@@ -4,7 +4,7 @@ import {
   ConnectExchangeBody,
   SUPPORTED_EXCHANGES,
   PASSPHRASE_REQUIRED,
-} from "../types";
+} from "../types/index.js";
 
 export const validateConnectBody = (
   req: Request,

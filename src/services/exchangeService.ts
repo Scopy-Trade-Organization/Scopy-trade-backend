@@ -46,7 +46,11 @@ function encrypt(plaintext: string): string {
 
 function decrypt(stored: string): string {
   const key = getEncryptionKey();
-  const [ivHex, authTagHex, encryptedHex] = stored.split(":");
+  const parts = stored.split(":");
+  if (parts.length !== 3) {
+    throw new Error("Malformed encrypted value.");
+  }
+  const [ivHex, authTagHex, encryptedHex] = parts as [string, string, string];
 
   const decipher = crypto.createDecipheriv(
     ALGORITHM,
@@ -208,6 +212,11 @@ const validateOkx: Validator<OkxAccountInfo> = async ({
   }
 
   const config = data.data[0];
+
+  if (!config) {
+    throw new Error("OKX returned an empty configuration response.");
+  }
+
   return {
     accountLevel: config.acctLv,
     posMode: config.posMode,

@@ -1,29 +1,7 @@
-import { Schema, model, Document, Types } from "mongoose";
-import { ExchangeId, AccountInfo } from "../types/index.js";
+import { Schema, model, InferSchemaType, HydratedDocument } from "mongoose";
+import { AccountInfo, ExchangeId } from "../types/index.js";
 
-// ─── Document Interface ───────────────────────────────────────────────────────
-
-export interface IExchangeConnection extends Document {
-  _id: Types.ObjectId;
-  userId: Types.ObjectId;
-  exchange: ExchangeId;
-  label: string;
-  encryptedApiKey: string | null;
-  encryptedApiSecret: string | null;
-  encryptedPassphrase: string | null;
-  accountInfo: AccountInfo;
-  isActive: boolean;
-  connectedAt: Date;
-  disconnectedAt: Date | null;
-  lastTestedAt: Date | null;
-  lastTestStatus: "ok" | "failed" | null;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-// ─── Schema ───────────────────────────────────────────────────────────────────
-
-const exchangeConnectionSchema = new Schema<IExchangeConnection>(
+const exchangeConnectionSchema = new Schema(
   {
     userId: {
       type: Schema.Types.ObjectId,
@@ -80,7 +58,20 @@ exchangeConnectionSchema.index(
   { unique: true, partialFilterExpression: { isActive: true } },
 );
 
-export const ExchangeConnection = model<IExchangeConnection>(
+// Infer everything, then surgically replace the weak types
+type RawInferred = InferSchemaType<typeof exchangeConnectionSchema>;
+
+export type IExchangeConnection = Omit<
+  RawInferred,
+  "accountInfo" | "lastTestStatus"
+> & {
+  accountInfo: AccountInfo;
+  lastTestStatus: "ok" | "failed" | null;
+};
+
+export type ExchangeConnectionDocument = HydratedDocument<IExchangeConnection>;
+
+export const ExchangeConnection = model(
   "ExchangeConnection",
   exchangeConnectionSchema,
 );

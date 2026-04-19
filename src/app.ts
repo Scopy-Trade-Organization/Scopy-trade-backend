@@ -7,7 +7,7 @@ import cookieParser from "cookie-parser";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
 import authRouter from "./routes/userAuthRoutes.js";
-import exchangeRoutes from "./routes/exchangeRoutes";
+import exchangeRoutes from "./routes/exchangeRoutes.js";
 import { sanitize } from "./middleware/mongodbSantizer.js";
 // import "./config/passport.js";
 

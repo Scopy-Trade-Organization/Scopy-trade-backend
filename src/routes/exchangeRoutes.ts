@@ -5,14 +5,14 @@ import {
   getUserConnections,
   removeConnection,
   testConnection,
-} from "../controllers/exchangeController";
-import { authenticate } from "../middleware/auth";
-import { validateConnectBody } from "../middleware/validateExchange";
+} from "../controllers/exchangeController.js";
+import { userAuthenticate } from "../middleware/authenticationMiddleware.js";
+import { validateConnectBody } from "../middleware/validateExchange.js";
 
 const router = Router();
 
 // All routes require a valid JWT
-router.use(authenticate);
+router.use(userAuthenticate);
 
 // GET  /api/exchanges              — list supported exchanges + connection status
 router.get("/", getSupportedExchanges);

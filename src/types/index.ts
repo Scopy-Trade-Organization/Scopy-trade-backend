@@ -1,5 +1,17 @@
-import { Request } from "express";
 import { Types } from "mongoose";
+
+export interface LoginRequestBody {
+  email: string;
+  password: string;
+}
+
+export interface RegisterRequestBody {
+  firstName: string;
+  lastName: string;
+  email: string;
+  password: string;
+  confirmPassword: string;
+}
 
 // ─── Supported Exchanges ───────────────────────────────────────────────────────
 
@@ -94,17 +106,6 @@ export interface ConnectExchangeBody {
   apiSecret: string;
   passphrase?: string;
   label?: string;
-}
-
-// ─── Authenticated Request ────────────────────────────────────────────────────
-
-export interface JwtPayload {
-  id: string;
-  email: string;
-}
-
-export interface AuthenticatedRequest extends Request {
-  user: JwtPayload;
 }
 
 // ─── API Responses ────────────────────────────────────────────────────────────

@@ -3,11 +3,8 @@ import bcrypt from "bcrypt";
 import User from "../models/userModel.js";
 import jwt, { SignOptions } from "jsonwebtoken";
 import validator from "validator";
-import {
-  LoginRequestBody,
-  RegisterRequestBody,
-} from "../interface/allInterfaces.js";
-import passport from "passport";
+import { LoginRequestBody, RegisterRequestBody } from "../types/index.js";
+// import passport from "passport";
 // import { UserJwtPayload } from "../config/passport.js"; // import the interface
 
 // Helper function to sign JWT tokens for User
