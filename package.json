@@ -17,6 +17,7 @@
     "@types/node": "^25.0.9",
     "@types/passport-google-oauth20": "^2.0.17",
     "axios": "^1.13.2",
+    "axios-retry": "^4.5.0",
     "bcrypt": "^6.0.0",
     "cloudinary": "^2.8.0",
     "compression": "^1.8.1",

@@ -10,6 +10,35 @@ import {
   OkxAccountInfo,
   KucoinAccountInfo,
 } from "../types/index.js";
+import axiosRetry from "axios-retry";
+
+export const http = axios.create({
+  timeout: 8000,
+});
+
+axiosRetry(http, {
+  retries: 2,
+  retryDelay: axiosRetry.exponentialDelay,
+  retryCondition: (error) =>
+    axiosRetry.isNetworkError(error) || (error.response?.status ?? 0) >= 500,
+});
+
+function normalizeError(err: unknown): Error {
+  if (axios.isAxiosError(err)) {
+    return new Error(
+      err.response?.data?.msg ||
+        err.response?.data?.retMsg ||
+        err.message ||
+        "Exchange request failed",
+    );
+  }
+
+  if (err instanceof Error) {
+    return err;
+  }
+
+  return new Error("Unknown error occurred");
+}
 
 // ─── Encryption Helpers ────────────────────────────────────────────────────────
 
@@ -78,34 +107,41 @@ const validateBinance: Validator<BinanceAccountInfo> = async ({
   apiKey,
   apiSecret,
 }) => {
-  const timestamp = Date.now();
-  const queryString = `timestamp=${timestamp}`;
-  const signature = crypto
-    .createHmac("sha256", apiSecret)
-    .update(queryString)
-    .digest("hex");
-
-  const { data } = await axios.get<BinanceAccountInfo & { canTrade: boolean }>(
-    "https://api.binance.com/api/v3/account",
-    {
-      params: { timestamp, signature },
-      headers: { "X-MBX-APIKEY": apiKey },
-      timeout: 8000,
-    },
-  );
-
-  if (!data.canTrade) {
-    throw new Error(
-      "API key does not have trading permissions enabled. Enable Spot Trading in your Binance API settings.",
+  try {
+    const { data: timeData } = await http.get(
+      "https://api.binance.com/api/v3/time",
     );
-  }
 
-  return {
-    accountType: data.accountType,
-    canTrade: data.canTrade,
-    canWithdraw: data.canWithdraw,
-    permissions: data.permissions,
-  };
+    const timestamp = timeData.serverTime;
+    const queryString = `timestamp=${timestamp}`;
+
+    const signature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(queryString)
+      .digest("hex");
+
+    const { data } = await http.get<BinanceAccountInfo & { canTrade: boolean }>(
+      "https://api.binance.com/api/v3/account",
+      {
+        params: { timestamp, signature },
+        headers: { "X-MBX-APIKEY": apiKey },
+        timeout: 8000,
+      },
+    );
+
+    if (!data.canTrade) {
+      throw new Error("API key does not have trading permissions enabled.");
+    }
+
+    return {
+      accountType: data.accountType,
+      canTrade: data.canTrade,
+      canWithdraw: data.canWithdraw,
+      permissions: data.permissions,
+    };
+  } catch (err) {
+    throw normalizeError(err);
+  }
 };
 
 // ── Bybit ─────────────────────────────────────────────────────────────────────
@@ -114,58 +150,62 @@ const validateBybit: Validator<BybitAccountInfo> = async ({
   apiKey,
   apiSecret,
 }) => {
-  const timestamp = Date.now().toString();
-  const recvWindow = "5000";
-  const signPayload = timestamp + apiKey + recvWindow;
+  try {
+    const timestamp = Date.now().toString();
+    const recvWindow = "5000";
+    const signPayload = timestamp + apiKey + recvWindow;
 
-  const signature = crypto
-    .createHmac("sha256", apiSecret)
-    .update(signPayload)
-    .digest("hex");
+    const signature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(signPayload)
+      .digest("hex");
 
-  interface BybitResponse {
-    retCode: number;
-    retMsg: string;
-    result: {
-      accountType: string;
-      permissions: Record<string, string[]>;
-      readOnly: number;
-    };
-  }
+    interface BybitResponse {
+      retCode: number;
+      retMsg: string;
+      result: {
+        accountType: string;
+        permissions: Record<string, string[]>;
+        readOnly: number;
+      };
+    }
 
-  const { data } = await axios.get<BybitResponse>(
-    "https://api.bybit.com/v5/user/query-api",
-    {
-      headers: {
-        "X-BAPI-API-KEY": apiKey,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recvWindow,
+    const { data } = await http.get<BybitResponse>(
+      "https://api.bybit.com/v5/user/query-api",
+      {
+        headers: {
+          "X-BAPI-API-KEY": apiKey,
+          "X-BAPI-SIGN": signature,
+          "X-BAPI-TIMESTAMP": timestamp,
+          "X-BAPI-RECV-WINDOW": recvWindow,
+        },
+        timeout: 8000,
       },
-      timeout: 8000,
-    },
-  );
-
-  if (data.retCode !== 0) {
-    throw new Error(data.retMsg || "Invalid Bybit API credentials.");
-  }
-
-  const info = data.result;
-  const hasTradePermission =
-    (info.permissions?.ContractTrade?.length ?? 0) > 0 ||
-    (info.permissions?.SpotTrade?.length ?? 0) > 0;
-
-  if (!hasTradePermission) {
-    throw new Error(
-      "API key does not have trading permissions. Enable Spot or Derivatives trading in Bybit API settings.",
     );
-  }
 
-  return {
-    accountType: info.accountType,
-    permissions: info.permissions,
-    readOnly: info.readOnly === 1,
-  };
+    if (data.retCode !== 0) {
+      throw new Error(data.retMsg || "Invalid Bybit API credentials.");
+    }
+
+    const info = data.result;
+    const hasTradePermission =
+      (info.permissions?.ContractTrade?.length ?? 0) > 0 ||
+      (info.permissions?.SpotTrade?.length ?? 0) > 0;
+
+    if (!hasTradePermission) {
+      throw new Error(
+        "API key does not have trading permissions. Enable Spot or Derivatives trading in Bybit API settings.",
+      );
+    }
+
+    return {
+      accountType: info.accountType,
+      permissions: info.permissions,
+      readOnly: info.readOnly === 1,
+    };
+  } catch (error) {
+    throw normalizeError(error);
+  }
 };
 
 // ── OKX ───────────────────────────────────────────────────────────────────────
@@ -176,52 +216,56 @@ const validateOkx: Validator<OkxAccountInfo> = async ({
   apiSecret,
   passphrase,
 }) => {
-  if (!passphrase) {
-    throw new Error("OKX requires a passphrase. Please provide it.");
+  try {
+    if (!passphrase) {
+      throw new Error("OKX requires a passphrase. Please provide it.");
+    }
+
+    const timestamp = new Date().toISOString();
+    const method = "GET";
+    const path = "/api/v5/account/config";
+    const signPayload = timestamp + method + path;
+
+    const signature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(signPayload)
+      .digest("base64"); // OKX uses base64, not hex
+
+    interface OkxResponse {
+      code: string;
+      msg: string;
+      data: Array<{ acctLv: string; posMode: string; uid: string }>;
+    }
+
+    const { data } = await http.get<OkxResponse>("https://www.okx.com" + path, {
+      headers: {
+        "OK-ACCESS-KEY": apiKey,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": passphrase,
+        "x-simulated-trading": "0", // 0 = live, 1 = paper trading
+      },
+      timeout: 8000,
+    });
+
+    if (data.code !== "0") {
+      throw new Error(data.msg || "Invalid OKX API credentials.");
+    }
+
+    const config = data.data[0];
+
+    if (!config) {
+      throw new Error("OKX returned an empty configuration response.");
+    }
+
+    return {
+      accountLevel: config.acctLv,
+      posMode: config.posMode,
+      uid: config.uid,
+    };
+  } catch (error) {
+    throw normalizeError(error);
   }
-
-  const timestamp = new Date().toISOString();
-  const method = "GET";
-  const path = "/api/v5/account/config";
-  const signPayload = timestamp + method + path;
-
-  const signature = crypto
-    .createHmac("sha256", apiSecret)
-    .update(signPayload)
-    .digest("base64"); // OKX uses base64, not hex
-
-  interface OkxResponse {
-    code: string;
-    msg: string;
-    data: Array<{ acctLv: string; posMode: string; uid: string }>;
-  }
-
-  const { data } = await axios.get<OkxResponse>("https://www.okx.com" + path, {
-    headers: {
-      "OK-ACCESS-KEY": apiKey,
-      "OK-ACCESS-SIGN": signature,
-      "OK-ACCESS-TIMESTAMP": timestamp,
-      "OK-ACCESS-PASSPHRASE": passphrase,
-      "x-simulated-trading": "0", // 0 = live, 1 = paper trading
-    },
-    timeout: 8000,
-  });
-
-  if (data.code !== "0") {
-    throw new Error(data.msg || "Invalid OKX API credentials.");
-  }
-
-  const config = data.data[0];
-
-  if (!config) {
-    throw new Error("OKX returned an empty configuration response.");
-  }
-
-  return {
-    accountLevel: config.acctLv,
-    posMode: config.posMode,
-    uid: config.uid,
-  };
 };
 
 // ── KuCoin ────────────────────────────────────────────────────────────────────
@@ -232,69 +276,73 @@ const validateKucoin: Validator<KucoinAccountInfo> = async ({
   apiSecret,
   passphrase,
 }) => {
-  if (!passphrase) {
-    throw new Error("KuCoin requires a passphrase. Please provide it.");
-  }
+  try {
+    if (!passphrase) {
+      throw new Error("KuCoin requires a passphrase. Please provide it.");
+    }
 
-  const timestamp = Date.now().toString();
-  const method = "GET";
-  const endpoint = "/api/v1/accounts";
-  const signPayload = timestamp + method + endpoint;
+    const timestamp = Date.now().toString();
+    const method = "GET";
+    const endpoint = "/api/v1/accounts";
+    const signPayload = timestamp + method + endpoint;
 
-  const signature = crypto
-    .createHmac("sha256", apiSecret)
-    .update(signPayload)
-    .digest("base64");
+    const signature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(signPayload)
+      .digest("base64");
 
-  // KuCoin v2: the passphrase itself must also be signed
-  const signedPassphrase = crypto
-    .createHmac("sha256", apiSecret)
-    .update(passphrase)
-    .digest("base64");
+    // KuCoin v2: the passphrase itself must also be signed
+    const signedPassphrase = crypto
+      .createHmac("sha256", apiSecret)
+      .update(passphrase)
+      .digest("base64");
 
-  interface KucoinAccount {
-    currency: string;
-    balance: string;
-    type: string;
-  }
-  interface KucoinResponse {
-    code: string;
-    msg?: string;
-    data: KucoinAccount[];
-  }
+    interface KucoinAccount {
+      currency: string;
+      balance: string;
+      type: string;
+    }
+    interface KucoinResponse {
+      code: string;
+      msg?: string;
+      data: KucoinAccount[];
+    }
 
-  const { data } = await axios.get<KucoinResponse>(
-    "https://api.kucoin.com" + endpoint,
-    {
-      headers: {
-        "KC-API-KEY": apiKey,
-        "KC-API-SIGN": signature,
-        "KC-API-TIMESTAMP": timestamp,
-        "KC-API-PASSPHRASE": signedPassphrase,
-        "KC-API-KEY-VERSION": "2",
+    const { data } = await http.get<KucoinResponse>(
+      "https://api.kucoin.com" + endpoint,
+      {
+        headers: {
+          "KC-API-KEY": apiKey,
+          "KC-API-SIGN": signature,
+          "KC-API-TIMESTAMP": timestamp,
+          "KC-API-PASSPHRASE": signedPassphrase,
+          "KC-API-KEY-VERSION": "2",
+        },
+        timeout: 8000,
       },
-      timeout: 8000,
-    },
-  );
-
-  if (data.code !== "200000") {
-    throw new Error(data.msg || "Invalid KuCoin API credentials.");
-  }
-
-  const tradingAccounts = data.data.filter((a) => a.type === "trade");
-  if (tradingAccounts.length === 0) {
-    throw new Error(
-      "No trading account found. Ensure your KuCoin API key has trade permissions.",
     );
-  }
 
-  return {
-    accounts: tradingAccounts.map((a) => ({
-      currency: a.currency,
-      balance: a.balance,
-      type: a.type,
-    })),
-  };
+    if (data.code !== "200000") {
+      throw new Error(data.msg || "Invalid KuCoin API credentials.");
+    }
+
+    const tradingAccounts = data.data.filter((a) => a.type === "trade");
+    if (tradingAccounts.length === 0) {
+      throw new Error(
+        "No trading account found. Ensure your KuCoin API key has trade permissions.",
+      );
+    }
+
+    return {
+      accounts: tradingAccounts.map((a) => ({
+        currency: a.currency,
+        balance: a.balance,
+        type: a.type,
+      })),
+    };
+  } catch (error) {
+    throw normalizeError(error);
+  }
 };
 
 // ─── Validator Registry ───────────────────────────────────────────────────────

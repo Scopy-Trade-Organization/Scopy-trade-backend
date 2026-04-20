@@ -50,10 +50,7 @@ export const getSupportedExchanges = async (req: Request, res: Response) => {
   }
 };
 
-export const connectExchange: RequestHandler = async (
-  req: Request,
-  res: Response,
-) => {
+export const connectExchange = async (req: Request, res: Response) => {
   try {
     const userId = req.user;
     const { exchange, apiKey, apiSecret, passphrase, label } =
@@ -84,6 +81,13 @@ export const connectExchange: RequestHandler = async (
         ...(passphrase !== undefined && { passphrase }),
       });
     } catch (validationError) {
+      console.error("[VALIDATION FAILED]", {
+        exchange,
+        userId,
+        error: (validationError as Error).message,
+        time: new Date().toISOString(),
+      });
+
       return res.status(422).json({
         success: false,
         message: (validationError as Error).message,
@@ -134,10 +138,7 @@ export const connectExchange: RequestHandler = async (
 
 // ─── GET /api/exchanges/connections ───────────────────────────────────────────
 
-export const getUserConnections: RequestHandler = async (
-  req: Request,
-  res: Response,
-) => {
+export const getUserConnections = async (req: Request, res: Response) => {
   try {
     const userId = req.user;
 
@@ -162,10 +163,7 @@ export const getUserConnections: RequestHandler = async (
 
 // ─── DELETE /api/exchanges/connections/:connectionId ──────────────────────────
 
-export const removeConnection: RequestHandler = async (
-  req: Request,
-  res: Response,
-) => {
+export const removeConnection = async (req: Request, res: Response) => {
   try {
     const userId = req.user;
     const { connectionId } = req.params;
@@ -204,10 +202,7 @@ export const removeConnection: RequestHandler = async (
   }
 };
 
-export const testConnection: RequestHandler = async (
-  req: Request,
-  res: Response,
-) => {
+export const testConnection = async (req: Request, res: Response) => {
   try {
     const userId = req.user;
     const { connectionId } = req.params;
@@ -270,6 +265,73 @@ export const testConnection: RequestHandler = async (
     });
   } catch (err) {
     console.error("[testConnection]", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+};
+
+export const updateConnectionCredentials = async (
+  req: Request,
+  res: Response,
+) => {
+  try {
+    const userId = req.user;
+    const { connectionId } = req.params;
+    const { apiKey, apiSecret, passphrase } = req.body;
+
+    const connection = await ExchangeConnection.findOne({
+      _id: connectionId,
+      userId,
+      isActive: true,
+    });
+
+    if (!connection) {
+      return res.status(404).json({
+        success: false,
+        message: "Connection not found.",
+      });
+    }
+
+    // Validate new credentials
+    let accountInfo;
+    try {
+      accountInfo = await validateCredentials(connection.exchange, {
+        apiKey,
+        apiSecret,
+        ...(passphrase && { passphrase }),
+      });
+    } catch (err) {
+      return res.status(422).json({
+        success: false,
+        message: (err as Error).message,
+      });
+    }
+
+    // Encrypt new credentials
+    const encrypted = encryptCredentials(connection.exchange, {
+      apiKey,
+      apiSecret,
+      ...(passphrase && { passphrase }),
+    });
+
+    // Update
+    connection.encryptedApiKey = encrypted.apiKey;
+    connection.encryptedApiSecret = encrypted.apiSecret;
+    connection.encryptedPassphrase = encrypted.passphrase ?? null;
+    connection.accountInfo = accountInfo;
+    connection.lastTestStatus = "ok";
+    connection.lastTestedAt = new Date();
+
+    await connection.save();
+
+    return res.status(200).json({
+      success: true,
+      message: "Credentials updated successfully.",
+    });
+  } catch (err) {
+    console.error("[updateConnectionCredentials]", err);
     return res.status(500).json({
       success: false,
       message: "Internal server error.",
