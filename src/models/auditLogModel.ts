@@ -8,13 +8,12 @@ const auditLogSchema = new Schema(
     },
     admin: {
       type: Schema.Types.ObjectId,
-      ref: "User",
+      ref: "Admin",
     },
     action: {
       type: String,
       required: true,
     },
-    userRole: String,
     targetId: Schema.Types.ObjectId,
     targetType: String,
     ipAddress: String,
