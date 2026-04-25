@@ -13,6 +13,7 @@ import {
   SUPPORTED_EXCHANGES,
   EncryptedCredentials,
 } from "../types/index.js";
+import AuditLog from "../models/auditLogModel.js";
 
 export const getSupportedExchanges = async (req: Request, res: Response) => {
   try {
@@ -122,6 +123,14 @@ export const connectExchange = async (req: Request, res: Response) => {
       connectedAt: connection.connectedAt,
     };
 
+    await AuditLog.create({
+      userId,
+      action: `${exchangeMeta.name} Connected`,
+      details: { exchange: connection.exchange, connectionId: connection._id },
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+
     return res.status(201).json({
       success: true,
       message: `${exchangeMeta.name} connected successfully.`,
@@ -168,7 +177,7 @@ export const removeConnection = async (req: Request, res: Response) => {
     const userId = req.user;
     const { connectionId } = req.params;
 
-    const connection = await ExchangeConnection.findOne({
+    const connection = await ExchangeConnection.findOneAndDelete({
       _id: connectionId,
       userId,
       isActive: true,
@@ -181,13 +190,13 @@ export const removeConnection = async (req: Request, res: Response) => {
       });
     }
 
-    // Soft delete — wipe encrypted keys and mark inactive
-    connection.isActive = false;
-    connection.encryptedApiKey = null;
-    connection.encryptedApiSecret = null;
-    connection.encryptedPassphrase = null;
-    connection.disconnectedAt = new Date();
-    await connection.save();
+    await AuditLog.create({
+      userId,
+      action: `${SUPPORTED_EXCHANGES[connection.exchange].name} Disconnected`,
+      details: { exchange: connection.exchange, connectionId: connection._id },
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
 
     return res.status(200).json({
       success: true,
@@ -325,6 +334,14 @@ export const updateConnectionCredentials = async (
     connection.lastTestedAt = new Date();
 
     await connection.save();
+
+    await AuditLog.create({
+      userId,
+      action: `${SUPPORTED_EXCHANGES[connection.exchange].name} Credentials Updated`,
+      details: { exchange: connection.exchange, connectionId: connection._id },
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
 
     return res.status(200).json({
       success: true,
