@@ -11,30 +11,30 @@ import { userAuthenticate } from "../middleware/authenticationMiddleware.js";
 import { validateConnectBody } from "../middleware/validateExchange.js";
 import { testConnectionLimiter } from "../middleware/rateLimit.js";
 
-const router = Router();
+const exchangeRouter = Router();
 
 // All routes require a valid JWT
-router.use(userAuthenticate);
+exchangeRouter.use(userAuthenticate);
 
 // GET  /api/exchanges              — list supported exchanges + connection status
-router.get("/", getSupportedExchanges);
+exchangeRouter.get("/", getSupportedExchanges);
 
 // POST /api/exchanges/connect      — validate, encrypt, and store credentials
-router.post("/connect", validateConnectBody, connectExchange);
+exchangeRouter.post("/connect", validateConnectBody, connectExchange);
 
 // GET  /api/exchanges/connections  — user's active connections (no secrets)
-router.get("/connections", getUserConnections);
+exchangeRouter.get("/connections", getUserConnections);
 
 // DELETE /api/exchanges/connections/:connectionId — soft delete + wipe keys
-router.delete("/connections/:connectionId", removeConnection);
+exchangeRouter.delete("/connections/:connectionId", removeConnection);
 
-router.patch("/connections/:connectionId", updateConnectionCredentials);
+exchangeRouter.patch("/connections/:connectionId", updateConnectionCredentials);
 
 // POST /api/exchanges/connections/:connectionId/test — re-validate live
-router.post(
+exchangeRouter.post(
   "/connections/:connectionId/test",
   testConnectionLimiter,
   testConnection,
 );
 
-export default router;
+export default exchangeRouter;

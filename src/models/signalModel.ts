@@ -18,6 +18,11 @@ const signalSchema = new Schema(
       type: String,
       required: true,
     },
+    signalResult: {
+      type: String,
+      enum: ["profit", "loss", "breakeven", null],
+      default: null,
+    },
   },
   { timestamps: true },
 );

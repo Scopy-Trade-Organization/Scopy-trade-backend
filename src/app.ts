@@ -7,7 +7,8 @@ import cookieParser from "cookie-parser";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
 import authRouter from "./routes/userAuthRoutes.js";
-import exchangeRoutes from "./routes/exchangeRoutes.js";
+import exchangeRouter from "./routes/exchangeRoutes.js";
+import adminDashboardRouter from "./routes/adminDashboardRoutes.js";
 import { sanitize } from "./middleware/mongodbSantizer.js";
 // import "./config/passport.js";
 
@@ -57,7 +58,8 @@ app.use((req, res, next) => {
 
 // Define API routes
 app.use("/api/auth", authRouter); // Register auth routes
-app.use("/api/exchanges", exchangeRoutes);
+app.use("/api/exchanges", exchangeRouter);
+app.use("/api/admin/dashboard", adminDashboardRouter);
 // app.use("/api/user", userRouter); // Register user routes
 
 export default app;
