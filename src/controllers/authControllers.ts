@@ -4,6 +4,7 @@ import User from "../models/userModel.js";
 import jwt, { SignOptions } from "jsonwebtoken";
 import validator from "validator";
 import { LoginRequestBody, RegisterRequestBody } from "../types/index.js";
+import AuditLog from "../models/auditLogModel.js";
 // import passport from "passport";
 // import { UserJwtPayload } from "../config/passport.js"; // import the interface
 
@@ -159,6 +160,14 @@ export const login = async (
 
     const token = signToken(user._id.toString());
     user.password = null;
+
+    await AuditLog.create({
+      action: "User login attempt",
+      user: user._id,
+      userEmail: user.email,
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
 
     const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
 
