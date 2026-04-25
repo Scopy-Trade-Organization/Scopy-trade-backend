@@ -109,7 +109,7 @@ const validateBinance: Validator<BinanceAccountInfo> = async ({
 }) => {
   try {
     const { data: timeData } = await http.get(
-      "https://api.binance.com/api/v3/time",
+      process.env.BINANCE_TEST_API_URL + "/api/v3/time",
     );
 
     const timestamp = timeData.serverTime;
@@ -121,7 +121,7 @@ const validateBinance: Validator<BinanceAccountInfo> = async ({
       .digest("hex");
 
     const { data } = await http.get<BinanceAccountInfo & { canTrade: boolean }>(
-      "https://api.binance.com/api/v3/account",
+      process.env.BINANCE_TEST_API_URL + "/api/v3/account",
       {
         params: { timestamp, signature },
         headers: { "X-MBX-APIKEY": apiKey },
@@ -171,7 +171,7 @@ const validateBybit: Validator<BybitAccountInfo> = async ({
     }
 
     const { data } = await http.get<BybitResponse>(
-      "https://api.bybit.com/v5/user/query-api",
+      process.env.BYBIT_TEST_API_URL + "/v5/user/query-api",
       {
         headers: {
           "X-BAPI-API-KEY": apiKey,

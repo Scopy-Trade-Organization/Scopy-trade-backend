@@ -171,7 +171,7 @@ export const login = async (
 
     const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
 
-    res.cookie("token", token, {
+    res.cookie("user_token", token, {
       httpOnly: true,
       secure: isSecure,
       sameSite: isSecure ? "none" : "lax", // "none" requires secure:true
