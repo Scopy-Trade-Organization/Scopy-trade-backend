@@ -53,8 +53,7 @@ export const adminLogin = async (
 
     await AuditLog.create({
       action: "Admin login attempt",
-      user: admin._id,
-      userEmail: admin.email,
+      admin: admin._id,
       ipAddress: req.ip,
       userAgent: req.headers["user-agent"],
     });
