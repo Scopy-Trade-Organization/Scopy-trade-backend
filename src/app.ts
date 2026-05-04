@@ -11,12 +11,13 @@ import exchangeRouter from "./routes/exchangeRoutes.js";
 import adminDashboardRouter from "./routes/adminDashboardRoutes.js";
 import adminAuthRouter from "./routes/adminAuthRoutes.js";
 import { sanitize } from "./middleware/mongodbSantizer.js";
+import proTraderDashboardRouter from "./routes/proTraderDashboardRoutes.js";
 // import "./config/passport.js";
 
 // Rate limiting configuration
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 70,
   message: "Too many requests from this IP, please try again later",
 });
 
@@ -61,6 +62,6 @@ app.use("/api/auth", authRouter);
 app.use("/api/exchanges", exchangeRouter);
 app.use("/api/admin/dashboard", adminDashboardRouter);
 app.use("/api/admin/auth", adminAuthRouter);
-// app.use("/api/user", userRouter);
+app.use("/api/pro-trader/dashboard", proTraderDashboardRouter);
 
 export default app;

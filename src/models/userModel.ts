@@ -28,6 +28,11 @@ const userSchema = new Schema(
     oauthProviders: {
       google: String,
     },
+    role: {
+      type: String,
+      enum: ["CopyTrader", "Pro Trader"],
+      default: "CopyTrader",
+    },
     traderID: {
       type: String,
       unique: true,

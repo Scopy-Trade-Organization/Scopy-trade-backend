@@ -5,6 +5,8 @@ import {
   // handleGoogleLogin,
   // googleAuthCallback,
   logout,
+  whoami,
+  refreshToken,
 } from "../controllers/authControllers.js";
 
 const userAuthRouter = express.Router();
@@ -12,6 +14,10 @@ const userAuthRouter = express.Router();
 userAuthRouter.post("/register", registerUser); // User Registration routes
 
 userAuthRouter.post("/login", login); // User Login route
+
+userAuthRouter.post("/refresh", refreshToken); // User Refresh Token route
+
+userAuthRouter.get("/me", whoami); // User Info route
 
 userAuthRouter.post("/logout", logout); // User Logout route
 

@@ -93,3 +93,36 @@ export const adminAuthenticate = async (
     });
   }
 };
+
+export function requireRole(allowedRoles: string[]) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          status: "error",
+          message: "Authentication required",
+        });
+      }
+
+      const user = await User.findById(req.user);
+
+      if (!user) {
+        return res.status(401).json({
+          status: "error",
+          message: "User not found",
+        });
+      }
+
+      if (!allowedRoles.includes(user.role)) {
+        return res.status(403).json({
+          status: "error",
+          message: "Insufficient permissions",
+        });
+      }
+
+      return next();
+    } catch (error) {
+      return next(error);
+    }
+  };
+}

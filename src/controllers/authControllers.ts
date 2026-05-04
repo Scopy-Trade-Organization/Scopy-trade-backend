@@ -1,29 +1,20 @@
 import { Request, Response } from "express";
 import bcrypt from "bcrypt";
 import User from "../models/userModel.js";
-import jwt, { SignOptions } from "jsonwebtoken";
+import jwt from "jsonwebtoken";
 import validator from "validator";
 import { LoginRequestBody, RegisterRequestBody } from "../types/index.js";
 import AuditLog from "../models/auditLogModel.js";
+import { signAccessToken, signRefreshToken } from "../helpers/jwtHelper.js";
 // import passport from "passport";
 // import { UserJwtPayload } from "../config/passport.js"; // import the interface
 
-// Helper function to sign JWT tokens for User
-const signToken = (id: string): string => {
-  const secret = process.env.JWT_SECRET;
-  const expiresIn = process.env.JWT_EXPIRES_IN;
+// Helper function to generate unique Trader IDs
+export const generateCopyTraderID = () =>
+  "SCT-" + Math.random().toString(36).substring(2, 10).toUpperCase();
 
-  if (!secret) throw new Error("JWT_SECRET is not defined");
-  if (!expiresIn) throw new Error("JWT_EXPIRES_IN is not defined");
-
-  return jwt.sign({ id }, secret, {
-    expiresIn: expiresIn as NonNullable<SignOptions["expiresIn"]>,
-  });
-};
-
-// Helper function to generate unique donor IDs
-export const generateUserID = () =>
-  "AGU-" + Math.random().toString(36).substring(2, 10).toUpperCase();
+export const generateProTraderID = () =>
+  "SPT-" + Math.random().toString(36).substring(2, 10).toUpperCase();
 
 // User Registration
 export const registerUser = async (
@@ -31,10 +22,18 @@ export const registerUser = async (
   res: Response,
 ) => {
   try {
-    const { firstName, lastName, email, password, confirmPassword } = req.body;
+    const { firstName, lastName, email, password, role, confirmPassword } =
+      req.body;
 
     // Validate user input
-    if (!email || !password || !confirmPassword || !firstName || !lastName) {
+    if (
+      !email ||
+      !password ||
+      !confirmPassword ||
+      !firstName ||
+      !lastName ||
+      !role
+    ) {
       return res.status(400).json({
         status: "fail",
         message: "All fields are required",
@@ -90,7 +89,11 @@ export const registerUser = async (
         password: hashedPassword,
         firstName,
         lastName,
-        traderID: generateUserID(),
+        role,
+        traderID:
+          role === "CopyTrader"
+            ? generateCopyTraderID()
+            : generateProTraderID(),
       });
     }
 
@@ -115,7 +118,7 @@ export const login = async (
   res: Response,
 ) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, rememberMe } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({
@@ -158,7 +161,7 @@ export const login = async (
     //   });
     // }
 
-    const token = signToken(user._id.toString());
+    const accessToken = signAccessToken(user._id.toString());
     user.password = null;
 
     await AuditLog.create({
@@ -171,12 +174,24 @@ export const login = async (
 
     const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
 
-    res.cookie("user_token", token, {
+    res.cookie("user_token", accessToken, {
       httpOnly: true,
       secure: isSecure,
       sameSite: isSecure ? "none" : "lax", // "none" requires secure:true
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      maxAge: 24 * 60 * 60 * 1000,
     });
+
+    if (rememberMe) {
+      const refreshToken = signRefreshToken(user._id.toString());
+
+      res.cookie("refresh_token", refreshToken, {
+        httpOnly: true,
+        secure: isSecure,
+        sameSite: "none",
+        path: "/api/auth/refresh", // very important
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      });
+    }
 
     return res.status(200).json({
       status: "success",
@@ -208,6 +223,97 @@ export const logout = (req: Request, res: Response) => {
     status: "success",
     message: "Logged out successfully",
   });
+};
+
+export const whoami = async (req: Request, res: Response) => {
+  try {
+    const user = await User.findById(req.user).select("-password");
+
+    if (!user) {
+      return res.status(404).json({
+        status: "fail",
+        message: "User not found",
+      });
+    }
+
+    return res.status(200).json({
+      status: "success",
+      data: { user },
+    });
+  } catch (err: any) {
+    console.error("Error fetching user info:", err);
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to fetch user info",
+      error: err.message,
+    });
+  }
+};
+
+export const refreshToken = async (req: Request, res: Response) => {
+  try {
+    const refreshToken = req.cookies.refresh_token;
+    if (!refreshToken) {
+      return res.status(401).json({
+        status: "fail",
+        message: "Refresh token missing",
+      });
+    }
+    const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
+
+    const refreshSecret = process.env.JWT_SECRET;
+    if (!refreshSecret) {
+      throw new Error("JWT_SECRET is not defined");
+    }
+
+    const decoded = jwt.verify(refreshToken, refreshSecret) as {
+      id: string;
+      type: string;
+    };
+
+    if (!decoded || decoded.type !== "refresh") {
+      res.clearCookie("refresh_token", {
+        httpOnly: true,
+        secure: isSecure,
+        sameSite: "none",
+        path: "/api/auth/refresh",
+      });
+      return res.status(401).json({
+        status: "fail",
+        message: "Invalid or expired refresh token",
+      });
+    }
+
+    const user = await User.findById(decoded.id).select("-password");
+    if (!user) {
+      return res.status(401).json({
+        status: "fail",
+        message: "User not found",
+      });
+    }
+
+    const newAccessToken = signAccessToken(user._id.toString());
+
+    res.cookie("access_token", newAccessToken, {
+      httpOnly: true,
+      secure: isSecure,
+      sameSite: "lax",
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+
+    return res.status(200).json({
+      status: "success",
+      data: { user },
+    });
+  } catch (err: any) {
+    console.error("Refresh token error:", err);
+
+    return res.status(401).json({
+      status: "error",
+      message: "Failed to refresh access token",
+      details: err.message,
+    });
+  }
 };
 
 // export const handleGoogleLogin = (

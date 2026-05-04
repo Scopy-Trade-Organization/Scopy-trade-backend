@@ -1,66 +1,27 @@
 import { Request, Response } from "express";
 import AuditLog from "../models/auditLogModel.js";
 import { Signal } from "../models/signalModel.js";
-
-export const createSignal = async (req: Request, res: Response) => {
-  try {
-    const { pair, tp, sl, entry } = req.body;
-
-    // Validate required fields
-    if (!pair || !tp || !sl || !entry) {
-      return res.status(400).json({
-        success: false,
-        message: "All fields are required",
-      });
-    }
-
-    const newSignal = await Signal.create({
-      pair,
-      tp,
-      sl,
-      entry,
-    });
-
-    await AuditLog.create({
-      admin: req.admin,
-      action: "New Trade Signal Created",
-      details: {
-        signalId: newSignal._id,
-        pair,
-        tp,
-        sl,
-        entry,
-      },
-      ipAddress: req.ip,
-      userAgent: req.headers["user-agent"],
-    });
-
-    return res.status(201).json({
-      success: true,
-      message: "Signal created successfully",
-      signal: newSignal,
-    });
-  } catch (error) {
-    console.error("Error creating signal:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    });
-  }
-};
+import User from "../models/userModel.js";
 
 export const getAllSignals = async (req: Request, res: Response) => {
   try {
-    const { page = 1 } = req.query;
+    const { page = 1, status } = req.query;
 
     const limit = 10;
     const currentPage = Number(page);
     const skip = (currentPage - 1) * limit;
 
-    const signals = await Signal.find()
+    const filter: any = {};
+
+    if (status) {
+      filter.status = status;
+    }
+
+    const signals = await Signal.find(filter)
       .sort({ createdAt: -1 })
       .limit(limit)
-      .skip(skip);
+      .skip(skip)
+      .sort({ createdAt: -1 });
 
     return res.status(200).json({
       success: true,
@@ -80,32 +41,58 @@ export const getAllSignals = async (req: Request, res: Response) => {
   }
 };
 
-export const deleteSignal = async (req: Request, res: Response) => {
+export const fetchAllUsers = async (req: Request, res: Response) => {
   try {
-    const { signalId } = req.params;
-    const signal = await Signal.findByIdAndDelete(signalId);
+    const { page = 1, role, status } = req.query;
 
-    if (!signal) {
-      return res.status(404).json({
-        success: false,
-        message: "Signal not found",
-      });
+    if (role) {
+      const validRoles = ["CopyTrader", "Pro Trader"];
+      if (!validRoles.includes(String(role))) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid role filter",
+        });
+      }
     }
 
-    await AuditLog.create({
-      admin: req.admin,
-      action: "Trade Signal Deleted",
-      details: { signalId },
-      ipAddress: req.ip,
-      userAgent: req.headers["user-agent"],
-    });
+    if (status) {
+      const validStatuses = ["active", "suspended"];
+      if (!validStatuses.includes(String(status))) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid status filter",
+        });
+      }
+    }
+
+    const filter: any = {};
+    if (role) {
+      filter.role = role;
+    }
+    if (status) {
+      filter.status = status;
+    }
+
+    const limit = 10;
+    const currentPage = Number(page);
+    const skip = (currentPage - 1) * limit;
+
+    const users = await User.find(filter)
+      .select("-password")
+      .limit(limit)
+      .skip(skip)
+      .sort({ createdAt: -1 });
 
     return res.status(200).json({
       success: true,
-      message: "Signal deleted successfully",
+      message: "Users retrieved successfully",
+      users,
+      page: currentPage,
+      limit,
+      pages: Math.ceil((await User.countDocuments(filter)) / limit),
     });
   } catch (error) {
-    console.error("Error deleting signal:", error);
+    console.error("Error fetching users:", error);
     return res.status(500).json({
       success: false,
       message: "Internal server error",
@@ -113,47 +100,35 @@ export const deleteSignal = async (req: Request, res: Response) => {
   }
 };
 
-export const updateSignal = async (req: Request, res: Response) => {
+export const suspendUser = async (req: Request, res: Response) => {
   try {
-    const { signalId } = req.params;
-    const { pair, tp, sl, entry } = req.body;
+    const { id } = req.params;
+    const user = await User.findById(id);
 
-    const signal = await Signal.findById(signalId);
-
-    if (!signal) {
+    if (!user) {
       return res.status(404).json({
         success: false,
-        message: "Signal not found",
+        message: "User not found",
       });
     }
-
-    const updatedSignal = await Signal.findByIdAndUpdate(
-      signalId,
-      { pair, tp, sl, entry },
-      { new: true },
-    );
+    user.status = "suspended";
+    await user.save();
 
     await AuditLog.create({
       admin: req.admin,
-      action: "Trade Signal Updated",
-      details: {
-        signalId,
-        pair,
-        tp,
-        sl,
-        entry,
-      },
+      action: "User Suspended",
+      details: { userId: id },
       ipAddress: req.ip,
+      targetId: id,
       userAgent: req.headers["user-agent"],
     });
 
     return res.status(200).json({
       success: true,
-      message: "Signal updated successfully",
-      signal: updatedSignal,
+      message: "User suspended successfully",
     });
   } catch (error) {
-    console.error("Error updating signal:", error);
+    console.error("Error suspending user:", error);
     return res.status(500).json({
       success: false,
       message: "Internal server error",
@@ -161,52 +136,35 @@ export const updateSignal = async (req: Request, res: Response) => {
   }
 };
 
-export const updateSignalResult = async (req: Request, res: Response) => {
+export const activateUser = async (req: Request, res: Response) => {
   try {
-    const { signalId } = req.params;
-    const { signalResult } = req.body;
+    const { id } = req.params;
+    const user = await User.findById(id);
 
-    const validResults = ["profit", "loss", "breakeven", null];
-    if (!validResults.includes(signalResult)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid signal result",
-      });
-    }
-
-    const signal = await Signal.findById(signalId);
-
-    if (!signal) {
+    if (!user) {
       return res.status(404).json({
         success: false,
-        message: "Signal not found",
+        message: "User not found",
       });
     }
-
-    const updatedSignal = await Signal.findByIdAndUpdate(
-      signalId,
-      { signalResult },
-      { new: true },
-    );
+    user.status = "active";
+    await user.save();
 
     await AuditLog.create({
       admin: req.admin,
-      action: "Trade Signal Result Updated",
-      details: {
-        signalId,
-        signalResult,
-      },
+      action: "User Activated",
+      details: { userId: id },
       ipAddress: req.ip,
+      targetId: id,
       userAgent: req.headers["user-agent"],
     });
 
     return res.status(200).json({
       success: true,
-      message: "Signal result updated successfully",
-      signal: updatedSignal,
+      message: "User activated successfully",
     });
   } catch (error) {
-    console.error("Error updating signal result:", error);
+    console.error("Error activating user:", error);
     return res.status(500).json({
       success: false,
       message: "Internal server error",

@@ -3,6 +3,7 @@ import { Types } from "mongoose";
 export interface LoginRequestBody {
   email: string;
   password: string;
+  rememberMe?: boolean;
 }
 
 export interface RegisterRequestBody {
@@ -11,6 +12,7 @@ export interface RegisterRequestBody {
   email: string;
   password: string;
   confirmPassword: string;
+  role: "CopyTrader" | "Pro Trader";
 }
 
 // ─── Supported Exchanges ───────────────────────────────────────────────────────

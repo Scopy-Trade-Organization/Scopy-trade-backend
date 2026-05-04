@@ -10,6 +10,11 @@ const signalSchema = new Schema(
       type: String,
       required: true,
     },
+    trader: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
     sl: {
       type: String,
       required: true,
@@ -22,6 +27,11 @@ const signalSchema = new Schema(
       type: String,
       enum: ["profit", "loss", "breakeven", null],
       default: null,
+    },
+    status: {
+      type: String,
+      enum: ["active", "expired"],
+      default: "active",
     },
   },
   { timestamps: true },
