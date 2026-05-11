@@ -17,7 +17,7 @@ export interface RegisterRequestBody {
 
 // ─── Supported Exchanges ───────────────────────────────────────────────────────
 
-export type ExchangeId = "binance" | "bybit" | "okx" | "kucoin";
+export type ExchangeId = "binance" | "bybit" | "okx" | "bitget";
 
 export interface ExchangeMeta {
   name: string;
@@ -41,14 +41,14 @@ export const SUPPORTED_EXCHANGES: Record<ExchangeId, ExchangeMeta> = {
     requiresPassphrase: true,
     fields: ["apiKey", "apiSecret", "passphrase"],
   },
-  kucoin: {
-    name: "KuCoin",
+  bitget: {
+    name: "Bitget",
     requiresPassphrase: true,
     fields: ["apiKey", "apiSecret", "passphrase"],
   },
 };
 
-export const PASSPHRASE_REQUIRED: ExchangeId[] = ["okx", "kucoin"];
+export const PASSPHRASE_REQUIRED: ExchangeId[] = ["okx", "bitget"];
 
 // ─── Credentials ──────────────────────────────────────────────────────────────
 
@@ -86,19 +86,20 @@ export interface OkxAccountInfo {
   uid: string;
 }
 
-export interface KucoinAccountInfo {
-  accounts: Array<{
-    currency: string;
-    balance: string;
-    type: string;
-  }>;
+export interface BitgetAccountInfo {
+  userId: string;
+  inviterId: string;
+  ips: string;
+  authorities: string[];
+  parentId: string;
+  trader: boolean;
 }
 
 export type AccountInfo =
   | BinanceAccountInfo
   | BybitAccountInfo
   | OkxAccountInfo
-  | KucoinAccountInfo;
+  | BitgetAccountInfo;
 
 // ─── Request Bodies ───────────────────────────────────────────────────────────
 

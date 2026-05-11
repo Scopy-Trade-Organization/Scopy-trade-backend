@@ -8,7 +8,7 @@ import {
   BinanceAccountInfo,
   BybitAccountInfo,
   OkxAccountInfo,
-  KucoinAccountInfo,
+  BitgetAccountInfo,
 } from "../types/index.js";
 import axiosRetry from "axios-retry";
 
@@ -268,77 +268,81 @@ const validateOkx: Validator<OkxAccountInfo> = async ({
   }
 };
 
-// ── KuCoin ────────────────────────────────────────────────────────────────────
-// Docs: https://docs.kucoin.com
-// KuCoin requires passphrase + the passphrase itself must be HMAC-signed (v2)
-const validateKucoin: Validator<KucoinAccountInfo> = async ({
+// ── Bitget ────────────────────────────────────────────────────────────────────
+// Docs: https://www.bitget.com/api-doc/common/intro
+// Bitget requires a passphrase + uses base64 HMAC-SHA256
+const validateBitget: Validator<BitgetAccountInfo> = async ({
   apiKey,
   apiSecret,
   passphrase,
 }) => {
   try {
     if (!passphrase) {
-      throw new Error("KuCoin requires a passphrase. Please provide it.");
+      throw new Error("Bitget requires a passphrase. Please provide it.");
     }
 
     const timestamp = Date.now().toString();
     const method = "GET";
-    const endpoint = "/api/v1/accounts";
-    const signPayload = timestamp + method + endpoint;
+    const path = "/api/v2/user/info";
+    const signPayload = timestamp + method + path;
 
     const signature = crypto
       .createHmac("sha256", apiSecret)
       .update(signPayload)
       .digest("base64");
 
-    // KuCoin v2: the passphrase itself must also be signed
-    const signedPassphrase = crypto
-      .createHmac("sha256", apiSecret)
-      .update(passphrase)
-      .digest("base64");
-
-    interface KucoinAccount {
-      currency: string;
-      balance: string;
-      type: string;
-    }
-    interface KucoinResponse {
+    interface BitgetResponse {
       code: string;
-      msg?: string;
-      data: KucoinAccount[];
+      msg: string;
+      data: {
+        userId: string;
+        inviterId: string;
+        ips: string;
+        authorities: string[];
+        parentId: string;
+        trader: boolean;
+      };
     }
 
-    const { data } = await http.get<KucoinResponse>(
-      "https://api.kucoin.com" + endpoint,
+    const { data } = await http.get<BitgetResponse>(
+      "https://api.bitget.com" + path,
       {
         headers: {
-          "KC-API-KEY": apiKey,
-          "KC-API-SIGN": signature,
-          "KC-API-TIMESTAMP": timestamp,
-          "KC-API-PASSPHRASE": signedPassphrase,
-          "KC-API-KEY-VERSION": "2",
+          "ACCESS-KEY": apiKey,
+          "ACCESS-SIGN": signature,
+          "ACCESS-TIMESTAMP": timestamp,
+          "ACCESS-PASSPHRASE": passphrase,
+          "Content-Type": "application/json",
         },
         timeout: 8000,
       },
     );
 
-    if (data.code !== "200000") {
-      throw new Error(data.msg || "Invalid KuCoin API credentials.");
+    if (data.code !== "00000") {
+      throw new Error(data.msg || "Invalid Bitget API credentials.");
     }
 
-    const tradingAccounts = data.data.filter((a) => a.type === "trade");
-    if (tradingAccounts.length === 0) {
+    const info = data.data;
+    if (!info) {
+      throw new Error("Bitget returned an empty response.");
+    }
+
+    const hasTradePermission = info.authorities?.some((a) =>
+      ["trade", "TRADE", "spot", "futures"].includes(a),
+    );
+    if (!hasTradePermission) {
       throw new Error(
-        "No trading account found. Ensure your KuCoin API key has trade permissions.",
+        "API key does not have trading permissions. Enable Spot or Futures trading in Bitget API settings.",
       );
     }
 
     return {
-      accounts: tradingAccounts.map((a) => ({
-        currency: a.currency,
-        balance: a.balance,
-        type: a.type,
-      })),
+      userId: info.userId,
+      inviterId: info.inviterId,
+      ips: info.ips,
+      authorities: info.authorities,
+      parentId: info.parentId,
+      trader: info.trader,
     };
   } catch (error) {
     throw normalizeError(error);
@@ -351,7 +355,7 @@ const validators: Record<ExchangeId, Validator<AccountInfo>> = {
   binance: validateBinance,
   bybit: validateBybit,
   okx: validateOkx,
-  kucoin: validateKucoin,
+  bitget: validateBitget,
 };
 
 // ─── Public API ───────────────────────────────────────────────────────────────

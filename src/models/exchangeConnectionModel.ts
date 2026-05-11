@@ -13,7 +13,7 @@ const exchangeConnectionSchema = new Schema(
     exchange: {
       type: String,
       required: true,
-      enum: ["binance", "bybit", "okx", "kucoin"] as ExchangeId[],
+      enum: ["binance", "bybit", "okx", "bitget"] as ExchangeId[],
       lowercase: true,
     },
 
@@ -26,7 +26,7 @@ const exchangeConnectionSchema = new Schema(
     // AES-256-GCM encrypted as "iv:authTag:ciphertext" — never returned to client
     encryptedApiKey: { type: String, default: null },
     encryptedApiSecret: { type: String, default: null },
-    encryptedPassphrase: { type: String, default: null }, // OKX + KuCoin only
+    encryptedPassphrase: { type: String, default: null }, // OKX + Bitget only
 
     // Non-sensitive snapshot of account state from the exchange
     accountInfo: {
