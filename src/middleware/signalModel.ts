@@ -19,9 +19,17 @@ const signalSchema = new Schema(
       type: String,
       required: true,
     },
+    direction: {
+      type: String,
+      enum: ["buy", "sell"],
+      required: true,
+    },
     entry: {
       type: String,
       required: true,
+    },
+    notes: {
+      type: String,
     },
     signalResult: {
       type: String,

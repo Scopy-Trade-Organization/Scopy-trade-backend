@@ -1,15 +1,15 @@
 import { Request, Response } from "express";
 import AuditLog from "../models/auditLogModel.js";
-import { Signal } from "../models/signalModel.js";
+import { Signal } from "../middleware/signalModel.js";
 
 export const createSignal = async (req: Request, res: Response) => {
   try {
-    const { pair, tp, sl, entry } = req.body;
+    const { pair, tp, notes, sl, direction, entry } = req.body;
 
     const traderId = req.user;
 
     // Validate required fields
-    if (!pair || !tp || !sl || !entry) {
+    if (!pair || !tp || !sl || !direction || !entry) {
       return res.status(400).json({
         success: false,
         message: "All fields are required",
@@ -21,6 +21,8 @@ export const createSignal = async (req: Request, res: Response) => {
       tp,
       sl,
       entry,
+      direction,
+      notes,
       trader: traderId,
     });
 
@@ -33,6 +35,7 @@ export const createSignal = async (req: Request, res: Response) => {
         tp,
         sl,
         entry,
+        direction,
       },
       targetId: newSignal._id,
       targetType: "Signal Creation",
@@ -93,11 +96,27 @@ export const deleteSignal = async (req: Request, res: Response) => {
 export const updateSignal = async (req: Request, res: Response) => {
   try {
     const { signalId } = req.params;
-    const { pair, tp, sl, entry } = req.body;
+    const { pair, tp, notes, sl, direction, entry } = req.body;
+
+    const signal = await Signal.findOne({ _id: signalId, trader: req.user });
+
+    if (!signal) {
+      return res.status(404).json({
+        success: false,
+        message: "Signal not found for this trader",
+      });
+    }
+
+    if (signal.status === "expired") {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot update an expired signal",
+      });
+    }
 
     const updatedSignal = await Signal.findByIdAndUpdate(
       { _id: signalId, trader: req.user },
-      { pair, tp, sl, entry },
+      { pair, tp, notes, sl, direction, entry },
       { new: true },
     );
 
@@ -115,7 +134,9 @@ export const updateSignal = async (req: Request, res: Response) => {
         signalId,
         pair,
         tp,
+        notes,
         sl,
+        direction,
         entry,
       },
       ipAddress: req.ip,

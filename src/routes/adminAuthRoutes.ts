@@ -5,6 +5,7 @@ import {
   AdminRefreshToken,
   adminWhoami,
 } from "../controllers/adminAuthController.js";
+import { adminAuthenticate } from "../middleware/authenticationMiddleware.js";
 
 const adminAuthRouter = Router();
 
@@ -18,6 +19,6 @@ adminAuthRouter.post("/logout", adminLogout);
 adminAuthRouter.post("/refresh", AdminRefreshToken);
 
 // Admin Info route
-adminAuthRouter.get("/me", adminWhoami);
+adminAuthRouter.get("/me", adminAuthenticate, adminWhoami);
 
 export default adminAuthRouter;

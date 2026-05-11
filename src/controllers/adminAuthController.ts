@@ -101,7 +101,7 @@ export const adminLogout = (req: Request, res: Response) => {
 
 export const adminWhoami = async (req: Request, res: Response) => {
   try {
-    const admin = await Admin.findById(req.user).select("-password");
+    const admin = await Admin.findById(req.admin).select("-password");
 
     if (!admin) {
       return res.status(404).json({
@@ -168,7 +168,7 @@ export const AdminRefreshToken = async (req: Request, res: Response) => {
 
     const newAccessToken = signAccessToken(admin._id.toString());
 
-    res.cookie("access_token", newAccessToken, {
+    res.cookie("admin_token", newAccessToken, {
       httpOnly: true,
       secure: isSecure,
       sameSite: "lax",

@@ -8,6 +8,7 @@ import {
   whoami,
   refreshToken,
 } from "../controllers/authControllers.js";
+import { userAuthenticate } from "../middleware/authenticationMiddleware.js";
 
 const userAuthRouter = express.Router();
 
@@ -17,7 +18,7 @@ userAuthRouter.post("/login", login); // User Login route
 
 userAuthRouter.post("/refresh", refreshToken); // User Refresh Token route
 
-userAuthRouter.get("/me", whoami); // User Info route
+userAuthRouter.get("/me", userAuthenticate, whoami); // User Info route
 
 userAuthRouter.post("/logout", logout); // User Logout route
 

@@ -20,8 +20,8 @@ proTraderDashboardRouter.post("/signals", createSignal);
 
 proTraderDashboardRouter.get("/signals", getAllSignals);
 
-proTraderDashboardRouter.delete("/signals/:id", deleteSignal);
+proTraderDashboardRouter.delete("/signals/:signalId", deleteSignal);
 
-proTraderDashboardRouter.put("/signals/:id", updateSignal);
+proTraderDashboardRouter.patch("/signals/:signalId", updateSignal);
 
 export default proTraderDashboardRouter;

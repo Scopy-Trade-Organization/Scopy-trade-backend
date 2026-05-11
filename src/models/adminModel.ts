@@ -1,5 +1,6 @@
 import validator from "validator";
 import { Schema, model, InferSchemaType, HydratedDocument } from "mongoose";
+import bcrypt from "bcrypt";
 
 const adminSchema = new Schema(
   {
@@ -56,6 +57,10 @@ const adminSchema = new Schema(
   },
   { timestamps: true },
 );
+
+adminSchema.methods.comparePassword = async function (enteredPassword: string) {
+  return await bcrypt.compare(enteredPassword, this.password);
+};
 
 export type Admin = InferSchemaType<typeof adminSchema>;
 export type AdminDocument = HydratedDocument<Admin>;

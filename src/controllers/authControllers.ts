@@ -294,7 +294,7 @@ export const refreshToken = async (req: Request, res: Response) => {
 
     const newAccessToken = signAccessToken(user._id.toString());
 
-    res.cookie("access_token", newAccessToken, {
+    res.cookie("user_token", newAccessToken, {
       httpOnly: true,
       secure: isSecure,
       sameSite: "lax",

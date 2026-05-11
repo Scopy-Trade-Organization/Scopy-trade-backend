@@ -14,7 +14,7 @@ adminDashboardRouter.use(adminAuthenticate);
 
 adminDashboardRouter.get("/signals", getAllSignals);
 adminDashboardRouter.get("/users", fetchAllUsers);
-adminDashboardRouter.put("/users/:id/suspend", suspendUser);
-adminDashboardRouter.put("/users/:id/activate", activateUser);
+adminDashboardRouter.patch("/users/:id/suspend", suspendUser);
+adminDashboardRouter.patch("/users/:id/activate", activateUser);
 
 export default adminDashboardRouter;
