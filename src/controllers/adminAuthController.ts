@@ -112,7 +112,7 @@ export const adminWhoami = async (req: Request, res: Response) => {
 
     return res.status(200).json({
       status: "success",
-      admin,
+      data: admin,
     });
   } catch (err: any) {
     console.error("Error fetching admin info:", err);

@@ -245,7 +245,7 @@ export const whoami = async (req: Request, res: Response) => {
 
     return res.status(200).json({
       status: "success",
-      user,
+      data: user,
     });
   } catch (err: any) {
     console.error("Error fetching user info:", err);
