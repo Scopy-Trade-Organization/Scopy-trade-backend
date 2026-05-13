@@ -112,7 +112,7 @@ export const adminWhoami = async (req: Request, res: Response) => {
 
     return res.status(200).json({
       status: "success",
-      data: { admin },
+      admin,
     });
   } catch (err: any) {
     console.error("Error fetching admin info:", err);
@@ -171,7 +171,7 @@ export const AdminRefreshToken = async (req: Request, res: Response) => {
     res.cookie("admin_token", newAccessToken, {
       httpOnly: true,
       secure: isSecure,
-      sameSite: "lax",
+      sameSite: "none",
       maxAge: 24 * 60 * 60 * 1000,
     });
 

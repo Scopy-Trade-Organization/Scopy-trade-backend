@@ -154,6 +154,13 @@ export const login = async (
       });
     }
 
+    if (user.status === "suspended") {
+      return res.status(403).json({
+        status: "fail",
+        message: "Your account has been suspended. Please contact support.",
+      });
+    }
+
     // if (!user.isVerified) {
     //   return res.status(401).json({
     //     status: "fail",
@@ -238,7 +245,7 @@ export const whoami = async (req: Request, res: Response) => {
 
     return res.status(200).json({
       status: "success",
-      data: { user },
+      user,
     });
   } catch (err: any) {
     console.error("Error fetching user info:", err);

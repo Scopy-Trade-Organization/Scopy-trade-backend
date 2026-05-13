@@ -171,3 +171,38 @@ export const activateUser = async (req: Request, res: Response) => {
     });
   }
 };
+
+export const fetchAuditLogs = async (req: Request, res: Response) => {
+  try {
+    const { page = 1, action } = req.query;
+    const filter: any = {};
+
+    if (action) {
+      filter.action = action;
+    }
+
+    const limit = 10;
+    const currentPage = Number(page);
+    const skip = (currentPage - 1) * limit;
+
+    const logs = await AuditLog.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .skip(skip);
+
+    return res.status(200).json({
+      success: true,
+      message: "Audit logs retrieved successfully",
+      logs,
+      page: currentPage,
+      limit,
+      pages: Math.ceil((await AuditLog.countDocuments(filter)) / limit),
+    });
+  } catch (error) {
+    console.error("Error fetching audit logs:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+};
