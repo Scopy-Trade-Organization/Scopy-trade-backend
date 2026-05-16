@@ -76,26 +76,35 @@ export const registerUser = async (
     const hashedPassword = await bcrypt.hash(password, 12);
 
     // Check if user already exists
+    // Check if user already exists
     const existingUser = await User.findOne({ email });
-    if (existingUser && existingUser.isVerified) {
+
+    if (existingUser) {
+      // User exists and verified
+      if (existingUser.isVerified) {
+        return res.status(400).json({
+          status: "fail",
+          message: "User is already registered and verified",
+        });
+      }
+
+      // User exists but not verified
       return res.status(400).json({
         status: "fail",
-        message: "User is already registered and verified",
-      });
-    } else {
-      // Create new user
-      await User.create({
-        email,
-        password: hashedPassword,
-        firstName,
-        lastName,
-        role,
-        traderID:
-          role === "CopyTrader"
-            ? generateCopyTraderID()
-            : generateProTraderID(),
+        message: "User already exists but is not verified",
       });
     }
+
+    // Create new user
+    await User.create({
+      email,
+      password: hashedPassword,
+      firstName,
+      lastName,
+      role,
+      traderID:
+        role === "CopyTrader" ? generateCopyTraderID() : generateProTraderID(),
+    });
 
     // Respond with success
     return res.status(201).json({
