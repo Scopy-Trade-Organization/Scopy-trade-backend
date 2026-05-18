@@ -1,4 +1,4 @@
-import express from "express";
+import express, { Request, Response, NextFunction } from "express";
 import compression from "compression";
 import "dotenv/config";
 import helmet from "helmet";
@@ -46,7 +46,7 @@ app.use("/api", cookieParser());
 app.use("/api", express.urlencoded({ extended: true }));
 app.use("/api", helmet());
 app.use("/api", limiter);
-app.use((req, res, next) => {
+app.use((req: Request, res: Response, next: NextFunction) => {
   req.body = sanitize(req.body);
   req.params = sanitize(req.params);
 

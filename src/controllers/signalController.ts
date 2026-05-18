@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import Signal from "../models/signalModel.js";
+import { Signal } from "../middleware/signalModel.js";
 
 export const getAllSignals = async (req: Request, res: Response) => {
   try {
