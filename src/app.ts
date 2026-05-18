@@ -12,6 +12,7 @@ import adminDashboardRouter from "./routes/adminDashboardRoutes.js";
 import adminAuthRouter from "./routes/adminAuthRoutes.js";
 import { sanitize } from "./middleware/mongodbSantizer.js";
 import proTraderDashboardRouter from "./routes/proTraderDashboardRoutes.js";
+import signalRouter from "./routes/signalRoutes.js";
 // import "./config/passport.js";
 
 // Rate limiting configuration
@@ -63,5 +64,6 @@ app.use("/api/exchanges", exchangeRouter);
 app.use("/api/admin/dashboard", adminDashboardRouter);
 app.use("/api/admin/auth", adminAuthRouter);
 app.use("/api/pro-trader/dashboard", proTraderDashboardRouter);
+app.use("/api/signals", signalRouter);
 
 export default app;

@@ -38,7 +38,8 @@ export const adminLogin = async (
     }
 
     const token = signAccessToken(admin._id.toString());
-    admin.password = null;
+    const adminObj = admin.toObject();
+    delete adminObj.password;
 
     await AuditLog.create({
       action: "Admin login attempt",
@@ -70,7 +71,7 @@ export const adminLogin = async (
 
     return res.status(200).json({
       status: "success",
-      data: { admin },
+      data: { admin: adminObj },
     });
   } catch (err: any) {
     console.error("Admin login error:", err);
