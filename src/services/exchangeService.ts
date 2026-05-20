@@ -25,11 +25,17 @@ axiosRetry(http, {
 
 function normalizeError(err: unknown): Error {
   if (axios.isAxiosError(err)) {
+    console.log("BINANCE ERROR:", {
+      status: err.response?.status,
+      data: err.response?.data,
+      headers: err.response?.headers,
+    });
+
     return new Error(
-      err.response?.data?.msg ||
-        err.response?.data?.retMsg ||
-        err.message ||
-        "Exchange request failed",
+      JSON.stringify({
+        status: err.response?.status,
+        data: err.response?.data,
+      }),
     );
   }
 
@@ -108,6 +114,7 @@ const validateBinance: Validator<BinanceAccountInfo> = async ({
   apiSecret,
 }) => {
   try {
+    console.log("VALIDATING BINANCE");
     const { data: timeData } = await http.get(
       process.env.BINANCE_TEST_API_URL + "/api/v3/time",
     );
@@ -140,6 +147,12 @@ const validateBinance: Validator<BinanceAccountInfo> = async ({
       permissions: data.permissions,
     };
   } catch (err) {
+    console.log("RAW BINANCE ERROR", err);
+
+    if (axios.isAxiosError(err)) {
+      console.log("AXIOS RESPONSE", err.response?.data);
+    }
+
     throw normalizeError(err);
   }
 };
