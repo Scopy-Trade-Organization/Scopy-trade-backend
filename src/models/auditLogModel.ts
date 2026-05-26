@@ -30,8 +30,8 @@ const auditLogSchema = new Schema(
   { timestamps: true },
 );
 
-export type AuditLog = InferSchemaType<typeof auditLogSchema>;
-export type AuditLogDocument = HydratedDocument<AuditLog>;
+export type IAuditLog = InferSchemaType<typeof auditLogSchema>;
+export type AuditLogDocument = HydratedDocument<IAuditLog>;
 
 const AuditLog = model("AuditLog", auditLogSchema);
 

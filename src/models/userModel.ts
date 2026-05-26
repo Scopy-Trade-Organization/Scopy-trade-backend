@@ -86,8 +86,8 @@ userSchema.methods.comparePassword = async function (enteredPassword: string) {
 userSchema.index({ status: 1, createdAt: -1 });
 userSchema.index({ isVerified: 1, createdAt: -1 });
 
-export type User = InferSchemaType<typeof userSchema>;
-export type UserDocument = HydratedDocument<User>;
+export type IUser = InferSchemaType<typeof userSchema>;
+export type UserDocument = HydratedDocument<IUser>;
 
 const User = model("User", userSchema);
 

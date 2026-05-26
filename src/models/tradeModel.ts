@@ -2,6 +2,12 @@ import { Schema, model, InferSchemaType, HydratedDocument } from "mongoose";
 
 const tradeSchema = new Schema(
   {
+    userId: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
     pair: {
       type: String,
       required: true,
@@ -10,20 +16,40 @@ const tradeSchema = new Schema(
       type: String,
       required: true,
     },
+    sl: {
+      type: String,
+      required: true,
+    },
     signalId: {
       type: Schema.Types.ObjectId,
       ref: "Signal",
       required: true,
     },
-    exchangeId: {
+    // References ExchangeConnection, not a raw exchange name
+    exchangeConnectionId: {
       type: Schema.Types.ObjectId,
-      ref: "Exchange",
+      ref: "ExchangeConnection",
+      required: true,
+    },
+    // The exchange-native order ID returned at placement
+    exchangeOrderId: {
+      type: String,
+      default: null,
+    },
+    direction: {
+      type: String,
+      enum: ["buy", "sell"],
+      required: true,
+    },
+    quantity: {
+      type: String,
       required: true,
     },
     status: {
       type: String,
-      enum: ["open", "closed", "cancelled"],
+      enum: ["open", "closed", "cancelled", "failed"],
       default: "open",
+      index: true,
     },
     entryPrice: {
       type: String,
@@ -38,6 +64,34 @@ const tradeSchema = new Schema(
       enum: ["profit", "loss", "breakeven", null],
       default: null,
     },
+    // Raw response snapshot from the exchange at order placement
+    rawOrderResponse: {
+      type: Schema.Types.Mixed,
+      default: null,
+    },
+    // Last status check snapshot from the exchange
+    lastCheckedAt: {
+      type: Date,
+      default: null,
+    },
+    rawStatusResponse: {
+      type: Schema.Types.Mixed,
+      default: null,
+    },
+    closedAt: {
+      type: Date,
+      default: null,
+    },
   },
   { timestamps: true },
 );
+
+// Prevent duplicate trades for the same signal on the same exchange connection
+tradeSchema.index({ signalId: 1, exchangeConnectionId: 1 }, { unique: true });
+
+tradeSchema.index({ userId: 1, status: 1, createdAt: -1 });
+
+export type ITrade = InferSchemaType<typeof tradeSchema>;
+export type TradeDocument = HydratedDocument<ITrade>;
+
+export const Trade = model<TradeDocument>("Trade", tradeSchema);

@@ -1,5 +1,4 @@
 import { Router } from "express";
-import axios from "axios";
 import {
   getSupportedExchanges,
   connectExchange,
@@ -13,21 +12,6 @@ import { validateConnectBody } from "../middleware/validateExchange.js";
 import { connectionLimiter } from "../middleware/rateLimit.js";
 
 const exchangeRouter = Router();
-
-exchangeRouter.get("/test-binance", async (_, res) => {
-  try {
-    const response = await axios.get(
-      "https://testnet.binance.vision/api/v3/time",
-    );
-
-    res.json(response.data);
-  } catch (err: any) {
-    res.status(500).json({
-      status: err.response?.status,
-      data: err.response?.data,
-    });
-  }
-});
 
 // All routes require a valid JWT
 exchangeRouter.use(userAuthenticate);

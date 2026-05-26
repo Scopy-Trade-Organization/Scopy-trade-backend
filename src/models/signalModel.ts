@@ -45,8 +45,8 @@ const signalSchema = new Schema(
   { timestamps: true },
 );
 
-export type Signal = InferSchemaType<typeof signalSchema>;
+export type ISignal = InferSchemaType<typeof signalSchema>;
 
-export type SignalDocument = HydratedDocument<Signal>;
+export type SignalDocument = HydratedDocument<ISignal>;
 
 export const Signal = model<SignalDocument>("Signal", signalSchema);

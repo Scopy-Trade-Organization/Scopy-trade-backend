@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import AuditLog from "../models/auditLogModel.js";
-import { Signal } from "../middleware/signalModel.js";
+import { Signal } from "../models/signalModel.js";
 import User from "../models/userModel.js";
 
 export const getAllSignals = async (req: Request, res: Response) => {

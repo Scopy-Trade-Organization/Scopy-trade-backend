@@ -62,8 +62,8 @@ adminSchema.methods.comparePassword = async function (enteredPassword: string) {
   return await bcrypt.compare(enteredPassword, this.password);
 };
 
-export type Admin = InferSchemaType<typeof adminSchema>;
-export type AdminDocument = HydratedDocument<Admin>;
+export type IAdmin = InferSchemaType<typeof adminSchema>;
+export type AdminDocument = HydratedDocument<IAdmin>;
 const Admin = model("Admin", adminSchema);
 
 export default Admin;
