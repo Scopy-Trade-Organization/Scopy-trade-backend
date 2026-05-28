@@ -28,6 +28,12 @@ const allowedOrigins = [
 
 const app = express();
 
+app.get("/ip", async (_, res) => {
+  const response = await fetch("https://api.ipify.org?format=json");
+  const data = await response.json();
+  res.json(data);
+});
+
 // Middleware
 app.use(
   cors({
@@ -55,12 +61,6 @@ app.use((req, res, next) => {
     }
   }
   next();
-});
-
-app.get("/ip", async (_, res) => {
-  const response = await fetch("https://api.ipify.org?format=json");
-  const data = await response.json();
-  res.json(data);
 });
 
 // Define API routes
