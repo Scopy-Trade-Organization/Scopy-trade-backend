@@ -57,6 +57,12 @@ app.use((req, res, next) => {
   next();
 });
 
+app.get("/ip", async (_, res) => {
+  const response = await fetch("https://api.ipify.org?format=json");
+  const data = await response.json();
+  res.json(data);
+});
+
 // Define API routes
 app.use("/api/auth", authRouter);
 app.use("/api/exchanges", exchangeRouter);

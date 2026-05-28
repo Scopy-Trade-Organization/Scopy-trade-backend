@@ -170,9 +170,11 @@ const validateBybit: Validator<BybitAccountInfo> = async ({
       throw new Error(data.retMsg || "Invalid Bybit API credentials.");
 
     const info = data.result;
+
     const hasTradePermission =
-      (info.permissions?.ContractTrade?.length ?? 0) > 0 ||
-      (info.permissions?.SpotTrade?.length ?? 0) > 0;
+      (info.permissions?.Spot?.includes("SpotTrade") ?? false) ||
+      (info.permissions?.Derivatives?.includes("DerivativesTrade") ?? false);
+
     if (!hasTradePermission)
       throw new Error(
         "API key does not have trading permissions. Enable Spot or Derivatives trading in Bybit API settings.",
