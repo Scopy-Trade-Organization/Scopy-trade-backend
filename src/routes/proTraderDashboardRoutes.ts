@@ -8,7 +8,7 @@ import {
   deleteSignal,
   getAllSignals,
   updateSignal,
-} from "../controllers/proTraderDashboardController.js";
+} from "../controllers/proTraderDashboardControlleri.js";
 
 const proTraderDashboardRouter = Router();
 
