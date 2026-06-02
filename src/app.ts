@@ -9,6 +9,7 @@ import cors from "cors";
 import authRouter from "./routes/userAuthRoutes.js";
 import exchangeRouter from "./routes/exchangeRoutes.js";
 import adminDashboardRouter from "./routes/adminDashboardRoutes.js";
+import tradeRouter from "./routes/tradeRoutes.js";
 import adminAuthRouter from "./routes/adminAuthRoutes.js";
 import { sanitize } from "./middleware/mongodbSantizer.js";
 import proTraderDashboardRouter from "./routes/proTraderDashboardRoutes.js";
@@ -71,5 +72,5 @@ app.use("/api/admin/dashboard", adminDashboardRouter);
 app.use("/api/admin/auth", adminAuthRouter);
 app.use("/api/pro-trader/dashboard", proTraderDashboardRouter);
 app.use("/api/signals", signalRouter);
-
+app.use("/api/trades", tradeRouter);
 export default app;

@@ -8,8 +8,108 @@ import {
   placeOrder,
   getOrderStatus,
   attachBinanceTpSl,
+  getExchangeBalance,
 } from "../services/exchangeService.js";
 import { ExchangeId } from "../types/index.js";
+
+// ─── Fetch Exchange Balances ──────────────────────────────────────────────────
+export async function fetchExchangeBalances(req: Request, res: Response) {
+  try {
+    const userId = req.user as mongoose.Types.ObjectId;
+    console.info("[fetchExchangeBalances] request", {
+      userId: String(userId),
+    });
+
+    const connections = await ExchangeConnection.find({
+      userId,
+      isActive: true,
+    }).lean();
+
+    if (!connections.length) {
+      const response = {
+        balances: [],
+        message: "No active exchange connections found.",
+      };
+      console.info("[fetchExchangeBalances] response", response);
+      return res.status(200).json(response);
+    }
+
+    // Fan out to all exchanges concurrently; settle independently
+    const results = await Promise.allSettled(
+      connections.map(async (connection) => {
+        console.log("[fetchExchangeBalances] testing exchange", {
+          connectionId: String(connection._id),
+          exchange: connection.exchange,
+        });
+
+        const storedCreds = {
+          exchange: connection.exchange as ExchangeId,
+          apiKey: connection.encryptedApiKey!,
+          apiSecret: connection.encryptedApiSecret!,
+          ...(connection.encryptedPassphrase
+            ? { passphrase: connection.encryptedPassphrase }
+            : {}),
+        };
+
+        const rawCreds = decryptCredentials(storedCreds);
+        const balanceData = await getExchangeBalance(
+          connection.exchange as ExchangeId,
+          rawCreds,
+        );
+
+        return {
+          connectionId: String(connection._id),
+          exchange: connection.exchange,
+          label: connection.label ?? "",
+          status: "ok" as const,
+          totalUsdtEquivalent: balanceData.totalUsdtEquivalent,
+          balances: balanceData.balances,
+        };
+      }),
+    );
+
+    const balances = results.map((result, i) => {
+      const connection = connections[i]!;
+
+      if (result.status === "fulfilled") {
+        return result.value;
+      }
+
+      // Rejected: surface a sanitized error — never leak raw credential data
+      const errMsg =
+        result.reason instanceof Error
+          ? result.reason.message
+          : "Balance fetch failed.";
+
+      const reason = result.reason as any;
+
+      console.error(`[${connection.exchange}] failed for ${connection._id}`, {
+        message: reason?.message,
+        exchange: reason?.exchange,
+        raw: reason,
+      });
+
+      return {
+        connectionId: String(connection._id),
+        exchange: connection.exchange,
+        label: connection.label ?? "",
+        status: "error" as const,
+        totalUsdtEquivalent: null,
+        balances: [],
+        error: errMsg,
+      };
+    });
+
+    const response = { balances };
+    console.info("[fetchExchangeBalances] response", response);
+    return res.status(200).json(response);
+  } catch (err) {
+    console.error("[fetchExchangeBalances]", err);
+    const response = { message: "Internal server error." };
+    console.error("[fetchExchangeBalances] response", response);
+    return res.status(500).json(response);
+  }
+}
 
 // ─── Initiate Trade ───────────────────────────────────────────────────────────
 

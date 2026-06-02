@@ -41,6 +41,35 @@ function normalizeError(err: unknown): Error {
   return new Error("Unknown error occurred");
 }
 
+async function getBybitTimestamp(baseUrl: string): Promise<string> {
+  interface BybitTimeResponse {
+    retCode: number;
+    retMsg: string;
+    result: {
+      timeSecond: string;
+      timeNano: string;
+    };
+    time?: number;
+  }
+
+  const { data } = await http.get<BybitTimeResponse>(
+    `${baseUrl}/v5/market/time`,
+  );
+
+  if (data.retCode !== 0) {
+    throw new Error(data.retMsg || "Failed to fetch Bybit server time.");
+  }
+
+  if (typeof data.time === "number") return String(data.time);
+
+  const timeSecond = Number(data.result?.timeSecond);
+  if (!Number.isFinite(timeSecond)) {
+    throw new Error("Bybit returned an invalid server time.");
+  }
+
+  return String(timeSecond * 1000);
+}
+
 // ─── Encryption Helpers ────────────────────────────────────────────────────────
 
 const ALGORITHM = "aes-256-gcm" as const;
@@ -136,7 +165,8 @@ const validateBybit: Validator<BybitAccountInfo> = async ({
   apiSecret,
 }) => {
   try {
-    const timestamp = Date.now().toString();
+    const baseUrl = process.env.BYBIT_TEST_API_URL!;
+    const timestamp = await getBybitTimestamp(baseUrl);
     const recvWindow = "5000";
     const signPayload = timestamp + apiKey + recvWindow;
     const signature = crypto
@@ -155,7 +185,7 @@ const validateBybit: Validator<BybitAccountInfo> = async ({
     }
 
     const { data } = await http.get<BybitResponse>(
-      process.env.BYBIT_TEST_API_URL + "/v5/user/query-api",
+      `${baseUrl}/v5/user/query-api`,
       {
         headers: {
           "X-BAPI-API-KEY": apiKey,
@@ -450,7 +480,7 @@ async function placeBybitOrder(
   const { apiKey, apiSecret } = p.credentials;
   const baseUrl = process.env.BYBIT_TEST_API_URL!;
 
-  const timestamp = Date.now().toString();
+  const timestamp = await getBybitTimestamp(baseUrl);
   const recvWindow = "5000";
   const body = JSON.stringify({
     category: "spot",
@@ -641,7 +671,7 @@ async function getBybitOrderStatus(
 ): Promise<OrderStatusResult> {
   const { apiKey, apiSecret } = credentials;
   const baseUrl = process.env.BYBIT_TEST_API_URL!;
-  const timestamp = Date.now().toString();
+  const timestamp = await getBybitTimestamp(baseUrl);
   const recvWindow = "5000";
   const signPayload = `${timestamp}${apiKey}${recvWindow}category=spot&orderId=${orderId}&symbol=${pair}`;
   const signature = crypto
@@ -862,5 +892,318 @@ export async function attachBinanceTpSl(
     await placeBinanceTpSl(params);
   } catch (err) {
     throw normalizeError(err);
+  }
+}
+
+// ─── Balance Types ────────────────────────────────────────────────────────────
+
+export interface AssetBalance {
+  asset: string;
+  free: string;
+  locked: string;
+}
+
+export interface ExchangeBalance {
+  balances: AssetBalance[]; // non-zero assets only
+  totalUsdtEquivalent: string | null; // provided natively by some exchanges
+}
+
+// ─── Per-Exchange Balance Fetchers ────────────────────────────────────────────
+
+async function getBinanceBalance(
+  credentials: RawCredentials,
+): Promise<ExchangeBalance> {
+  const { apiKey, apiSecret } = credentials;
+  const baseUrl = process.env.BINANCE_TEST_API_URL!;
+
+  try {
+    const { data: timeData } = await http.get(`${baseUrl}/api/v3/time`);
+    const timestamp = timeData.serverTime as number;
+
+    const qs = `timestamp=${timestamp}`;
+    const signature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(qs)
+      .digest("hex");
+
+    interface BinanceAccountResponse {
+      balances: Array<{ asset: string; free: string; locked: string }>;
+    }
+
+    const { data } = await http.get<BinanceAccountResponse>(
+      `${baseUrl}/api/v3/account`,
+      {
+        params: { timestamp, signature },
+        headers: { "X-MBX-APIKEY": apiKey },
+      },
+    );
+
+    const nonZero = data.balances.filter(
+      (b) => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0,
+    );
+
+    const usdtEntry = nonZero.find(
+      (b) => b.asset === "USDT" || b.asset === "BUSD",
+    );
+
+    const totalUsdtEquivalent = usdtEntry
+      ? String(parseFloat(usdtEntry.free) + parseFloat(usdtEntry.locked))
+      : null;
+
+    return {
+      balances: nonZero.map((b) => ({
+        asset: b.asset,
+        free: b.free,
+        locked: b.locked,
+      })),
+      totalUsdtEquivalent,
+    };
+  } catch (err: any) {
+    const status = err?.response?.status;
+    const msg = err?.response?.data?.msg || err?.message;
+
+    if (status === 401 || status === 403) {
+      throw new Error("Binance: Insufficient permissions");
+    }
+
+    if (msg?.toLowerCase?.().includes("permission")) {
+      throw new Error(`Binance: ${msg}`);
+    }
+
+    throw new Error(`Binance error: ${msg || "Unknown error"}`);
+  }
+}
+
+async function getBybitBalance(
+  credentials: RawCredentials,
+): Promise<ExchangeBalance> {
+  const { apiKey, apiSecret } = credentials;
+  const baseUrl = process.env.BYBIT_TEST_API_URL!;
+
+  try {
+    const timestamp = await getBybitTimestamp(baseUrl);
+    const recvWindow = "5000";
+    const queryString = "accountType=UNIFIED";
+    const signPayload = timestamp + apiKey + recvWindow + queryString;
+    const signature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(signPayload)
+      .digest("hex");
+
+    interface BybitBalanceResponse {
+      retCode: number;
+      retMsg: string;
+      result: {
+        list: Array<{
+          totalEquity: string;
+          coin: Array<{
+            coin: string;
+            walletBalance: string;
+            locked: string;
+          }>;
+        }>;
+      };
+    }
+
+    const { data } = await http.get<BybitBalanceResponse>(
+      `${baseUrl}/v5/account/wallet-balance`,
+      {
+        params: { accountType: "UNIFIED" },
+        headers: {
+          "X-BAPI-API-KEY": apiKey,
+          "X-BAPI-SIGN": signature,
+          "X-BAPI-TIMESTAMP": timestamp,
+          "X-BAPI-RECV-WINDOW": recvWindow,
+        },
+      },
+    );
+
+    if (data.retCode !== 0)
+      throw new Error(data.retMsg || "Bybit balance fetch failed.");
+
+    const account = data.result.list[0];
+    if (!account) throw new Error("Bybit returned an empty wallet response.");
+
+    const nonZero = account.coin.filter((c) => parseFloat(c.walletBalance) > 0);
+
+    return {
+      balances: nonZero.map((c) => ({
+        asset: c.coin,
+        free: String(parseFloat(c.walletBalance) - parseFloat(c.locked || "0")),
+        locked: c.locked || "0",
+      })),
+      totalUsdtEquivalent: account.totalEquity || null,
+    };
+  } catch (err: any) {
+    const status = err?.response?.status;
+    const msg = err?.response?.data?.retMsg || err?.message;
+
+    if (status === 401 || status === 403) {
+      throw new Error("Bybit: Insufficient permissions");
+    }
+
+    if (msg?.toLowerCase?.().includes("permission")) {
+      throw new Error(`Bybit: ${msg}`);
+    }
+
+    throw new Error(`Bybit error: ${msg || "Unknown error"}`);
+  }
+}
+
+async function getOkxBalance(
+  credentials: RawCredentials,
+): Promise<ExchangeBalance> {
+  const { apiKey, apiSecret, passphrase } = credentials;
+  if (!passphrase) throw new Error("OKX requires a passphrase.");
+
+  const timestamp = new Date().toISOString();
+  const method = "GET";
+  const path = "/api/v5/account/balance";
+  const signPayload = timestamp + method + path;
+  const signature = crypto
+    .createHmac("sha256", apiSecret)
+    .update(signPayload)
+    .digest("base64");
+
+  interface OkxBalanceResponse {
+    code: string;
+    msg: string;
+    data: Array<{
+      totalEq: string;
+      details: Array<{
+        ccy: string;
+        availBal: string;
+        frozenBal: string;
+      }>;
+    }>;
+  }
+
+  const { data } = await http.get<OkxBalanceResponse>(
+    "https://www.okx.com" + path,
+    {
+      headers: {
+        "OK-ACCESS-KEY": apiKey,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": passphrase,
+        "x-simulated-trading": "0",
+      },
+    },
+  );
+
+  if (data.code !== "0")
+    throw new Error(data.msg || "OKX balance fetch failed.");
+
+  const account = data.data[0];
+  if (!account) throw new Error("OKX returned an empty balance response.");
+
+  const nonZero = account.details.filter(
+    (d) => parseFloat(d.availBal) > 0 || parseFloat(d.frozenBal) > 0,
+  );
+
+  return {
+    balances: nonZero.map((d) => ({
+      asset: d.ccy,
+      free: d.availBal,
+      locked: d.frozenBal,
+    })),
+    totalUsdtEquivalent: account.totalEq || null,
+  };
+}
+
+async function getBitgetBalance(
+  credentials: RawCredentials,
+): Promise<ExchangeBalance> {
+  const { apiKey, apiSecret, passphrase } = credentials;
+  if (!passphrase) throw new Error("Bitget requires a passphrase.");
+
+  const timestamp = Date.now().toString();
+  const method = "GET";
+  const path = "/api/v2/spot/account/assets";
+  const signPayload = timestamp + method + path;
+  const signature = crypto
+    .createHmac("sha256", apiSecret)
+    .update(signPayload)
+    .digest("base64");
+
+  interface BitgetBalanceResponse {
+    code: string;
+    msg: string;
+    data: Array<{
+      coin: string;
+      available: string;
+      frozen: string;
+      locked: string;
+      usdtValue: string;
+    }>;
+  }
+
+  const { data } = await http.get<BitgetBalanceResponse>(
+    "https://api.bitget.com" + path,
+    {
+      headers: {
+        "ACCESS-KEY": apiKey,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": passphrase,
+        "Content-Type": "application/json",
+      },
+    },
+  );
+
+  if (data.code !== "00000")
+    throw new Error(data.msg || "Bitget balance fetch failed.");
+
+  const nonZero = (data.data ?? []).filter(
+    (a) => parseFloat(a.available) > 0 || parseFloat(a.frozen) > 0,
+  );
+
+  // Sum USDT values reported natively by Bitget per-asset
+  const totalUsdt = nonZero.reduce(
+    (sum, a) => sum + parseFloat(a.usdtValue || "0"),
+    0,
+  );
+
+  return {
+    balances: nonZero.map((a) => ({
+      asset: a.coin,
+      free: a.available,
+      locked: String(parseFloat(a.frozen) + parseFloat(a.locked || "0")),
+    })),
+    totalUsdtEquivalent: totalUsdt > 0 ? String(totalUsdt) : null,
+  };
+}
+
+// ─── Balance Fetcher Registry ─────────────────────────────────────────────────
+
+const balanceFetcher: Record<
+  ExchangeId,
+  (credentials: RawCredentials) => Promise<ExchangeBalance>
+> = {
+  binance: getBinanceBalance,
+  bybit: getBybitBalance,
+  okx: getOkxBalance,
+  bitget: getBitgetBalance,
+};
+
+// ─── Public Balance API ───────────────────────────────────────────────────────
+
+/**
+ * Fetches the spot wallet balance for a given exchange.
+ * Returns only non-zero asset entries to keep the payload lean.
+ */
+export async function getExchangeBalance(
+  exchange: ExchangeId,
+  credentials: RawCredentials,
+): Promise<ExchangeBalance> {
+  try {
+    return await balanceFetcher[exchange](credentials);
+  } catch (err) {
+    const error = normalizeError(err);
+
+    // attach exchange context
+    (error as any).exchange = exchange;
+
+    throw error;
   }
 }
