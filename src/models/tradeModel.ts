@@ -47,13 +47,17 @@ const tradeSchema = new Schema(
     },
     status: {
       type: String,
-      enum: ["open", "closed", "cancelled", "failed"],
-      default: "open",
+      enum: ["pending", "filled", "closed", "cancelled", "failed"],
+      default: "pending",
       index: true,
     },
     entryPrice: {
       type: String,
       required: true,
+    },
+    entryFillPrice: {
+      type: String,
+      default: null,
     },
     exitPrice: {
       type: String,

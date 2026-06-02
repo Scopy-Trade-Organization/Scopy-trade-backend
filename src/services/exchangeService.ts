@@ -403,8 +403,13 @@ export interface PlacedOrderResult {
 }
 
 export interface OrderStatusResult {
-  status: "open" | "closed" | "cancelled" | "failed";
+  status: "pending" | "filled" | "closed" | "cancelled" | "failed";
   filledPrice: string | null;
+  raw: unknown;
+}
+
+export interface CurrentPriceResult {
+  price: string;
   raw: unknown;
 }
 
@@ -649,17 +654,24 @@ async function getBinanceOrderStatus(
   });
 
   const statusMap: Record<string, OrderStatusResult["status"]> = {
-    FILLED: "closed",
+    FILLED: "filled",
     CANCELED: "cancelled",
     REJECTED: "failed",
     EXPIRED: "cancelled",
-    NEW: "open",
-    PARTIALLY_FILLED: "open",
+    NEW: "pending",
+    PARTIALLY_FILLED: "pending",
   };
 
+  const executedQty = parseFloat(data.executedQty ?? "0");
+  const cummulativeQuoteQty = parseFloat(data.cummulativeQuoteQty ?? "0");
+  const averageFillPrice =
+    executedQty > 0 && cummulativeQuoteQty > 0
+      ? String(cummulativeQuoteQty / executedQty)
+      : data.avgPrice || data.price || null;
+
   return {
-    status: statusMap[data.status] ?? "open",
-    filledPrice: data.avgPrice || data.price || null,
+    status: statusMap[data.status] ?? "pending",
+    filledPrice: averageFillPrice,
     raw: data,
   };
 }
@@ -703,15 +715,15 @@ async function getBybitOrderStatus(
   if (!order) throw new Error("Order not found on Bybit.");
 
   const statusMap: Record<string, OrderStatusResult["status"]> = {
-    Filled: "closed",
+    Filled: "filled",
     Cancelled: "cancelled",
     Rejected: "failed",
-    New: "open",
-    PartiallyFilled: "open",
+    New: "pending",
+    PartiallyFilled: "pending",
   };
 
   return {
-    status: statusMap[order.orderStatus] ?? "open",
+    status: statusMap[order.orderStatus] ?? "pending",
     filledPrice: order.avgPrice || null,
     raw: data,
   };
@@ -756,14 +768,14 @@ async function getOkxOrderStatus(
   if (!order) throw new Error("Order not found on OKX.");
 
   const statusMap: Record<string, OrderStatusResult["status"]> = {
-    filled: "closed",
+    filled: "filled",
     canceled: "cancelled",
-    live: "open",
-    partially_filled: "open",
+    live: "pending",
+    partially_filled: "pending",
   };
 
   return {
-    status: statusMap[order.state] ?? "open",
+    status: statusMap[order.state] ?? "pending",
     filledPrice: order.avgPx || null,
     raw: data,
   };
@@ -808,17 +820,69 @@ async function getBitgetOrderStatus(
   if (!order) throw new Error("Order not found on Bitget.");
 
   const statusMap: Record<string, OrderStatusResult["status"]> = {
-    full_fill: "closed",
-    partial_fill: "open",
+    full_fill: "filled",
+    partial_fill: "pending",
     cancelled: "cancelled",
-    live: "open",
+    live: "pending",
   };
 
   return {
-    status: statusMap[order.status] ?? "open",
+    status: statusMap[order.status] ?? "pending",
     filledPrice: order.priceAvg || null,
     raw: data,
   };
+}
+
+// ─── Market Price Fetchers ───────────────────────────────────────────────────
+
+async function getBinanceCurrentPrice(
+  pair: string,
+): Promise<CurrentPriceResult> {
+  const baseUrl = process.env.BINANCE_TEST_API_URL!;
+  const { data } = await http.get(`${baseUrl}/api/v3/ticker/price`, {
+    params: { symbol: pair },
+  });
+
+  if (!data?.price) throw new Error("Binance returned an invalid ticker.");
+  return { price: String(data.price), raw: data };
+}
+
+async function getBybitCurrentPrice(pair: string): Promise<CurrentPriceResult> {
+  const baseUrl = process.env.BYBIT_TEST_API_URL!;
+  const { data } = await http.get(`${baseUrl}/v5/market/tickers`, {
+    params: { category: "spot", symbol: pair },
+  });
+
+  if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit ticker failed.");
+  const ticker = data.result?.list?.[0];
+  if (!ticker?.lastPrice) throw new Error("Bybit returned an invalid ticker.");
+
+  return { price: String(ticker.lastPrice), raw: data };
+}
+
+async function getOkxCurrentPrice(pair: string): Promise<CurrentPriceResult> {
+  const { data } = await http.get("https://www.okx.com/api/v5/market/ticker", {
+    params: { instId: pair },
+  });
+
+  if (data.code !== "0") throw new Error(data.msg || "OKX ticker failed.");
+  const ticker = data.data?.[0];
+  if (!ticker?.last) throw new Error("OKX returned an invalid ticker.");
+
+  return { price: String(ticker.last), raw: data };
+}
+
+async function getBitgetCurrentPrice(pair: string): Promise<CurrentPriceResult> {
+  const { data } = await http.get("https://api.bitget.com/api/v2/spot/market/tickers", {
+    params: { symbol: pair },
+  });
+
+  if (data.code !== "00000")
+    throw new Error(data.msg || "Bitget ticker failed.");
+  const ticker = data.data?.[0];
+  if (!ticker?.lastPr) throw new Error("Bitget returned an invalid ticker.");
+
+  return { price: String(ticker.lastPr), raw: data };
 }
 
 // ─── Order Registry ───────────────────────────────────────────────────────────
@@ -845,6 +909,16 @@ const statusChecker: Record<
   bybit: getBybitOrderStatus,
   okx: getOkxOrderStatus,
   bitget: getBitgetOrderStatus,
+};
+
+const priceFetcher: Record<
+  ExchangeId,
+  (pair: string) => Promise<CurrentPriceResult>
+> = {
+  binance: getBinanceCurrentPrice,
+  bybit: getBybitCurrentPrice,
+  okx: getOkxCurrentPrice,
+  bitget: getBitgetCurrentPrice,
 };
 
 // ─── Public Order API ─────────────────────────────────────────────────────────
@@ -876,6 +950,17 @@ export async function getOrderStatus(
 ): Promise<OrderStatusResult> {
   try {
     return await statusChecker[exchange](credentials, pair, orderId);
+  } catch (err) {
+    throw normalizeError(err);
+  }
+}
+
+export async function getCurrentPrice(
+  exchange: ExchangeId,
+  pair: string,
+): Promise<CurrentPriceResult> {
+  try {
+    return await priceFetcher[exchange](pair);
   } catch (err) {
     throw normalizeError(err);
   }

@@ -1,8 +1,8 @@
 /**
  * tradeStatusJob.ts
  *
- * Background polling job that periodically checks all open trades against
- * their respective exchanges and resolves their status (closed / cancelled / failed).
+ * Background polling job that periodically checks pending entry orders against
+ * their respective exchanges and advances them to filled / cancelled / failed.
  *
  * Run this with node-cron (or equivalent) — recommended interval: every 2 minutes.
  *
@@ -33,25 +33,25 @@ async function processBatch() {
 
   const cutoff = new Date(Date.now() - MIN_CHECK_INTERVAL_MS);
 
-  // Fetch open trades that haven't been checked recently
-  const openTrades = await Trade.find({
-    status: "open",
+  // Fetch pending entry orders that haven't been checked recently
+  const pendingTrades = await Trade.find({
+    status: "pending",
     exchangeOrderId: { $ne: null },
     $or: [{ lastCheckedAt: null }, { lastCheckedAt: { $lte: cutoff } }],
   })
     .limit(BATCH_SIZE)
     .lean();
 
-  if (!openTrades.length) {
+  if (!pendingTrades.length) {
     console.log("[tradeStatusJob] No trades to process.");
     return;
   }
 
-  console.log(`[tradeStatusJob] Processing ${openTrades.length} trades.`);
+  console.log(`[tradeStatusJob] Processing ${pendingTrades.length} trades.`);
 
   // Group by exchangeConnectionId to reuse decrypted credentials
   const connectionIds = [
-    ...new Set(openTrades.map((t) => t.exchangeConnectionId.toString())),
+    ...new Set(pendingTrades.map((t) => t.exchangeConnectionId.toString())),
   ];
 
   const connections = await ExchangeConnection.find({
@@ -62,7 +62,7 @@ async function processBatch() {
 
   // Process each trade independently — don't let one failure abort the rest
   await Promise.allSettled(
-    openTrades.map(async (trade) => {
+    pendingTrades.map(async (trade) => {
       const connection = connectionMap.get(
         trade.exchangeConnectionId.toString(),
       );
@@ -99,23 +99,14 @@ async function processBatch() {
           rawStatusResponse: statusResult.raw,
         };
 
-        if (statusResult.status !== "open") {
+        if (statusResult.status !== "pending") {
           update.status = statusResult.status;
 
           if (statusResult.filledPrice) {
-            update.exitPrice = statusResult.filledPrice;
+            update.entryFillPrice = statusResult.filledPrice;
           }
 
-          if (statusResult.status === "closed") {
-            update.closedAt = new Date();
-            update.tradeResult = resolveTradeResult(
-              trade.direction as "buy" | "sell",
-              trade.entryPrice,
-              statusResult.filledPrice,
-              trade.tp,
-              trade.sl,
-            );
-
+          if (statusResult.status === "filled") {
             // Binance: entry filled → now place the TP/SL OCO
             if (connection.exchange === "binance") {
               attachBinanceTpSl({

@@ -9,8 +9,12 @@ import {
   getOrderStatus,
   attachBinanceTpSl,
   getExchangeBalance,
+  getCurrentPrice,
 } from "../services/exchangeService.js";
 import { ExchangeId } from "../types/index.js";
+
+const DEFAULT_RISK_FRACTION = 0.03;
+const DEFAULT_MAX_ENTRY_DEVIATION = 0.02;
 
 // ─── Fetch Exchange Balances ──────────────────────────────────────────────────
 export async function fetchExchangeBalances(req: Request, res: Response) {
@@ -112,30 +116,16 @@ export async function fetchExchangeBalances(req: Request, res: Response) {
 }
 
 // ─── Initiate Trade ───────────────────────────────────────────────────────────
-
-/**
- * POST /trades
- * Body: { signalId, exchangeConnectionId, quantity }
- *
- * Flow:
- *  1. Validate the signal is still active.
- *  2. Verify the exchange connection belongs to the requesting user and is active.
- *  3. Guard against duplicate (same signal + same connection).
- *  4. Decrypt stored credentials.
- *  5. Place the order on the exchange.
- *  6. Persist the trade record with the returned exchange order ID.
- *  7. For Binance, attach the TP/SL OCO order immediately (fire-and-forget with
- *     a logged error — the polling job will catch unresolved trades).
- */
 export async function initiateTrade(req: Request, res: Response) {
   try {
     const userId = req.user as mongoose.Types.ObjectId;
-    const { signalId, exchangeConnectionId, quantity } = req.body;
+    const { signalId, exchangeConnectionId, balance } = req.body;
 
     // ── 1. Input validation ──────────────────────────────────────────────────
-    if (!signalId || !exchangeConnectionId || !quantity) {
+    if (!signalId || !exchangeConnectionId || !balance) {
       return res.status(400).json({
-        message: "signalId, exchangeConnectionId, and quantity are required.",
+        success: true,
+        message: "signalId, exchangeConnectionId, and balance are required.",
       });
     }
 
@@ -143,23 +133,31 @@ export async function initiateTrade(req: Request, res: Response) {
       !mongoose.isValidObjectId(signalId) ||
       !mongoose.isValidObjectId(exchangeConnectionId)
     ) {
-      return res.status(400).json({ message: "Invalid ID format." });
+      return res.status(400).json({
+        success: true,
+        message: "Invalid ID format.",
+      });
     }
 
-    const parsedQty = parseFloat(quantity);
-    if (isNaN(parsedQty) || parsedQty <= 0) {
-      return res
-        .status(400)
-        .json({ message: "quantity must be a positive number." });
+    const parsedBalance = parseFloat(balance);
+    if (isNaN(parsedBalance) || parsedBalance <= 0) {
+      return res.status(400).json({
+        success: true,
+        message: "balance must be a positive number.",
+      });
     }
 
     // ── 2. Fetch & validate the signal ───────────────────────────────────────
     const signal = await Signal.findById(signalId).lean();
     if (!signal) {
-      return res.status(404).json({ message: "Signal not found." });
+      return res.status(404).json({
+        success: true,
+        message: "Signal not found.",
+      });
     }
     if (signal.status !== "active") {
       return res.status(409).json({
+        success: true,
         message: "This signal is no longer active and cannot be copied.",
       });
     }
@@ -173,6 +171,7 @@ export async function initiateTrade(req: Request, res: Response) {
 
     if (!connection) {
       return res.status(404).json({
+        success: true,
         message:
           "Exchange connection not found or does not belong to your account.",
       });
@@ -186,6 +185,7 @@ export async function initiateTrade(req: Request, res: Response) {
 
     if (existing) {
       return res.status(409).json({
+        success: true,
         message:
           "You have already initiated a trade for this signal on this exchange.",
         trade: { _id: existing._id, status: existing.status },
@@ -203,6 +203,69 @@ export async function initiateTrade(req: Request, res: Response) {
     };
 
     const rawCreds = decryptCredentials(storedCreds);
+
+    let currentPriceResult;
+    try {
+      currentPriceResult = await getCurrentPrice(
+        connection.exchange as ExchangeId,
+        signal.pair,
+      );
+    } catch (priceErr) {
+      const message =
+        priceErr instanceof Error
+          ? priceErr.message
+          : "Current price lookup failed.";
+      console.error("[initiateTrade] Price lookup error:", message);
+      return res.status(502).json({
+        message: "Failed to fetch current market price.",
+        detail: message,
+      });
+    }
+
+    const entryPrice = parseFloat(signal.entry);
+    const currentPrice = parseFloat(currentPriceResult.price);
+
+    if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
+      return res.status(422).json({
+        message: "Signal entry price is invalid.",
+      });
+    }
+
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+      return res.status(502).json({
+        message: "Exchange returned an invalid current price.",
+      });
+    }
+
+    const configuredMaxDeviation = parseFloat(
+      process.env.TRADE_ENTRY_DEVIATION_LIMIT ?? "",
+    );
+    const maxDeviation =
+      Number.isFinite(configuredMaxDeviation) && configuredMaxDeviation > 0
+        ? configuredMaxDeviation
+        : DEFAULT_MAX_ENTRY_DEVIATION;
+    const deviation = Math.abs(currentPrice - entryPrice) / entryPrice;
+
+    if (deviation > maxDeviation) {
+      return res.status(409).json({
+        message: "Current market price is too far from the signal entry price.",
+        pair: signal.pair,
+        entryPrice: signal.entry,
+        currentPrice: currentPriceResult.price,
+        deviation: Number(deviation.toFixed(6)),
+        maxDeviation,
+      });
+    }
+
+    const capitalToUse = parsedBalance * DEFAULT_RISK_FRACTION;
+    const quantity = capitalToUse / currentPrice;
+    const parsedQty = parseFloat(quantity.toFixed(6));
+
+    if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
+      return res.status(422).json({
+        message: "Calculated order quantity is invalid.",
+      });
+    }
 
     // ── 6. Place the order on the exchange ───────────────────────────────────
     let placed;
@@ -240,29 +303,19 @@ export async function initiateTrade(req: Request, res: Response) {
       exchangeOrderId: placed.orderId,
       quantity: String(parsedQty),
       entryPrice: signal.entry,
-      status: "open",
-      rawOrderResponse: placed.raw,
+      status: "pending",
+      rawOrderResponse: {
+        order: placed.raw,
+        marketPrice: currentPriceResult.raw,
+        sizing: {
+          balance: parsedBalance,
+          riskFraction: DEFAULT_RISK_FRACTION,
+          capitalToUse,
+          currentPrice: currentPriceResult.price,
+          deviation,
+        },
+      },
     });
-
-    // ── 8. Binance: attach TP/SL OCO (best-effort, logged on failure) ────────
-    if (connection.exchange === "binance") {
-      attachBinanceTpSl({
-        credentials: rawCreds,
-        pair: signal.pair,
-        direction: signal.direction as "buy" | "sell",
-        quantity: String(parsedQty),
-        entryPrice: signal.entry,
-        tp: signal.tp,
-        sl: signal.sl,
-        orderId: placed.orderId,
-      }).catch((tpSlErr) => {
-        // Non-fatal: polling job will retry resolution
-        console.error(
-          `[initiateTrade] Binance TP/SL attachment failed for trade ${trade._id}:`,
-          tpSlErr,
-        );
-      });
-    }
 
     return res.status(201).json({
       message: "Trade initiated successfully.",
@@ -307,9 +360,9 @@ export async function refreshTradeStatus(req: Request, res: Response) {
       return res.status(404).json({ message: "Trade not found." });
     }
 
-    if (trade.status !== "open") {
+    if (trade.status !== "pending") {
       return res.status(200).json({
-        message: "Trade is already resolved.",
+        message: "Trade entry order is no longer pending.",
         trade,
       });
     }
@@ -363,19 +416,31 @@ export async function refreshTradeStatus(req: Request, res: Response) {
     trade.lastCheckedAt = new Date();
     trade.rawStatusResponse = statusResult.raw;
 
-    if (statusResult.status !== "open") {
+    if (statusResult.status !== "pending") {
       trade.status = statusResult.status;
-      if (statusResult.filledPrice) trade.exitPrice = statusResult.filledPrice;
+      if (statusResult.filledPrice) {
+        trade.entryFillPrice = statusResult.filledPrice;
+      }
 
-      if (statusResult.status === "closed") {
-        trade.closedAt = new Date();
-        trade.tradeResult = resolveTradeResult(
-          trade.direction as "buy" | "sell",
-          trade.entryPrice,
-          statusResult.filledPrice,
-          trade.tp,
-          trade.sl,
-        );
+      if (
+        statusResult.status === "filled" &&
+        connection.exchange === "binance"
+      ) {
+        attachBinanceTpSl({
+          credentials: rawCreds,
+          pair: trade.pair,
+          direction: trade.direction as "buy" | "sell",
+          quantity: trade.quantity,
+          entryPrice: trade.entryPrice,
+          tp: trade.tp,
+          sl: trade.sl,
+          orderId: trade.exchangeOrderId,
+        }).catch((tpSlErr) => {
+          console.error(
+            `[refreshTradeStatus] Binance TP/SL attachment failed for trade ${trade._id}:`,
+            tpSlErr,
+          );
+        });
       }
     }
 
@@ -392,7 +457,7 @@ export async function refreshTradeStatus(req: Request, res: Response) {
 
 /**
  * GET /trades
- * Query params: status (open|closed|cancelled|failed), page, limit
+ * Query params: status (pending|filled|closed|cancelled|failed), page, limit
  */
 export async function getUserTrades(req: Request, res: Response) {
   try {
