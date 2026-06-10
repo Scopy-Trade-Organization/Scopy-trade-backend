@@ -20,8 +20,7 @@ export const getAllSignals = async (req: Request, res: Response) => {
     const signals = await Signal.find(filter)
       .sort({ createdAt: -1 })
       .limit(limit)
-      .skip(skip)
-      .sort({ createdAt: -1 });
+      .skip(skip);
 
     return res.status(200).json({
       success: true,

@@ -4,6 +4,7 @@ import {
   fetchAllUsers,
   getAllSignals,
   suspendUser,
+  fetchAuditLogs,
 } from "../controllers/adminDashboardController.js";
 import { adminAuthenticate } from "../middleware/authenticationMiddleware.js";
 
@@ -16,5 +17,6 @@ adminDashboardRouter.get("/signals", getAllSignals);
 adminDashboardRouter.get("/users", fetchAllUsers);
 adminDashboardRouter.patch("/users/:id/suspend", suspendUser);
 adminDashboardRouter.patch("/users/:id/activate", activateUser);
+adminDashboardRouter.get("/audit-logs", fetchAuditLogs);
 
 export default adminDashboardRouter;

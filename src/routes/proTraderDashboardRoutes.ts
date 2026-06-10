@@ -8,6 +8,7 @@ import {
   deleteSignal,
   getAllSignals,
   updateSignal,
+  withdrawFunds,
 } from "../controllers/proTraderDashboardController.js";
 
 const proTraderDashboardRouter = Router();
@@ -23,5 +24,7 @@ proTraderDashboardRouter.get("/signals", getAllSignals);
 proTraderDashboardRouter.delete("/signals/:signalId", deleteSignal);
 
 proTraderDashboardRouter.patch("/signals/:signalId", updateSignal);
+
+proTraderDashboardRouter.post("/withdraw", withdrawFunds);
 
 export default proTraderDashboardRouter;

@@ -1,6 +1,9 @@
 import { Request, Response } from "express";
 import AuditLog from "../models/auditLogModel.js";
 import { Signal } from "../models/signalModel.js";
+import { decryptCredentials, withdrawUsdt } from "../services/exchangeService.js";
+import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
+import { EncryptedCredentials } from "../types/index.js";
 
 export const createSignal = async (req: Request, res: Response) => {
   try {
@@ -187,3 +190,86 @@ export const getAllSignals = async (req: Request, res: Response) => {
     });
   }
 };
+
+export const withdrawFunds = async (req: Request, res: Response) => {
+  try {
+    const { amount, destinationAddress } = req.body;
+
+    if (!amount || !destinationAddress) {
+      return res.status(400).json({
+        success: false,
+        message: "Amount and destination address are required",
+      });
+    }
+
+    // Find active exchange connection for the logged-in pro-trader
+    const connection = await ExchangeConnection.findOne({
+      userId: req.user,
+      isActive: true,
+    });
+
+    if (!connection) {
+      return res.status(400).json({
+        success: false,
+        message: "No active exchange connection found.",
+      });
+    }
+
+    if (!connection.encryptedApiKey || !connection.encryptedApiSecret) {
+      return res.status(422).json({
+        success: false,
+        message: "Exchange credentials are missing. Please reconnect your exchange.",
+      });
+    }
+
+    // Decrypt credentials
+    const storedCredentials: EncryptedCredentials = {
+      exchange: connection.exchange,
+      apiKey: connection.encryptedApiKey,
+      apiSecret: connection.encryptedApiSecret,
+      ...(connection.encryptedPassphrase != null && {
+        passphrase: connection.encryptedPassphrase,
+      }),
+    };
+
+    const credentials = decryptCredentials(storedCredentials);
+
+    // Call unified withdrawal service
+    const amountStr = String(amount);
+    const result = await withdrawUsdt(
+      connection.exchange,
+      credentials,
+      amountStr,
+      destinationAddress,
+    );
+
+    // Log the withdrawal in AuditLog
+    await AuditLog.create({
+      userId: req.user,
+      action: "Exchange Withdrawal Initiated",
+      details: {
+        exchange: connection.exchange,
+        connectionId: connection._id,
+        amount: amountStr,
+        destinationAddress,
+        transactionId: result.transactionId,
+      },
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Withdrawal initiated successfully",
+      transactionId: result.transactionId,
+      data: result.raw,
+    });
+  } catch (error) {
+    console.error("Error initiating withdrawal:", error);
+    return res.status(500).json({
+      success: false,
+      message: (error as Error).message || "Internal server error",
+    });
+  }
+};
+
