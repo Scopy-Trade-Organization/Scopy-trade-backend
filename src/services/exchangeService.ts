@@ -280,7 +280,7 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
       throw new Error("Bitget requires a passphrase. Please provide it.");
     const timestamp = Date.now().toString();
     const method = "GET";
-    const path = "/api/v2/user/info";
+    const path = "/api/v2/spot/account/info";
     const signPayload = timestamp + method + path;
     const signature = crypto
       .createHmac("sha256", apiSecret)
@@ -304,7 +304,8 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
       BITGET_BASE_URL + path,
       {
         headers: {
-          "ACCESS-KEY": apiKey,
+          paptrading: "1",
+        "ACCESS-KEY": apiKey,
           "ACCESS-SIGN": signature,
           "ACCESS-TIMESTAMP": timestamp,
           "ACCESS-PASSPHRASE": passphrase,
@@ -626,6 +627,7 @@ async function placeBitgetOrder(
     body,
     {
       headers: {
+        paptrading: "1",
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -813,6 +815,7 @@ async function getBitgetOrderStatus(
     BITGET_BASE_URL + path,
     {
       headers: {
+        paptrading: "1",
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -1233,6 +1236,7 @@ async function getBitgetBalance(
     BITGET_BASE_URL + path,
     {
       headers: {
+        paptrading: "1",
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -1337,6 +1341,7 @@ async function withdrawBitget(
     body,
     {
       headers: {
+        paptrading: "1",
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
