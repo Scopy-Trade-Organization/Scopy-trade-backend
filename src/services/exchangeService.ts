@@ -335,6 +335,10 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
       trader: info.trader,
     };
   } catch (error) {
+    if (axios.isAxiosError(error) && error.response) {
+      console.error("Bitget API Error Response:", JSON.stringify(error.response.data, null, 2));
+      throw new Error("Bitget validation failed: " + JSON.stringify(error.response.data));
+    }
     throw normalizeError(error);
   }
 };
