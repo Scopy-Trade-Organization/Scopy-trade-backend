@@ -1,9 +1,8 @@
 import { Request, Response } from "express";
 import AuditLog from "../models/auditLogModel.js";
 import { Signal } from "../models/signalModel.js";
-import { decryptCredentials, withdrawUsdt } from "../services/exchangeService.js";
-import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
-import { EncryptedCredentials } from "../types/index.js";
+import User from "../models/userModel.js";
+import { TronWeb } from "tronweb";
 
 export const createSignal = async (req: Request, res: Response) => {
   try {
@@ -191,68 +190,118 @@ export const getAllSignals = async (req: Request, res: Response) => {
   }
 };
 
-export const withdrawFunds = async (req: Request, res: Response) => {
+export const saveWalletAddress = async (req: Request, res: Response) => {
   try {
-    const { amount, destinationAddress } = req.body;
+    const { address } = req.body;
 
-    if (!amount || !destinationAddress) {
+    if (!address || typeof address !== "string" || !address.startsWith("T") || address.length !== 34) {
       return res.status(400).json({
         success: false,
-        message: "Amount and destination address are required",
+        message: "Invalid TRC-20 wallet address. It must start with 'T' and be 34 characters long.",
       });
     }
 
-    // Find active exchange connection for the logged-in pro-trader
-    const connection = await ExchangeConnection.findOne({
-      userId: req.user,
-      isActive: true,
-    });
-
-    if (!connection) {
-      return res.status(400).json({
-        success: false,
-        message: "No active exchange connection found.",
-      });
-    }
-
-    if (!connection.encryptedApiKey || !connection.encryptedApiSecret) {
-      return res.status(422).json({
-        success: false,
-        message: "Exchange credentials are missing. Please reconnect your exchange.",
-      });
-    }
-
-    // Decrypt credentials
-    const storedCredentials: EncryptedCredentials = {
-      exchange: connection.exchange,
-      apiKey: connection.encryptedApiKey,
-      apiSecret: connection.encryptedApiSecret,
-      ...(connection.encryptedPassphrase != null && {
-        passphrase: connection.encryptedPassphrase,
-      }),
-    };
-
-    const credentials = decryptCredentials(storedCredentials);
-
-    // Call unified withdrawal service
-    const amountStr = String(amount);
-    const result = await withdrawUsdt(
-      connection.exchange,
-      credentials,
-      amountStr,
-      destinationAddress,
+    const user = await User.findByIdAndUpdate(
+      req.user,
+      { withdrawalAddress: address },
+      { new: true }
     );
 
-    // Log the withdrawal in AuditLog
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
     await AuditLog.create({
       userId: req.user,
-      action: "Exchange Withdrawal Initiated",
+      action: "Wallet Address Updated",
+      details: { address },
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Wallet address saved successfully",
+      withdrawalAddress: user.withdrawalAddress,
+    });
+  } catch (error) {
+    console.error("Error saving wallet address:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+};
+
+export const getWalletAddress = async (req: Request, res: Response) => {
+  try {
+    const user = await User.findById(req.user);
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.status(200).json({
+      success: true,
+      withdrawalAddress: user.withdrawalAddress || null,
+    });
+  } catch (error) {
+    console.error("Error fetching wallet address:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+};
+
+export const withdrawFunds = async (req: Request, res: Response) => {
+  try {
+    const { amount } = req.body;
+
+    if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid amount is required",
+      });
+    }
+
+    const user = await User.findById(req.user);
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    if (!user.withdrawalAddress) {
+      return res.status(400).json({
+        success: false,
+        message: "No withdrawal address found. Please save your TRC-20 wallet address first.",
+      });
+    }
+
+    // TODO: Validate that the user has sufficient balance in the SCopyTrade system
+    // const hasSufficientBalance = ... 
+    // if (!hasSufficientBalance) return res.status(400).json({ message: "Insufficient balance" });
+
+    const privateKey = process.env.TRON_COMPANY_PRIVATE_KEY;
+    if (!privateKey) {
+      return res.status(500).json({ success: false, message: "Server configuration error: Missing Tron private key" });
+    }
+
+    const tronWeb = new TronWeb({
+      fullHost: "https://api.trongrid.io",
+      privateKey: privateKey,
+    });
+
+    // USDT TRC20 Mainnet Contract Address
+    const usdtContractAddress = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
+    const contract = await tronWeb.contract().at(usdtContractAddress);
+    
+    // Convert amount to USDT decimals (6)
+    const amountInSun = tronWeb.toBigNumber(amount).times(1_000_000).toString(10);
+    
+    const transactionId = await contract.transfer(user.withdrawalAddress, amountInSun).send();
+
+    await AuditLog.create({
+      userId: req.user,
+      action: "Withdrawal Executed",
       details: {
-        exchange: connection.exchange,
-        connectionId: connection._id,
-        amount: amountStr,
-        destinationAddress,
-        transactionId: result.transactionId,
+        amount,
+        destinationAddress: user.withdrawalAddress,
+        transactionId,
       },
       ipAddress: req.ip,
       userAgent: req.headers["user-agent"],
@@ -261,11 +310,10 @@ export const withdrawFunds = async (req: Request, res: Response) => {
     return res.status(200).json({
       success: true,
       message: "Withdrawal initiated successfully",
-      transactionId: result.transactionId,
-      data: result.raw,
+      transactionId,
     });
   } catch (error) {
-    console.error("Error initiating withdrawal:", error);
+    console.error("Error executing withdrawal:", error);
     return res.status(500).json({
       success: false,
       message: (error as Error).message || "Internal server error",

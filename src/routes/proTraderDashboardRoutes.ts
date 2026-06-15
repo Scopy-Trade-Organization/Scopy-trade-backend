@@ -9,6 +9,8 @@ import {
   getAllSignals,
   updateSignal,
   withdrawFunds,
+  saveWalletAddress,
+  getWalletAddress,
 } from "../controllers/proTraderDashboardController.js";
 
 const proTraderDashboardRouter = Router();
@@ -16,6 +18,9 @@ const proTraderDashboardRouter = Router();
 // authentication and role-based access control middleware
 proTraderDashboardRouter.use(userAuthenticate);
 proTraderDashboardRouter.use(requireRole(["Pro Trader"]));
+
+proTraderDashboardRouter.post("/wallet", saveWalletAddress);
+proTraderDashboardRouter.get("/wallet", getWalletAddress);
 
 proTraderDashboardRouter.post("/signals", createSignal);
 
