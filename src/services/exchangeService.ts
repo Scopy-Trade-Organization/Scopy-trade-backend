@@ -12,6 +12,8 @@ import {
 } from "../types/index.js";
 import axiosRetry from "axios-retry";
 
+const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
+
 export const http = axios.create({
   timeout: 8000,
 });
@@ -299,7 +301,7 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
     }
 
     const { data } = await http.get<BitgetResponse>(
-      "https://api.bitget.com" + path,
+      BITGET_BASE_URL + path,
       {
         headers: {
           "ACCESS-KEY": apiKey,
@@ -616,7 +618,7 @@ async function placeBitgetOrder(
   }
 
   const { data } = await http.post<BitgetOrderResponse>(
-    "https://api.bitget.com" + path,
+    BITGET_BASE_URL + path,
     body,
     {
       headers: {
@@ -804,7 +806,7 @@ async function getBitgetOrderStatus(
   }
 
   const { data } = await http.get<BitgetStatusResponse>(
-    "https://api.bitget.com" + path,
+    BITGET_BASE_URL + path,
     {
       headers: {
         "ACCESS-KEY": apiKey,
@@ -873,7 +875,7 @@ async function getOkxCurrentPrice(pair: string): Promise<CurrentPriceResult> {
 }
 
 async function getBitgetCurrentPrice(pair: string): Promise<CurrentPriceResult> {
-  const { data } = await http.get("https://api.bitget.com/api/v2/spot/market/tickers", {
+  const { data } = await http.get(BITGET_BASE_URL + "/api/v2/spot/market/tickers", {
     params: { symbol: pair },
   });
 
@@ -1224,7 +1226,7 @@ async function getBitgetBalance(
   }
 
   const { data } = await http.get<BitgetBalanceResponse>(
-    "https://api.bitget.com" + path,
+    BITGET_BASE_URL + path,
     {
       headers: {
         "ACCESS-KEY": apiKey,
@@ -1327,7 +1329,7 @@ async function withdrawBitget(
   }
 
   const { data } = await http.post<BitgetWithdrawResponse>(
-    "https://api.bitget.com" + path,
+    BITGET_BASE_URL + path,
     body,
     {
       headers: {
