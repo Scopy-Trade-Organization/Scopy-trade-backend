@@ -281,13 +281,18 @@ export const withdrawFunds = async (req: Request, res: Response) => {
       return res.status(500).json({ success: false, message: "Server configuration error: Missing Tron private key" });
     }
 
+    const usdtContractAddress = process.env.TRON_USDT_CONTRACT_ADDRESS;
+    if (!usdtContractAddress) {
+      return res.status(500).json({ success: false, message: "Server configuration error: Missing USDT contract address" });
+    }
+
+    const tronHost = process.env.TRON_FULL_HOST || "https://api.trongrid.io";
+
     const tronWeb = new TronWeb({
-      fullHost: "https://api.trongrid.io",
+      fullHost: tronHost,
       privateKey: privateKey,
     });
 
-    // USDT TRC20 Mainnet Contract Address
-    const usdtContractAddress = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
     const contract = await tronWeb.contract().at(usdtContractAddress);
     
     // Convert amount to USDT decimals (6)
