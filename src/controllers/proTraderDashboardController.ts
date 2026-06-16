@@ -192,6 +192,7 @@ export const getAllSignals = async (req: Request, res: Response) => {
 
 export const saveWalletAddress = async (req: Request, res: Response) => {
   try {
+    console.log("saveWalletAddress req.body:", req.body);
     const { address } = req.body;
 
     if (!address || typeof address !== "string") {
