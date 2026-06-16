@@ -608,15 +608,16 @@ async function placeBitgetOrder(
   const method = "POST";
   const path = "/api/v2/mix/order/place-order";
   const body = JSON.stringify({
-    symbol: toBitgetDemoSymbol(p.pair), // e.g. "SXRPSUSDT"
+    symbol: p.pair.replace(/\//g, ""), // e.g. "XRPUSDT"
     productType: "USDT-FUTURES",
     marginMode: "crossed",
     marginCoin: "USDT",
+    size: p.quantity,
+    price: p.entryPrice,
     side: p.direction,
+    tradeSide: "open",
     orderType: "limit",
     force: "gtc",
-    price: p.entryPrice,
-    size: p.quantity,
   });
 
   const signPayload = timestamp + method + path + body;
@@ -809,8 +810,8 @@ async function getBitgetOrderStatus(
 
   const timestamp = Date.now().toString();
   const method = "GET";
-  const normalizedPair = toBitgetDemoSymbol(pair);
-  const path = `/api/v2/mix/order/detail?symbol=${normalizedPair}&orderId=${orderId}&productType=USDT-FUTURES`;
+  const normalizedPair = pair.replace(/\//g, "");
+  const path = `/api/v2/mix/order/detail?symbol=${normalizedPair}&productType=USDT-FUTURES&orderId=${orderId}`;
   const signPayload = timestamp + method + path;
   const signature = crypto
     .createHmac("sha256", apiSecret)
@@ -893,7 +894,7 @@ async function getOkxCurrentPrice(pair: string): Promise<CurrentPriceResult> {
 }
 
 async function getBitgetCurrentPrice(pair: string): Promise<CurrentPriceResult> {
-  const normalizedPair = toBitgetDemoSymbol(pair);
+  const normalizedPair = pair.replace(/\//g, "");
   const { data } = await http.get(BITGET_BASE_URL + "/api/v2/mix/market/ticker", {
     params: { symbol: normalizedPair, productType: "USDT-FUTURES" },
     headers: { paptrading: "1" },
@@ -1455,15 +1456,5 @@ export async function withdrawUsdt(
   }
 }
 
-function toBitgetDemoSymbol(symbol: string): string {
-  const cleanSymbol = symbol.replace(/\//g, "").toUpperCase();
-  // Don't double convert if already in format
-  if (cleanSymbol.startsWith("S") && cleanSymbol.endsWith("SUSDT")) return cleanSymbol;
-  
-  if (cleanSymbol.endsWith("USDT")) {
-    const base = cleanSymbol.slice(0, -4);
-    return `S${base}SUSDT`;
-  }
-  return cleanSymbol;
-}
+
 
