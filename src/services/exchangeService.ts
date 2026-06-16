@@ -628,6 +628,7 @@ async function placeBitgetOrder(
     data: { orderId: string };
   }
 
+  console.log("Placing Bitget Order - URL:", BITGET_BASE_URL + path, "Body:", body);
   const { data } = await http.post<BitgetOrderResponse>(
     BITGET_BASE_URL + path,
     body,
