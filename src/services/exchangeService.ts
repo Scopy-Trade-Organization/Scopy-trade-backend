@@ -606,9 +606,12 @@ async function placeBitgetOrder(
 
   const timestamp = Date.now().toString();
   const method = "POST";
-  const path = "/api/v2/spot/trade/place-order";
+  const path = "/api/v2/mix/order/place-order";
   const body = JSON.stringify({
     symbol: toBitgetDemoSymbol(p.pair), // e.g. "SXRPSUSDT"
+    productType: "USDT-FUTURES",
+    marginMode: "crossed",
+    marginCoin: "USDT",
     side: p.direction,
     orderType: "limit",
     force: "gtc",
@@ -807,7 +810,7 @@ async function getBitgetOrderStatus(
   const timestamp = Date.now().toString();
   const method = "GET";
   const normalizedPair = toBitgetDemoSymbol(pair);
-  const path = `/api/v2/spot/trade/orderInfo?symbol=${normalizedPair}&orderId=${orderId}`;
+  const path = `/api/v2/mix/order/detail?symbol=${normalizedPair}&orderId=${orderId}&productType=USDT-FUTURES`;
   const signPayload = timestamp + method + path;
   const signature = crypto
     .createHmac("sha256", apiSecret)
@@ -891,8 +894,8 @@ async function getOkxCurrentPrice(pair: string): Promise<CurrentPriceResult> {
 
 async function getBitgetCurrentPrice(pair: string): Promise<CurrentPriceResult> {
   const normalizedPair = toBitgetDemoSymbol(pair);
-  const { data } = await http.get(BITGET_BASE_URL + "/api/v2/spot/market/tickers", {
-    params: { symbol: normalizedPair },
+  const { data } = await http.get(BITGET_BASE_URL + "/api/v2/mix/market/ticker", {
+    params: { symbol: normalizedPair, productType: "USDT-FUTURES" },
   });
 
   if (data.code !== "00000")
