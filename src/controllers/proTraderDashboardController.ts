@@ -194,10 +194,10 @@ export const saveWalletAddress = async (req: Request, res: Response) => {
   try {
     const { address } = req.body;
 
-    if (!address || typeof address !== "string" || !address.startsWith("T") || address.length < 33 || address.length > 36) {
+    if (!address || typeof address !== "string" || !address.startsWith("T")) {
       return res.status(400).json({
         success: false,
-        message: "Invalid TRC-20 wallet address. It must start with 'T' and be between 33 and 36 characters long.",
+        message: "Invalid TRC-20 wallet address. It must start with 'T'.",
       });
     }
 
