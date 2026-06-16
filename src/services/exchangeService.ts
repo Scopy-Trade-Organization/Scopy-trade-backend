@@ -324,7 +324,7 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
 
     const hasTradePermission = info.authorities && Array.isArray(info.authorities)
       ? info.authorities.some((a: string) =>
-          ["trade", "TRADE", "spot", "futures"].includes(a)
+          ["trade", "TRADE", "spot", "futures", "stow", "coow"].includes(a)
         )
       : true; // Bypass strict authorities check for demo keys or spot/account/info endpoints
 
