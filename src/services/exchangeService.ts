@@ -608,7 +608,7 @@ async function placeBitgetOrder(
   const method = "POST";
   const path = "/api/v2/spot/trade/place-order";
   const body = JSON.stringify({
-    symbol: p.pair, // e.g. "BTCUSDT"
+    symbol: p.pair.replace(/\//g, ""), // e.g. "BTCUSDT"
     side: p.direction,
     orderType: "limit",
     force: "gtc",
@@ -805,7 +805,8 @@ async function getBitgetOrderStatus(
 
   const timestamp = Date.now().toString();
   const method = "GET";
-  const path = `/api/v2/spot/trade/orderInfo?symbol=${pair}&orderId=${orderId}`;
+  const normalizedPair = pair.replace(/\//g, "");
+  const path = `/api/v2/spot/trade/orderInfo?symbol=${normalizedPair}&orderId=${orderId}`;
   const signPayload = timestamp + method + path;
   const signature = crypto
     .createHmac("sha256", apiSecret)
@@ -888,8 +889,9 @@ async function getOkxCurrentPrice(pair: string): Promise<CurrentPriceResult> {
 }
 
 async function getBitgetCurrentPrice(pair: string): Promise<CurrentPriceResult> {
+  const normalizedPair = pair.replace(/\//g, "");
   const { data } = await http.get(BITGET_BASE_URL + "/api/v2/spot/market/tickers", {
-    params: { symbol: pair },
+    params: { symbol: normalizedPair },
   });
 
   if (data.code !== "00000")
