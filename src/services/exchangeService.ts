@@ -896,7 +896,10 @@ async function getBitgetCurrentPrice(pair: string): Promise<CurrentPriceResult> 
   const normalizedPair = toBitgetDemoSymbol(pair);
   const { data } = await http.get(BITGET_BASE_URL + "/api/v2/mix/market/ticker", {
     params: { symbol: normalizedPair, productType: "USDT-FUTURES" },
+    headers: { paptrading: "1" },
   });
+
+  console.log("Bitget Ticker API Raw Response:", JSON.stringify(data, null, 2));
 
   if (data.code !== "00000")
     throw new Error(data.msg || "Bitget ticker failed.");
