@@ -608,7 +608,7 @@ async function placeBitgetOrder(
   const method = "POST";
   const path = "/api/v2/spot/trade/place-order";
   const body = JSON.stringify({
-    symbol: p.pair.replace(/\//g, ""), // e.g. "BTCUSDT"
+    symbol: toBitgetDemoSymbol(p.pair), // e.g. "SXRPSUSDT"
     side: p.direction,
     orderType: "limit",
     force: "gtc",
@@ -806,7 +806,7 @@ async function getBitgetOrderStatus(
 
   const timestamp = Date.now().toString();
   const method = "GET";
-  const normalizedPair = pair.replace(/\//g, "");
+  const normalizedPair = toBitgetDemoSymbol(pair);
   const path = `/api/v2/spot/trade/orderInfo?symbol=${normalizedPair}&orderId=${orderId}`;
   const signPayload = timestamp + method + path;
   const signature = crypto
@@ -890,7 +890,7 @@ async function getOkxCurrentPrice(pair: string): Promise<CurrentPriceResult> {
 }
 
 async function getBitgetCurrentPrice(pair: string): Promise<CurrentPriceResult> {
-  const normalizedPair = pair.replace(/\//g, "");
+  const normalizedPair = toBitgetDemoSymbol(pair);
   const { data } = await http.get(BITGET_BASE_URL + "/api/v2/spot/market/tickers", {
     params: { symbol: normalizedPair },
   });
@@ -1447,5 +1447,17 @@ export async function withdrawUsdt(
     (error as any).exchange = exchange;
     throw error;
   }
+}
+
+function toBitgetDemoSymbol(symbol: string): string {
+  const cleanSymbol = symbol.replace(/\//g, "").toUpperCase();
+  // Don't double convert if already in format
+  if (cleanSymbol.startsWith("S") && cleanSymbol.endsWith("SUSDT")) return cleanSymbol;
+  
+  if (cleanSymbol.endsWith("USDT")) {
+    const base = cleanSymbol.slice(0, -4);
+    return `S${base}SUSDT`;
+  }
+  return cleanSymbol;
 }
 
