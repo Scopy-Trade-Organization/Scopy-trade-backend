@@ -194,11 +194,13 @@ export const saveWalletAddress = async (req: Request, res: Response) => {
   try {
     console.log("saveWalletAddress req.body:", req.body);
     const { address } = req.body;
+    
+    console.log("saveWalletAddress address length:", address?.length);
 
-    if (!address || typeof address !== "string") {
+    if (!address || typeof address !== "string" || !address.startsWith("T") || address.length !== 34) {
       return res.status(400).json({
         success: false,
-        message: "A wallet address string is required.",
+        message: "Invalid TRC-20 wallet address. It must be a non-empty string, start with 'T', and be exactly 34 characters long.",
       });
     }
 
@@ -242,6 +244,12 @@ export const getWalletAddress = async (req: Request, res: Response) => {
     return res.status(200).json({
       success: true,
       withdrawalAddress: user.withdrawalAddress || null,
+      requirements: {
+        format: "TRC-20 (Tron Network)",
+        mustStartWith: "T",
+        length: 34,
+        example: "TRX address from any Tron wallet",
+      },
     });
   } catch (error) {
     console.error("Error fetching wallet address:", error);
