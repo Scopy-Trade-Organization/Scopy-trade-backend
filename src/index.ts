@@ -26,15 +26,15 @@ app.get("/api", (req: Request, res: Response) => {
   res.json({ message: "Hello from Express API!" });
 });
 
-app.listen(PORT, (err) => {
-  if (err) throw err;
-  console.log(`Server running at http://localhost:${PORT}`);
-});
-
 app.use((err: any, req: any, res: any, next: any) => {
   console.error(err);
   res.status(500).json({
     status: "error",
     message: err?.message ?? "Internal Server Error",
   });
+});
+
+app.listen(PORT, (err) => {
+  if (err) throw err;
+  console.log(`Server running at http://localhost:${PORT}`);
 });

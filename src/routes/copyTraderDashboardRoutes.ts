@@ -1,8 +1,3 @@
-/**
- * routes/copyTraderDashboardRoutes.ts
- * Mount at: /api/copy-trader-dashboard
- */
-
 import { Router } from "express";
 import {
   userAuthenticate,
@@ -19,17 +14,8 @@ const copyTraderDashboardRouter = Router();
 copyTraderDashboardRouter.use(userAuthenticate);
 copyTraderDashboardRouter.use(requireRole(["CopyTrader"]));
 
-/**
- * GET /api/signals/active
- * Lists all active signals; includes the requesting user's trade status
- * for each signal so the UI can show "already copying" state.
- */
-copyTraderDashboardRouter.get("/active", getActiveSignals);
+copyTraderDashboardRouter.get("/signals", getActiveSignals);
 
-/**
- * GET /api/signals/:signalId
- * Returns a single signal by ID.
- */
-copyTraderDashboardRouter.get("/:signalId", getSignalById);
+copyTraderDashboardRouter.get("/signals/:signalId", getSignalById);
 
 export default copyTraderDashboardRouter;

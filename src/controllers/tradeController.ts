@@ -7,7 +7,6 @@ import {
   decryptCredentials,
   placeOrder,
   getOrderStatus,
-  attachBinanceTpSl,
   getExchangeBalance,
   getCurrentPrice,
 } from "../services/exchangeService.js";
@@ -334,121 +333,6 @@ export async function initiateTrade(req: Request, res: Response) {
     });
   } catch (err) {
     console.error("[initiateTrade]", err);
-    return res.status(500).json({ message: "Internal server error." });
-  }
-}
-
-// ─── Refresh Trade Status ─────────────────────────────────────────────────────
-
-/**
- * POST /trades/:tradeId/refresh
- * Manually triggers a status check against the exchange for a single trade.
- * Useful for on-demand refreshes from the UI; background polling is handled
- * separately by the job in tradeStatusJob.ts.
- */
-export async function refreshTradeStatus(req: Request, res: Response) {
-  try {
-    const userId = req.user as mongoose.Types.ObjectId;
-    const { tradeId } = req.params;
-
-    if (!mongoose.isValidObjectId(tradeId)) {
-      return res.status(400).json({ message: "Invalid trade ID." });
-    }
-
-    const trade = await Trade.findOne({ _id: tradeId, userId });
-    if (!trade) {
-      return res.status(404).json({ message: "Trade not found." });
-    }
-
-    if (trade.status !== "pending") {
-      return res.status(200).json({
-        message: "Trade entry order is no longer pending.",
-        trade,
-      });
-    }
-
-    if (!trade.exchangeOrderId) {
-      return res.status(422).json({
-        message: "This trade has no exchange order ID to check.",
-      });
-    }
-
-    // Fetch the exchange connection for credentials
-    const connection = await ExchangeConnection.findById(
-      trade.exchangeConnectionId,
-    ).lean();
-
-    if (!connection) {
-      return res.status(404).json({
-        message: "Associated exchange connection not found.",
-      });
-    }
-
-    const storedCreds = {
-      exchange: connection.exchange as ExchangeId,
-      apiKey: connection.encryptedApiKey!,
-      apiSecret: connection.encryptedApiSecret!,
-      ...(connection.encryptedPassphrase
-        ? { passphrase: connection.encryptedPassphrase }
-        : {}),
-    };
-
-    const rawCreds = decryptCredentials(storedCreds);
-
-    let statusResult;
-    try {
-      statusResult = await getOrderStatus(
-        connection.exchange as ExchangeId,
-        rawCreds,
-        trade.pair,
-        trade.exchangeOrderId,
-      );
-    } catch (statusErr) {
-      const message =
-        statusErr instanceof Error ? statusErr.message : "Status check failed.";
-      return res.status(502).json({
-        message: "Failed to fetch order status from exchange.",
-        detail: message,
-      });
-    }
-
-    // Update the trade record
-    trade.lastCheckedAt = new Date();
-    trade.rawStatusResponse = statusResult.raw;
-
-    if (statusResult.status !== "pending") {
-      trade.status = statusResult.status;
-      if (statusResult.filledPrice) {
-        trade.entryFillPrice = statusResult.filledPrice;
-      }
-
-      if (
-        statusResult.status === "filled" &&
-        connection.exchange === "binance"
-      ) {
-        attachBinanceTpSl({
-          credentials: rawCreds,
-          pair: trade.pair,
-          direction: trade.direction as "buy" | "sell",
-          quantity: trade.quantity,
-          entryPrice: trade.entryPrice,
-          tp: trade.tp,
-          sl: trade.sl,
-          orderId: trade.exchangeOrderId,
-        }).catch((tpSlErr) => {
-          console.error(
-            `[refreshTradeStatus] Binance TP/SL attachment failed for trade ${trade._id}:`,
-            tpSlErr,
-          );
-        });
-      }
-    }
-
-    await trade.save();
-
-    return res.status(200).json({ trade });
-  } catch (err) {
-    console.error("[refreshTradeStatus]", err);
     return res.status(500).json({ message: "Internal server error." });
   }
 }

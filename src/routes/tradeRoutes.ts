@@ -1,7 +1,6 @@
 import { Router } from "express";
 import {
   initiateTrade,
-  refreshTradeStatus,
   getUserTrades,
   getTradeById,
   fetchExchangeBalances,
@@ -28,8 +27,5 @@ tradeRouter.get("/balances", fetchExchangeBalances);
 
 // Returns a single trade with populated signal and exchange connection info.
 tradeRouter.get("/:tradeId", getTradeById);
-
-// Triggers an on-demand status check for an open trade against the exchange.
-tradeRouter.post("/:tradeId/refresh", refreshTradeStatus);
 
 export default tradeRouter;
