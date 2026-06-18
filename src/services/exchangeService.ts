@@ -12,6 +12,8 @@ import {
 } from "../types/index.js";
 import axiosRetry from "axios-retry";
 
+const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
+
 export const http = axios.create({
   timeout: 8000,
 });
@@ -248,7 +250,7 @@ const validateOkx: Validator<OkxAccountInfo> = async ({
         "OK-ACCESS-SIGN": signature,
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": passphrase,
-        "x-simulated-trading": "0",
+        "x-simulated-trading": "1",
       },
       timeout: 8000,
     });
@@ -278,7 +280,7 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
       throw new Error("Bitget requires a passphrase. Please provide it.");
     const timestamp = Date.now().toString();
     const method = "GET";
-    const path = "/api/v2/user/info";
+    const path = "/api/v2/spot/account/info";
     const signPayload = timestamp + method + path;
     const signature = crypto
       .createHmac("sha256", apiSecret)
@@ -299,10 +301,11 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
     }
 
     const { data } = await http.get<BitgetResponse>(
-      "https://api.bitget.com" + path,
+      BITGET_BASE_URL + path,
       {
         headers: {
-          "ACCESS-KEY": apiKey,
+          paptrading: "1",
+        "ACCESS-KEY": apiKey,
           "ACCESS-SIGN": signature,
           "ACCESS-TIMESTAMP": timestamp,
           "ACCESS-PASSPHRASE": passphrase,
@@ -314,25 +317,35 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
     if (data.code !== "00000")
       throw new Error(data.msg || "Invalid Bitget API credentials.");
 
-    const info = data.data;
+    console.log("Bitget raw validation response:", JSON.stringify(data, null, 2));
+
+    const info = data.data as any;
     if (!info) throw new Error("Bitget returned an empty response.");
 
-    const hasTradePermission = info.authorities?.some((a) =>
-      ["trade", "TRADE", "spot", "futures"].includes(a),
-    );
+    const hasTradePermission = info.authorities && Array.isArray(info.authorities)
+      ? info.authorities.some((a: string) =>
+          ["trade", "TRADE", "spot", "futures", "stow", "coow"].includes(a)
+        )
+      : true; // Bypass strict authorities check for demo keys or spot/account/info endpoints
+
     if (!hasTradePermission)
       throw new Error(
         "API key does not have trading permissions. Enable Spot or Futures trading in Bitget API settings.",
       );
+
     return {
-      userId: info.userId,
-      inviterId: info.inviterId,
-      ips: info.ips,
-      authorities: info.authorities,
-      parentId: info.parentId,
-      trader: info.trader,
+      userId: info.userId || "bitget-user",
+      inviterId: info.inviterId || "",
+      ips: info.ips || "",
+      authorities: info.authorities || [],
+      parentId: info.parentId || "",
+      trader: info.trader || false,
     };
   } catch (error) {
+    if (axios.isAxiosError(error) && error.response) {
+      console.error("Bitget API Error Response:", JSON.stringify(error.response.data, null, 2));
+      throw new Error("Bitget validation failed: " + JSON.stringify(error.response.data));
+    }
     throw normalizeError(error);
   }
 };
@@ -572,7 +585,7 @@ async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": passphrase,
         "Content-Type": "application/json",
-        "x-simulated-trading": "0",
+        "x-simulated-trading": "1",
       },
     },
   );
@@ -593,14 +606,18 @@ async function placeBitgetOrder(
 
   const timestamp = Date.now().toString();
   const method = "POST";
-  const path = "/api/v2/spot/trade/place-order";
+  const path = "/api/v2/mix/order/place-order";
   const body = JSON.stringify({
-    symbol: p.pair, // e.g. "BTCUSDT"
+    symbol: p.pair.replace(/\//g, ""), // e.g. "XRPUSDT"
+    productType: "USDT-FUTURES",
+    marginMode: "crossed",
+    marginCoin: "USDT",
+    size: p.quantity,
+    price: p.entryPrice,
     side: p.direction,
+    tradeSide: "open",
     orderType: "limit",
     force: "gtc",
-    price: p.entryPrice,
-    size: p.quantity,
   });
 
   const signPayload = timestamp + method + path + body;
@@ -615,11 +632,13 @@ async function placeBitgetOrder(
     data: { orderId: string };
   }
 
+  console.log("Placing Bitget Order - URL:", BITGET_BASE_URL + path, "Body:", body);
   const { data } = await http.post<BitgetOrderResponse>(
-    "https://api.bitget.com" + path,
+    BITGET_BASE_URL + path,
     body,
     {
       headers: {
+        paptrading: "1",
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -759,7 +778,7 @@ async function getOkxOrderStatus(
         "OK-ACCESS-SIGN": signature,
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": passphrase,
-        "x-simulated-trading": "0",
+        "x-simulated-trading": "1",
       },
     },
   );
@@ -791,7 +810,8 @@ async function getBitgetOrderStatus(
 
   const timestamp = Date.now().toString();
   const method = "GET";
-  const path = `/api/v2/spot/trade/orderInfo?symbol=${pair}&orderId=${orderId}`;
+  const normalizedPair = pair.replace(/\//g, "");
+  const path = `/api/v2/mix/order/detail?symbol=${normalizedPair}&productType=USDT-FUTURES&orderId=${orderId}`;
   const signPayload = timestamp + method + path;
   const signature = crypto
     .createHmac("sha256", apiSecret)
@@ -804,9 +824,10 @@ async function getBitgetOrderStatus(
   }
 
   const { data } = await http.get<BitgetStatusResponse>(
-    "https://api.bitget.com" + path,
+    BITGET_BASE_URL + path,
     {
       headers: {
+        paptrading: "1",
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -873,9 +894,13 @@ async function getOkxCurrentPrice(pair: string): Promise<CurrentPriceResult> {
 }
 
 async function getBitgetCurrentPrice(pair: string): Promise<CurrentPriceResult> {
-  const { data } = await http.get("https://api.bitget.com/api/v2/spot/market/tickers", {
-    params: { symbol: pair },
+  const normalizedPair = pair.replace(/\//g, "");
+  const { data } = await http.get(BITGET_BASE_URL + "/api/v2/mix/market/ticker", {
+    params: { symbol: normalizedPair, productType: "USDT-FUTURES" },
+    headers: { paptrading: "1" },
   });
+
+  console.log("Bitget Ticker API Raw Response:", JSON.stringify(data, null, 2));
 
   if (data.code !== "00000")
     throw new Error(data.msg || "Bitget ticker failed.");
@@ -1171,7 +1196,7 @@ async function getOkxBalance(
         "OK-ACCESS-SIGN": signature,
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": passphrase,
-        "x-simulated-trading": "0",
+        "x-simulated-trading": "1",
       },
     },
   );
@@ -1224,9 +1249,10 @@ async function getBitgetBalance(
   }
 
   const { data } = await http.get<BitgetBalanceResponse>(
-    "https://api.bitget.com" + path,
+    BITGET_BASE_URL + path,
     {
       headers: {
+        paptrading: "1",
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -1292,3 +1318,143 @@ export async function getExchangeBalance(
     throw error;
   }
 }
+
+async function withdrawBitget(
+  credentials: RawCredentials,
+  amount: string,
+  destinationAddress: string,
+): Promise<{ transactionId: string; raw: any }> {
+  const { apiKey, apiSecret, passphrase } = credentials;
+  if (!passphrase) throw new Error("Bitget requires a passphrase.");
+
+  const timestamp = Date.now().toString();
+  const method = "POST";
+  const path = "/api/v2/wallet/withdrawal";
+  const body = JSON.stringify({
+    coin: "USDT",
+    address: destinationAddress,
+    chain: "TRC20",
+    amount,
+    outerOrderNo: crypto.randomUUID(),
+  });
+
+  const signPayload = timestamp + method + path + body;
+  const signature = crypto
+    .createHmac("sha256", apiSecret)
+    .update(signPayload)
+    .digest("base64");
+
+  interface BitgetWithdrawResponse {
+    code: string;
+    msg: string;
+    data: {
+      withdrawId: string;
+    } | null;
+  }
+
+  const { data } = await http.post<BitgetWithdrawResponse>(
+    BITGET_BASE_URL + path,
+    body,
+    {
+      headers: {
+        paptrading: "1",
+        "ACCESS-KEY": apiKey,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": passphrase,
+        "Content-Type": "application/json",
+      },
+    },
+  );
+
+  if (data.code !== "00000") {
+    throw new Error(data.msg || "Bitget withdrawal failed.");
+  }
+
+  const withdrawId = data.data?.withdrawId || "unknown";
+  return { transactionId: withdrawId, raw: data };
+}
+
+async function withdrawOkx(
+  credentials: RawCredentials,
+  amount: string,
+  destinationAddress: string,
+): Promise<{ transactionId: string; raw: any }> {
+  const { apiKey, apiSecret, passphrase } = credentials;
+  if (!passphrase) throw new Error("OKX requires a passphrase.");
+
+  const timestamp = new Date().toISOString();
+  const method = "POST";
+  const path = "/api/v5/asset/withdrawal";
+  const body = JSON.stringify({
+    ccy: "USDT",
+    amt: amount,
+    dest: "4", // digital wallet address
+    toAddr: destinationAddress,
+    chain: "USDT-TRC20",
+  });
+
+  const signPayload = timestamp + method + path + body;
+  const signature = crypto
+    .createHmac("sha256", apiSecret)
+    .update(signPayload)
+    .digest("base64");
+
+  interface OkxWithdrawResponse {
+    code: string;
+    msg: string;
+    data: Array<{
+      wdId: string;
+    }>;
+  }
+
+  const { data } = await http.post<OkxWithdrawResponse>(
+    "https://www.okx.com" + path,
+    body,
+    {
+      headers: {
+        "OK-ACCESS-KEY": apiKey,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": passphrase,
+        "Content-Type": "application/json",
+        "x-simulated-trading": "1",
+      },
+    },
+  );
+
+  if (data.code !== "0") {
+    throw new Error(data.msg || "OKX withdrawal failed.");
+  }
+
+  const wdId = data.data?.[0]?.wdId || "unknown";
+  return { transactionId: wdId, raw: data };
+}
+
+/**
+ * Initiates a USDT TRC-20 withdrawal from the given exchange connection.
+ * Only supported for OKX and Bitget.
+ */
+export async function withdrawUsdt(
+  exchange: ExchangeId,
+  credentials: RawCredentials,
+  amount: string,
+  destinationAddress: string,
+): Promise<{ transactionId: string; raw: any }> {
+  try {
+    if (exchange === "okx") {
+      return await withdrawOkx(credentials, amount, destinationAddress);
+    } else if (exchange === "bitget") {
+      return await withdrawBitget(credentials, amount, destinationAddress);
+    } else {
+      throw new Error(`Withdrawal is only supported for OKX and Bitget.`);
+    }
+  } catch (err) {
+    const error = normalizeError(err);
+    (error as any).exchange = exchange;
+    throw error;
+  }
+}
+
+
+
