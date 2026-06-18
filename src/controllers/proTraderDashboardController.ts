@@ -114,7 +114,7 @@ export const updateSignal = async (req: Request, res: Response) => {
       });
     }
 
-    const updatedSignal = await Signal.findByIdAndUpdate(
+    const updatedSignal = await Signal.findOneAndUpdate(
       { _id: signalId, trader: req.user },
       { pair, tp, notes, sl, direction, entry },
       { new: true },
@@ -168,8 +168,7 @@ export const getAllSignals = async (req: Request, res: Response) => {
     const signals = await Signal.find({ trader: req.user })
       .sort({ createdAt: -1 })
       .limit(limit)
-      .skip(skip)
-      .sort({ createdAt: -1 });
+      .skip(skip);
 
     return res.status(200).json({
       success: true,
@@ -178,7 +177,7 @@ export const getAllSignals = async (req: Request, res: Response) => {
       page: currentPage,
       limit,
       pageSize: signals.length,
-      pages: Math.ceil((await Signal.countDocuments()) / limit),
+      pages: Math.ceil((await Signal.countDocuments({ trader: req.user })) / limit),
     });
   } catch (error) {
     console.error("Error fetching signals:", error);
