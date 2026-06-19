@@ -304,7 +304,7 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
       BITGET_BASE_URL + path,
       {
         headers: {
-          paptrading: "1",
+          ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
           "ACCESS-SIGN": signature,
           "ACCESS-TIMESTAMP": timestamp,
@@ -638,7 +638,7 @@ async function placeBitgetOrder(
     body,
     {
       headers: {
-        paptrading: "1",
+        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -827,7 +827,7 @@ async function getBitgetOrderStatus(
     BITGET_BASE_URL + path,
     {
       headers: {
-        paptrading: "1",
+        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -897,7 +897,7 @@ async function getBitgetCurrentPrice(pair: string): Promise<CurrentPriceResult> 
   const normalizedPair = pair.replace(/\//g, "");
   const { data } = await http.get(BITGET_BASE_URL + "/api/v2/mix/market/ticker", {
     params: { symbol: normalizedPair, productType: "USDT-FUTURES" },
-    headers: { paptrading: "1" },
+    headers: { ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}) },
   });
 
   console.log("Bitget Ticker API Raw Response:", JSON.stringify(data, null, 2));
@@ -1252,7 +1252,7 @@ async function getBitgetBalance(
     BITGET_BASE_URL + path,
     {
       headers: {
-        paptrading: "1",
+        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -1357,7 +1357,7 @@ async function withdrawBitget(
     body,
     {
       headers: {
-        paptrading: "1",
+        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
