@@ -14,12 +14,9 @@
 import cron from "node-cron";
 import { Trade } from "../models/tradeModel.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
-import {
-  decryptCredentials,
-  getOrderStatus,
-  attachBinanceTpSl,
-} from "../services/exchangeService.js";
 import { ExchangeId } from "../types/index.js";
+import { decryptCredentials } from "./exchangeConnectionService.js";
+import { attachBinanceTpSl, getOrderStatus } from "./tradeService.js";
 
 // Maximum number of trades to process per job run (prevents overloading exchanges)
 const BATCH_SIZE = 50;

@@ -7,8 +7,8 @@ import cookieParser from "cookie-parser";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
 import { createServer } from "http";
-import { WebSocketServer } from "./websocket/server.js";
-import { getWebSocketManager } from "./services/websocketManager.js";
+// import { WebSocketServer } from "./websocket/server.js";
+// import { getWebSocketManager } from "./services/websocketManager.js";
 import authRouter from "./routes/userAuthRoutes.js";
 import exchangeRouter from "./routes/exchangeRoutes.js";
 import adminDashboardRouter from "./routes/adminDashboardRoutes.js";
@@ -34,31 +34,31 @@ const allowedOrigins = [
 const app = express();
 const server = createServer(app);
 
-const wsManager = getWebSocketManager();
+// const wsManager = getWebSocketManager();
 
-// Start WebSocket connections for exchange monitoring
-wsManager
-  .initialize()
-  .then(() => {
-    console.log("[App] WebSocket manager initialized");
-  })
-  .catch((err) => {
-    console.error("[App] Failed to initialize WebSocket manager:", err);
-  });
+// // Start WebSocket connections for exchange monitoring
+// wsManager
+//   .initialize()
+//   .then(() => {
+//     console.log("[App] WebSocket manager initialized");
+//   })
+//   .catch((err) => {
+//     console.error("[App] Failed to initialize WebSocket manager:", err);
+//   });
 
 // Initialize WebSocket server for frontend
-const wsServer = new WebSocketServer(server);
+// const wsServer = new WebSocketServer(server);
 
 // Graceful shutdown
-process.on("SIGTERM", async () => {
-  console.log("[App] Received SIGTERM, shutting down...");
-  wsServer.shutdown();
-  await wsManager.shutdown();
-  server.close(() => {
-    console.log("[App] Server closed");
-    process.exit(0);
-  });
-});
+// process.on("SIGTERM", async () => {
+//   console.log("[App] Received SIGTERM, shutting down...");
+//   wsServer.shutdown();
+//   await wsManager.shutdown();
+//   server.close(() => {
+//     console.log("[App] Server closed");
+//     process.exit(0);
+//   });
+// });
 
 app.get("/ip", async (_, res) => {
   const response = await fetch("https://api.ipify.org?format=json");
