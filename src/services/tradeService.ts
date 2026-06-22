@@ -50,17 +50,38 @@ export interface ExchangeBalance {
   totalUsdtEquivalent: string | null; // provided natively by some exchanges
 }
 
+// ─── Pair Normalization ──────────────────────────────────────────────────────
+
+function normalizePairForExchange(exchange: ExchangeId, pair: string): string {
+  // Remove any slashes first
+  let normalized = pair.replace(/\//g, "");
+
+  // OKX uses dash separator for futures too
+  if (exchange === "okx") {
+    const match = normalized.match(/^([A-Z]+)(USDT|USD|BUSD|USDC)$/);
+    if (match) {
+      return `${match[1]}-${match[2]}`;
+    }
+    return normalized;
+  }
+
+  // Binance, Bybit, Bitget all use no separator for futures
+  return normalized;
+}
+
 // ─── Order Placement ──────────────────────────────────────────────────────────
 
-// ── Binance Spot — places limit order; TP/SL via OCO is a follow-on order
+// ── Binance Futures — places limit order with TP/SL
 async function placeBinanceOrder(
   p: PlaceOrderParams,
 ): Promise<PlacedOrderResult> {
   const { apiKey, apiSecret } = p.credentials;
-  const baseUrl = process.env.BINANCE_TEST_API_URL!;
+  const baseUrl =
+    process.env.BINANCE_TEST_API_URL || "https://fapi.binance.com";
+  const normalizedPair = normalizePairForExchange("binance", p.pair);
 
   const getTimestamp = async () => {
-    const { data } = await http.get(`${baseUrl}/api/v3/time`);
+    const { data } = await http.get(`${baseUrl}/fapi/v1/time`);
     return data.serverTime as number;
   };
 
@@ -69,60 +90,66 @@ async function placeBinanceOrder(
 
   // 1. Place the limit entry order
   const ts = await getTimestamp();
-  const side = p.direction.toUpperCase(); // BUY | SELL
-  const entryQs = `symbol=${p.pair}&side=${side}&type=LIMIT&timeInForce=GTC&quantity=${p.quantity}&price=${p.entryPrice}&timestamp=${ts}`;
-  const { data: orderData } = await http.post(`${baseUrl}/api/v3/order`, null, {
-    params: {
-      ...Object.fromEntries(new URLSearchParams(entryQs)),
-      signature: sign(entryQs),
+  const side = p.direction.toUpperCase();
+
+  const entryQs = `symbol=${normalizedPair}&side=${side}&type=LIMIT&timeInForce=GTC&quantity=${p.quantity}&price=${p.entryPrice}&timestamp=${ts}`;
+  const { data: orderData } = await http.post(
+    `${baseUrl}/fapi/v1/order`,
+    null,
+    {
+      params: {
+        ...Object.fromEntries(new URLSearchParams(entryQs)),
+        signature: sign(entryQs),
+      },
+      headers: { "X-MBX-APIKEY": apiKey },
     },
-    headers: { "X-MBX-APIKEY": apiKey },
-  });
+  );
 
-  return { orderId: String(orderData.orderId), raw: orderData };
+  const orderId = String(orderData.orderId);
+
+  // 2. Set TP using TAKE_PROFIT_MARKET
+  try {
+    const tpSide = p.direction === "buy" ? "SELL" : "BUY";
+    const tpQs = `symbol=${normalizedPair}&side=${tpSide}&type=TAKE_PROFIT_MARKET&quantity=${p.quantity}&stopPrice=${p.tp}&timestamp=${ts + 1}`;
+    await http.post(`${baseUrl}/fapi/v1/order`, null, {
+      params: {
+        ...Object.fromEntries(new URLSearchParams(tpQs)),
+        signature: sign(tpQs),
+      },
+      headers: { "X-MBX-APIKEY": apiKey },
+    });
+
+    // 3. Set SL using STOP_MARKET
+    const slSide = p.direction === "buy" ? "SELL" : "BUY";
+    const slQs = `symbol=${normalizedPair}&side=${slSide}&type=STOP_MARKET&quantity=${p.quantity}&stopPrice=${p.sl}&timestamp=${ts + 2}`;
+    await http.post(`${baseUrl}/fapi/v1/order`, null, {
+      params: {
+        ...Object.fromEntries(new URLSearchParams(slQs)),
+        signature: sign(slQs),
+      },
+      headers: { "X-MBX-APIKEY": apiKey },
+    });
+  } catch (tpSlErr) {
+    console.warn("Failed to set TP/SL for Binance futures:", tpSlErr);
+  }
+
+  return { orderId, raw: orderData };
 }
 
-async function placeBinanceTpSl(
-  params: PlaceOrderParams & { orderId: string },
-) {
-  const {
-    credentials: { apiKey, apiSecret },
-    pair,
-    direction,
-    quantity,
-    tp,
-    sl,
-  } = params;
-  const baseUrl = process.env.BINANCE_TEST_API_URL!;
-  const exitSide = direction === "buy" ? "SELL" : "BUY";
-
-  const { data: timeData } = await http.get(`${baseUrl}/api/v3/time`);
-  const ts = timeData.serverTime as number;
-
-  const qs =
-    `symbol=${pair}&side=${exitSide}&quantity=${quantity}` +
-    `&price=${tp}&stopPrice=${sl}&stopLimitPrice=${sl}&stopLimitTimeInForce=GTC` +
-    `&timestamp=${ts}`;
-  const sig = crypto.createHmac("sha256", apiSecret).update(qs).digest("hex");
-
-  await http.post(`${baseUrl}/api/v3/order/oco`, null, {
-    params: { ...Object.fromEntries(new URLSearchParams(qs)), signature: sig },
-    headers: { "X-MBX-APIKEY": apiKey },
-  });
-}
-
-// ── Bybit Spot — places limit order with TP/SL in a single call
+// ── Bybit Futures (Linear) — places limit order with TP/SL in a single call
 async function placeBybitOrder(
   p: PlaceOrderParams,
 ): Promise<PlacedOrderResult> {
   const { apiKey, apiSecret } = p.credentials;
-  const baseUrl = process.env.BYBIT_TEST_API_URL!;
+  const baseUrl = process.env.BYBIT_TEST_API_URL || "https://api.bybit.com";
+  const normalizedPair = normalizePairForExchange("bybit", p.pair);
 
   const timestamp = await getBybitTimestamp(baseUrl);
   const recvWindow = "5000";
+
   const body = JSON.stringify({
-    category: "spot",
-    symbol: p.pair,
+    category: "linear",
+    symbol: normalizedPair,
     side: p.direction === "buy" ? "Buy" : "Sell",
     orderType: "Limit",
     qty: p.quantity,
@@ -130,6 +157,7 @@ async function placeBybitOrder(
     takeProfit: p.tp,
     stopLoss: p.sl,
     timeInForce: "GTC",
+    positionIdx: 0,
   });
 
   const signPayload = timestamp + apiKey + recvWindow + body;
@@ -162,17 +190,19 @@ async function placeBybitOrder(
   return { orderId: data.result.orderId, raw: data };
 }
 
-// ── OKX — places limit order with attached TP/SL
+// ── OKX Futures — places limit order with attached TP/SL
 async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
   const { apiKey, apiSecret, passphrase } = p.credentials;
   if (!passphrase) throw new Error("OKX requires a passphrase.");
+
+  const normalizedPair = normalizePairForExchange("okx", p.pair);
 
   const timestamp = new Date().toISOString();
   const method = "POST";
   const path = "/api/v5/trade/order";
   const body = JSON.stringify({
-    instId: p.pair,
-    tdMode: "cash",
+    instId: normalizedPair,
+    tdMode: "cross",
     side: p.direction,
     ordType: "limit",
     sz: p.quantity,
@@ -181,6 +211,7 @@ async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
     tpOrdPx: p.tp,
     slTriggerPx: p.sl,
     slOrdPx: p.sl,
+    posSide: "net",
   });
 
   const signPayload = timestamp + method + path + body;
@@ -217,18 +248,20 @@ async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
   return { orderId: result.ordId, raw: data };
 }
 
-// ── Bitget — places limit order
+// ── Bitget Futures (Mix) — places limit order
 async function placeBitgetOrder(
   p: PlaceOrderParams,
 ): Promise<PlacedOrderResult> {
   const { apiKey, apiSecret, passphrase } = p.credentials;
   if (!passphrase) throw new Error("Bitget requires a passphrase.");
 
+  const normalizedPair = normalizePairForExchange("bitget", p.pair);
+
   const timestamp = Date.now().toString();
   const method = "POST";
   const path = "/api/v2/mix/order/place-order";
   const body = JSON.stringify({
-    symbol: p.pair.replace(/\//g, ""),
+    symbol: normalizedPair,
     productType: "USDT-FUTURES",
     marginMode: "crossed",
     marginCoin: "USDT",
@@ -252,12 +285,6 @@ async function placeBitgetOrder(
     data: { orderId: string };
   }
 
-  console.log(
-    "Placing Bitget Order - URL:",
-    BITGET_BASE_URL + path,
-    "Body:",
-    body,
-  );
   const { data } = await http.post<BitgetOrderResponse>(
     BITGET_BASE_URL + path,
     body,
@@ -275,7 +302,91 @@ async function placeBitgetOrder(
 
   if (data.code !== "00000")
     throw new Error(data.msg || "Bitget order failed.");
-  return { orderId: data.data.orderId, raw: data };
+
+  const orderId = data.data.orderId;
+
+  // Bitget requires separate TP/SL orders after placing the main order
+  try {
+    // Set Take Profit
+    const tpBody = JSON.stringify({
+      symbol: normalizedPair,
+      productType: "USDT-FUTURES",
+      marginCoin: "USDT",
+      size: p.quantity,
+      triggerPrice: p.tp,
+      executePrice: p.tp,
+      side: p.direction === "buy" ? "sell" : "buy",
+      orderType: "limit",
+      triggerType: "fill_price",
+      tradeSide: "close",
+    });
+
+    const tpSignPayload =
+      timestamp + method + "/api/v2/mix/order/place-tp-sl-order" + tpBody;
+    const tpSignature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(tpSignPayload)
+      .digest("base64");
+
+    await http.post(
+      BITGET_BASE_URL + "/api/v2/mix/order/place-tp-sl-order",
+      tpBody,
+      {
+        headers: {
+          ...(process.env.BITGET_DEMO_MODE === "true"
+            ? { paptrading: "1" }
+            : {}),
+          "ACCESS-KEY": apiKey,
+          "ACCESS-SIGN": tpSignature,
+          "ACCESS-TIMESTAMP": timestamp,
+          "ACCESS-PASSPHRASE": passphrase,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+
+    // Set Stop Loss
+    const slBody = JSON.stringify({
+      symbol: normalizedPair,
+      productType: "USDT-FUTURES",
+      marginCoin: "USDT",
+      size: p.quantity,
+      triggerPrice: p.sl,
+      executePrice: p.sl,
+      side: p.direction === "buy" ? "sell" : "buy",
+      orderType: "limit",
+      triggerType: "fill_price",
+      tradeSide: "close",
+    });
+
+    const slSignPayload =
+      timestamp + method + "/api/v2/mix/order/place-tp-sl-order" + slBody;
+    const slSignature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(slSignPayload)
+      .digest("base64");
+
+    await http.post(
+      BITGET_BASE_URL + "/api/v2/mix/order/place-tp-sl-order",
+      slBody,
+      {
+        headers: {
+          ...(process.env.BITGET_DEMO_MODE === "true"
+            ? { paptrading: "1" }
+            : {}),
+          "ACCESS-KEY": apiKey,
+          "ACCESS-SIGN": slSignature,
+          "ACCESS-TIMESTAMP": timestamp,
+          "ACCESS-PASSPHRASE": passphrase,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+  } catch (tpSlErr) {
+    console.warn("Failed to set TP/SL for Bitget:", tpSlErr);
+  }
+
+  return { orderId, raw: data };
 }
 
 // ─── Order Status Checkers ─────────────────────────────────────────────────────
@@ -286,13 +397,16 @@ async function getBinanceOrderStatus(
   orderId: string,
 ): Promise<OrderStatusResult> {
   const { apiKey, apiSecret } = credentials;
-  const baseUrl = process.env.BINANCE_TEST_API_URL!;
-  const { data: timeData } = await http.get(`${baseUrl}/api/v3/time`);
+  const baseUrl =
+    process.env.BINANCE_TEST_API_URL || "https://fapi.binance.com";
+  const normalizedPair = normalizePairForExchange("binance", pair);
+
+  const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
   const ts = timeData.serverTime as number;
-  const qs = `symbol=${pair}&orderId=${orderId}&timestamp=${ts}`;
+  const qs = `symbol=${normalizedPair}&orderId=${orderId}&timestamp=${ts}`;
   const sig = crypto.createHmac("sha256", apiSecret).update(qs).digest("hex");
 
-  const { data } = await http.get(`${baseUrl}/api/v3/order`, {
+  const { data } = await http.get(`${baseUrl}/fapi/v1/order`, {
     params: { ...Object.fromEntries(new URLSearchParams(qs)), signature: sig },
     headers: { "X-MBX-APIKEY": apiKey },
   });
@@ -326,10 +440,12 @@ async function getBybitOrderStatus(
   orderId: string,
 ): Promise<OrderStatusResult> {
   const { apiKey, apiSecret } = credentials;
-  const baseUrl = process.env.BYBIT_TEST_API_URL!;
+  const baseUrl = process.env.BYBIT_TEST_API_URL || "https://api.bybit.com";
+  const normalizedPair = normalizePairForExchange("bybit", pair);
+
   const timestamp = await getBybitTimestamp(baseUrl);
   const recvWindow = "5000";
-  const signPayload = `${timestamp}${apiKey}${recvWindow}category=spot&orderId=${orderId}&symbol=${pair}`;
+  const signPayload = `${timestamp}${apiKey}${recvWindow}category=linear&orderId=${orderId}&symbol=${normalizedPair}`;
   const signature = crypto
     .createHmac("sha256", apiSecret)
     .update(signPayload)
@@ -344,7 +460,7 @@ async function getBybitOrderStatus(
   const { data } = await http.get<BybitStatusResponse>(
     `${baseUrl}/v5/order/history`,
     {
-      params: { category: "spot", orderId, symbol: pair },
+      params: { category: "linear", orderId, symbol: normalizedPair },
       headers: {
         "X-BAPI-API-KEY": apiKey,
         "X-BAPI-SIGN": signature,
@@ -381,9 +497,11 @@ async function getOkxOrderStatus(
   const { apiKey, apiSecret, passphrase } = credentials;
   if (!passphrase) throw new Error("OKX requires a passphrase.");
 
+  const normalizedPair = normalizePairForExchange("okx", pair);
+
   const timestamp = new Date().toISOString();
   const method = "GET";
-  const path = `/api/v5/trade/order?instId=${pair}&ordId=${orderId}`;
+  const path = `/api/v5/trade/order?instId=${normalizedPair}&ordId=${orderId}`;
   const signPayload = timestamp + method + path;
   const signature = crypto
     .createHmac("sha256", apiSecret)
@@ -433,9 +551,10 @@ async function getBitgetOrderStatus(
   const { apiKey, apiSecret, passphrase } = credentials;
   if (!passphrase) throw new Error("Bitget requires a passphrase.");
 
+  const normalizedPair = normalizePairForExchange("bitget", pair);
+
   const timestamp = Date.now().toString();
   const method = "GET";
-  const normalizedPair = pair.replace(/\//g, "");
   const path = `/api/v2/mix/order/detail?symbol=${normalizedPair}&productType=USDT-FUTURES&orderId=${orderId}`;
   const signPayload = timestamp + method + path;
   const signature = crypto
@@ -484,9 +603,12 @@ async function getBitgetOrderStatus(
 async function getBinanceCurrentPrice(
   pair: string,
 ): Promise<CurrentPriceResult> {
-  const baseUrl = process.env.BINANCE_TEST_API_URL!;
-  const { data } = await http.get(`${baseUrl}/api/v3/ticker/price`, {
-    params: { symbol: pair },
+  const baseUrl =
+    process.env.BINANCE_TEST_API_URL || "https://fapi.binance.com";
+  const normalizedPair = normalizePairForExchange("binance", pair);
+
+  const { data } = await http.get(`${baseUrl}/fapi/v1/ticker/price`, {
+    params: { symbol: normalizedPair },
   });
 
   if (!data?.price) throw new Error("Binance returned an invalid ticker.");
@@ -494,9 +616,11 @@ async function getBinanceCurrentPrice(
 }
 
 async function getBybitCurrentPrice(pair: string): Promise<CurrentPriceResult> {
-  const baseUrl = process.env.BYBIT_TEST_API_URL!;
+  const baseUrl = process.env.BYBIT_TEST_API_URL || "https://api.bybit.com";
+  const normalizedPair = normalizePairForExchange("bybit", pair);
+
   const { data } = await http.get(`${baseUrl}/v5/market/tickers`, {
-    params: { category: "spot", symbol: pair },
+    params: { category: "linear", symbol: normalizedPair },
   });
 
   if (data.retCode !== 0)
@@ -508,8 +632,10 @@ async function getBybitCurrentPrice(pair: string): Promise<CurrentPriceResult> {
 }
 
 async function getOkxCurrentPrice(pair: string): Promise<CurrentPriceResult> {
+  const normalizedPair = normalizePairForExchange("okx", pair);
+
   const { data } = await http.get("https://www.okx.com/api/v5/market/ticker", {
-    params: { instId: pair },
+    params: { instId: normalizedPair },
   });
 
   if (data.code !== "0") throw new Error(data.msg || "OKX ticker failed.");
@@ -522,7 +648,8 @@ async function getOkxCurrentPrice(pair: string): Promise<CurrentPriceResult> {
 async function getBitgetCurrentPrice(
   pair: string,
 ): Promise<CurrentPriceResult> {
-  const normalizedPair = pair.replace(/\//g, "");
+  const normalizedPair = normalizePairForExchange("bitget", pair);
+
   const { data } = await http.get(
     BITGET_BASE_URL + "/api/v2/mix/market/ticker",
     {
@@ -532,8 +659,6 @@ async function getBitgetCurrentPrice(
       },
     },
   );
-
-  console.log("Bitget Ticker API Raw Response:", JSON.stringify(data, null, 2));
 
   if (data.code !== "00000")
     throw new Error(data.msg || "Bitget ticker failed.");
@@ -549,10 +674,11 @@ async function getBinanceBalance(
   credentials: RawCredentials,
 ): Promise<ExchangeBalance> {
   const { apiKey, apiSecret } = credentials;
-  const baseUrl = process.env.BINANCE_TEST_API_URL!;
+  const baseUrl =
+    process.env.BINANCE_TEST_API_URL || "https://fapi.binance.com";
 
   try {
-    const { data: timeData } = await http.get(`${baseUrl}/api/v3/time`);
+    const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
     const timestamp = timeData.serverTime as number;
 
     const qs = `timestamp=${timestamp}`;
@@ -562,36 +688,32 @@ async function getBinanceBalance(
       .digest("hex");
 
     interface BinanceAccountResponse {
-      balances: Array<{ asset: string; free: string; locked: string }>;
+      assets: Array<{
+        asset: string;
+        walletBalance: string;
+        marginBalance: string;
+      }>;
     }
 
     const { data } = await http.get<BinanceAccountResponse>(
-      `${baseUrl}/api/v3/account`,
+      `${baseUrl}/fapi/v2/account`,
       {
         params: { timestamp, signature },
         headers: { "X-MBX-APIKEY": apiKey },
       },
     );
 
-    const nonZero = data.balances.filter(
-      (b) => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0,
-    );
+    const nonZero = data.assets.filter((b) => parseFloat(b.walletBalance) > 0);
 
-    const usdtEntry = nonZero.find(
-      (b) => b.asset === "USDT" || b.asset === "BUSD",
-    );
-
-    const totalUsdtEquivalent = usdtEntry
-      ? String(parseFloat(usdtEntry.free) + parseFloat(usdtEntry.locked))
-      : null;
+    const usdtEntry = nonZero.find((b) => b.asset === "USDT");
 
     return {
       balances: nonZero.map((b) => ({
         asset: b.asset,
-        free: b.free,
-        locked: b.locked,
+        free: b.walletBalance,
+        locked: "0",
       })),
-      totalUsdtEquivalent,
+      totalUsdtEquivalent: usdtEntry?.walletBalance || null,
     };
   } catch (err: any) {
     const status = err?.response?.status;
@@ -599,10 +721,6 @@ async function getBinanceBalance(
 
     if (status === 401 || status === 403) {
       throw new Error("Binance: Insufficient permissions");
-    }
-
-    if (msg?.toLowerCase?.().includes("permission")) {
-      throw new Error(`Binance: ${msg}`);
     }
 
     throw new Error(`Binance error: ${msg || "Unknown error"}`);
@@ -613,7 +731,7 @@ async function getBybitBalance(
   credentials: RawCredentials,
 ): Promise<ExchangeBalance> {
   const { apiKey, apiSecret } = credentials;
-  const baseUrl = process.env.BYBIT_TEST_API_URL!;
+  const baseUrl = process.env.BYBIT_TEST_API_URL || "https://api.bybit.com";
 
   try {
     const timestamp = await getBybitTimestamp(baseUrl);
@@ -675,10 +793,6 @@ async function getBybitBalance(
 
     if (status === 401 || status === 403) {
       throw new Error("Bybit: Insufficient permissions");
-    }
-
-    if (msg?.toLowerCase?.().includes("permission")) {
-      throw new Error(`Bybit: ${msg}`);
     }
 
     throw new Error(`Bybit error: ${msg || "Unknown error"}`);
@@ -754,7 +868,7 @@ async function getBitgetBalance(
 
   const timestamp = Date.now().toString();
   const method = "GET";
-  const path = "/api/v2/spot/account/assets";
+  const path = "/api/v2/mix/account/account";
   const signPayload = timestamp + method + path;
   const signature = crypto
     .createHmac("sha256", apiSecret)
@@ -765,9 +879,8 @@ async function getBitgetBalance(
     code: string;
     msg: string;
     data: Array<{
-      coin: string;
+      marginCoin: string;
       available: string;
-      frozen: string;
       locked: string;
       usdtValue: string;
     }>;
@@ -791,7 +904,7 @@ async function getBitgetBalance(
     throw new Error(data.msg || "Bitget balance fetch failed.");
 
   const nonZero = (data.data ?? []).filter(
-    (a) => parseFloat(a.available) > 0 || parseFloat(a.frozen) > 0,
+    (a) => parseFloat(a.available) > 0 || parseFloat(a.locked) > 0,
   );
 
   const totalUsdt = nonZero.reduce(
@@ -801,9 +914,9 @@ async function getBitgetBalance(
 
   return {
     balances: nonZero.map((a) => ({
-      asset: a.coin,
+      asset: a.marginCoin,
       free: a.available,
-      locked: String(parseFloat(a.frozen) + parseFloat(a.locked || "0")),
+      locked: a.locked || "0",
     })),
     totalUsdtEquivalent: totalUsdt > 0 ? String(totalUsdt) : null,
   };
@@ -896,7 +1009,7 @@ export async function attachBinanceTpSl(
   params: PlaceOrderParams & { orderId: string },
 ): Promise<void> {
   try {
-    await placeBinanceTpSl(params);
+    await placeBinanceOrder(params);
   } catch (err) {
     throw normalizeError(err);
   }

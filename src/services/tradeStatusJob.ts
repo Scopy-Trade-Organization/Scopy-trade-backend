@@ -179,18 +179,3 @@ function resolveTradeResult(
 
   return diff > 0 ? "profit" : "loss";
 }
-
-/**
- * Starts the cron job. Call once at app startup.
- * Default schedule: every 2 minutes.
- */
-export function startTradeStatusJob(schedule = "*/2 * * * *") {
-  console.log(`[tradeStatusJob] Scheduled: ${schedule}`);
-  cron.schedule(schedule, async () => {
-    try {
-      await processBatch();
-    } catch (err) {
-      console.error("[tradeStatusJob] Unhandled error in batch:", err);
-    }
-  });
-}

@@ -2,7 +2,6 @@ import "dotenv/config";
 import app from "./app.js";
 import mongoose from "mongoose";
 import type { Request, Response } from "express";
-import { startTradeStatusJob } from "./services/tradeStatusJob.js";
 
 const dev = process.env.NODE_ENV !== "production";
 
@@ -17,9 +16,6 @@ if (!MONGO_URI) {
 try {
   await mongoose.connect(MONGO_URI);
   console.log("MongoDB Connected Successfully");
-  
-  // Start the background cron job for tracking/polling trade status updates
-  startTradeStatusJob();
 } catch (error) {
   console.error("MongoDB Connection Error:", error);
   process.exit(1);
