@@ -4,13 +4,12 @@ import { Signal } from "../models/signalModel.js";
 import { Trade } from "../models/tradeModel.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import {
-  decryptCredentials,
   placeOrder,
-  getOrderStatus,
   getExchangeBalance,
   getCurrentPrice,
-} from "../services/exchangeService.js";
+} from "../services/tradeService.js";
 import { ExchangeId } from "../types/index.js";
+import { decryptCredentials } from "../services/exchangeConnectionService.js";
 
 const DEFAULT_RISK_FRACTION = 0.03;
 const DEFAULT_MAX_ENTRY_DEVIATION = 0.02;

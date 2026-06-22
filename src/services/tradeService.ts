@@ -1,19 +1,22 @@
 import crypto from "crypto";
+import axios from "axios";
+import { RawCredentials, ExchangeId } from "../types/index.js";
 import {
   http,
   normalizeError,
   getBybitTimestamp,
 } from "./exchangeConnectionService.js";
-import { RawCredentials, ExchangeId } from "../types/index.js";
+
+const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
 
 // ─── Order Types ──────────────────────────────────────────────────────────────
 
 export interface PlaceOrderParams {
   credentials: RawCredentials;
-  pair: string; // Exchange-native symbol: "BTCUSDT" (Binance/Bybit/Bitget), "BTC-USDT-SWAP" (OKX)
-  direction: "buy" | "sell"; // buy = open long, sell = open short
-  quantity: string; // Contract quantity in base asset
-  entryPrice: string; // Limit price
+  pair: string; // e.g. "BTCUSDT"
+  direction: "buy" | "sell";
+  quantity: string; // base asset quantity
+  entryPrice: string; // limit price
   tp: string;
   sl: string;
 }
@@ -34,92 +37,44 @@ export interface CurrentPriceResult {
   raw: unknown;
 }
 
-// ─── Order Placement (Futures / Perpetuals) ───────────────────────────────────
-//
-// Binance  → USD-M Futures /fapi/v1/order       one-way mode, TP/SL as reduce-only orders
-// Bybit    → Linear perp   /v5/order/create     category: linear, TP/SL inline
-// OKX      → SWAP          /api/v5/trade/order  tdMode: cross, TP/SL inline
-// Bitget   → USDT-FUTURES  /api/v2/mix/order/place-order  TP/SL inline
+// ─── Balance Types ────────────────────────────────────────────────────────────
 
+export interface AssetBalance {
+  asset: string;
+  free: string;
+  locked: string;
+}
+
+export interface ExchangeBalance {
+  balances: AssetBalance[]; // non-zero assets only
+  totalUsdtEquivalent: string | null; // provided natively by some exchanges
+}
+
+// ─── Order Placement ──────────────────────────────────────────────────────────
+
+// ── Binance Spot — places limit order; TP/SL via OCO is a follow-on order
 async function placeBinanceOrder(
   p: PlaceOrderParams,
 ): Promise<PlacedOrderResult> {
   const { apiKey, apiSecret } = p.credentials;
-  const baseUrl =
-    process.env.BINANCE_FUTURES_URL ?? "https://testnet.binancefuture.com";
+  const baseUrl = process.env.BINANCE_TEST_API_URL!;
+
+  const getTimestamp = async () => {
+    const { data } = await http.get(`${baseUrl}/api/v3/time`);
+    return data.serverTime as number;
+  };
 
   const sign = (qs: string) =>
     crypto.createHmac("sha256", apiSecret).update(qs).digest("hex");
 
-  const getTs = async () => {
-    const { data } = await http.get(`${baseUrl}/fapi/v1/time`);
-    return data.serverTime as number;
-  };
-
+  // 1. Place the limit entry order
+  const ts = await getTimestamp();
   const side = p.direction.toUpperCase(); // BUY | SELL
-  const exitSide = p.direction === "buy" ? "SELL" : "BUY";
-
-  // 1. Entry limit order (positionSide=BOTH = one-way/net mode)
-  const entryQs =
-    `symbol=${p.pair}` +
-    `&side=${side}` +
-    `&positionSide=BOTH` +
-    `&type=LIMIT` +
-    `&timeInForce=GTC` +
-    `&quantity=${p.quantity}` +
-    `&price=${p.entryPrice}` +
-    `&timestamp=${await getTs()}`;
-
-  const { data: orderData } = await http.post(
-    `${baseUrl}/fapi/v1/order`,
-    null,
-    {
-      params: {
-        ...Object.fromEntries(new URLSearchParams(entryQs)),
-        signature: sign(entryQs),
-      },
-      headers: { "X-MBX-APIKEY": apiKey },
-    },
-  );
-
-  // 2. Take-profit reduce-only order
-  const tpQs =
-    `symbol=${p.pair}` +
-    `&side=${exitSide}` +
-    `&positionSide=BOTH` +
-    `&type=TAKE_PROFIT` +
-    `&timeInForce=GTC` +
-    `&quantity=${p.quantity}` +
-    `&price=${p.tp}` +
-    `&stopPrice=${p.tp}` +
-    `&reduceOnly=true` +
-    `&timestamp=${await getTs()}`;
-
-  await http.post(`${baseUrl}/fapi/v1/order`, null, {
+  const entryQs = `symbol=${p.pair}&side=${side}&type=LIMIT&timeInForce=GTC&quantity=${p.quantity}&price=${p.entryPrice}&timestamp=${ts}`;
+  const { data: orderData } = await http.post(`${baseUrl}/api/v3/order`, null, {
     params: {
-      ...Object.fromEntries(new URLSearchParams(tpQs)),
-      signature: sign(tpQs),
-    },
-    headers: { "X-MBX-APIKEY": apiKey },
-  });
-
-  // 3. Stop-loss reduce-only order
-  const slQs =
-    `symbol=${p.pair}` +
-    `&side=${exitSide}` +
-    `&positionSide=BOTH` +
-    `&type=STOP` +
-    `&timeInForce=GTC` +
-    `&quantity=${p.quantity}` +
-    `&price=${p.sl}` +
-    `&stopPrice=${p.sl}` +
-    `&reduceOnly=true` +
-    `&timestamp=${await getTs()}`;
-
-  await http.post(`${baseUrl}/fapi/v1/order`, null, {
-    params: {
-      ...Object.fromEntries(new URLSearchParams(slQs)),
-      signature: sign(slQs),
+      ...Object.fromEntries(new URLSearchParams(entryQs)),
+      signature: sign(entryQs),
     },
     headers: { "X-MBX-APIKEY": apiKey },
   });
@@ -127,6 +82,36 @@ async function placeBinanceOrder(
   return { orderId: String(orderData.orderId), raw: orderData };
 }
 
+async function placeBinanceTpSl(
+  params: PlaceOrderParams & { orderId: string },
+) {
+  const {
+    credentials: { apiKey, apiSecret },
+    pair,
+    direction,
+    quantity,
+    tp,
+    sl,
+  } = params;
+  const baseUrl = process.env.BINANCE_TEST_API_URL!;
+  const exitSide = direction === "buy" ? "SELL" : "BUY";
+
+  const { data: timeData } = await http.get(`${baseUrl}/api/v3/time`);
+  const ts = timeData.serverTime as number;
+
+  const qs =
+    `symbol=${pair}&side=${exitSide}&quantity=${quantity}` +
+    `&price=${tp}&stopPrice=${sl}&stopLimitPrice=${sl}&stopLimitTimeInForce=GTC` +
+    `&timestamp=${ts}`;
+  const sig = crypto.createHmac("sha256", apiSecret).update(qs).digest("hex");
+
+  await http.post(`${baseUrl}/api/v3/order/oco`, null, {
+    params: { ...Object.fromEntries(new URLSearchParams(qs)), signature: sig },
+    headers: { "X-MBX-APIKEY": apiKey },
+  });
+}
+
+// ── Bybit Spot — places limit order with TP/SL in a single call
 async function placeBybitOrder(
   p: PlaceOrderParams,
 ): Promise<PlacedOrderResult> {
@@ -135,10 +120,8 @@ async function placeBybitOrder(
 
   const timestamp = await getBybitTimestamp(baseUrl);
   const recvWindow = "5000";
-
-  // category: "linear" = USDT-margined perpetual contracts
   const body = JSON.stringify({
-    category: "linear",
+    category: "spot",
     symbol: p.pair,
     side: p.direction === "buy" ? "Buy" : "Sell",
     orderType: "Limit",
@@ -146,10 +129,7 @@ async function placeBybitOrder(
     price: p.entryPrice,
     takeProfit: p.tp,
     stopLoss: p.sl,
-    tpTriggerBy: "MarkPrice",
-    slTriggerBy: "MarkPrice",
     timeInForce: "GTC",
-    reduceOnly: false,
   });
 
   const signPayload = timestamp + apiKey + recvWindow + body;
@@ -182,6 +162,7 @@ async function placeBybitOrder(
   return { orderId: data.result.orderId, raw: data };
 }
 
+// ── OKX — places limit order with attached TP/SL
 async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
   const { apiKey, apiSecret, passphrase } = p.credentials;
   if (!passphrase) throw new Error("OKX requires a passphrase.");
@@ -189,15 +170,10 @@ async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
   const timestamp = new Date().toISOString();
   const method = "POST";
   const path = "/api/v5/trade/order";
-
-  // instId must be a SWAP instrument e.g. "BTC-USDT-SWAP"
-  // tdMode "cross" = cross-margin perpetual futures
-  // posSide "net" = one-way/net mode (buy opens long, sell opens short)
   const body = JSON.stringify({
     instId: p.pair,
-    tdMode: "cross",
+    tdMode: "cash",
     side: p.direction,
-    posSide: "net",
     ordType: "limit",
     sz: p.quantity,
     px: p.entryPrice,
@@ -205,8 +181,6 @@ async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
     tpOrdPx: p.tp,
     slTriggerPx: p.sl,
     slOrdPx: p.sl,
-    tpTriggerPxType: "mark",
-    slTriggerPxType: "mark",
   });
 
   const signPayload = timestamp + method + path + body;
@@ -231,7 +205,7 @@ async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": passphrase,
         "Content-Type": "application/json",
-        "x-simulated-trading": "0",
+        "x-simulated-trading": "1",
       },
     },
   );
@@ -243,6 +217,7 @@ async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
   return { orderId: result.ordId, raw: data };
 }
 
+// ── Bitget — places limit order
 async function placeBitgetOrder(
   p: PlaceOrderParams,
 ): Promise<PlacedOrderResult> {
@@ -251,24 +226,18 @@ async function placeBitgetOrder(
 
   const timestamp = Date.now().toString();
   const method = "POST";
-  // USDT-M perpetual futures endpoint
   const path = "/api/v2/mix/order/place-order";
-
-  // side "buy" opens a long, "sell" opens a short in one-way/net mode
-  // tradeSide "open" = opening a new position
   const body = JSON.stringify({
-    symbol: p.pair,
+    symbol: p.pair.replace(/\//g, ""),
     productType: "USDT-FUTURES",
     marginMode: "crossed",
     marginCoin: "USDT",
+    size: p.quantity,
+    price: p.entryPrice,
     side: p.direction,
     tradeSide: "open",
     orderType: "limit",
     force: "gtc",
-    price: p.entryPrice,
-    size: p.quantity,
-    presetStopSurplusPrice: p.tp,
-    presetStopLossPrice: p.sl,
   });
 
   const signPayload = timestamp + method + path + body;
@@ -283,11 +252,18 @@ async function placeBitgetOrder(
     data: { orderId: string };
   }
 
+  console.log(
+    "Placing Bitget Order - URL:",
+    BITGET_BASE_URL + path,
+    "Body:",
+    body,
+  );
   const { data } = await http.post<BitgetOrderResponse>(
-    "https://api.bitget.com" + path,
+    BITGET_BASE_URL + path,
     body,
     {
       headers: {
+        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -302,7 +278,7 @@ async function placeBitgetOrder(
   return { orderId: data.data.orderId, raw: data };
 }
 
-// ─── Order Status Checkers (Futures) ─────────────────────────────────────────
+// ─── Order Status Checkers ─────────────────────────────────────────────────────
 
 async function getBinanceOrderStatus(
   credentials: RawCredentials,
@@ -310,15 +286,13 @@ async function getBinanceOrderStatus(
   orderId: string,
 ): Promise<OrderStatusResult> {
   const { apiKey, apiSecret } = credentials;
-  const baseUrl =
-    process.env.BINANCE_FUTURES_URL ?? "https://testnet.binancefuture.com";
-
-  const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
+  const baseUrl = process.env.BINANCE_TEST_API_URL!;
+  const { data: timeData } = await http.get(`${baseUrl}/api/v3/time`);
   const ts = timeData.serverTime as number;
   const qs = `symbol=${pair}&orderId=${orderId}&timestamp=${ts}`;
   const sig = crypto.createHmac("sha256", apiSecret).update(qs).digest("hex");
 
-  const { data } = await http.get(`${baseUrl}/fapi/v1/order`, {
+  const { data } = await http.get(`${baseUrl}/api/v3/order`, {
     params: { ...Object.fromEntries(new URLSearchParams(qs)), signature: sig },
     headers: { "X-MBX-APIKEY": apiKey },
   });
@@ -333,10 +307,10 @@ async function getBinanceOrderStatus(
   };
 
   const executedQty = parseFloat(data.executedQty ?? "0");
-  const cumQuote = parseFloat(data.cumQuote ?? "0");
+  const cummulativeQuoteQty = parseFloat(data.cummulativeQuoteQty ?? "0");
   const averageFillPrice =
-    executedQty > 0 && cumQuote > 0
-      ? String(cumQuote / executedQty)
+    executedQty > 0 && cummulativeQuoteQty > 0
+      ? String(cummulativeQuoteQty / executedQty)
       : data.avgPrice || data.price || null;
 
   return {
@@ -355,9 +329,7 @@ async function getBybitOrderStatus(
   const baseUrl = process.env.BYBIT_TEST_API_URL!;
   const timestamp = await getBybitTimestamp(baseUrl);
   const recvWindow = "5000";
-
-  // category: "linear" for USDT perpetuals
-  const signPayload = `${timestamp}${apiKey}${recvWindow}category=linear&orderId=${orderId}&symbol=${pair}`;
+  const signPayload = `${timestamp}${apiKey}${recvWindow}category=spot&orderId=${orderId}&symbol=${pair}`;
   const signature = crypto
     .createHmac("sha256", apiSecret)
     .update(signPayload)
@@ -372,7 +344,7 @@ async function getBybitOrderStatus(
   const { data } = await http.get<BybitStatusResponse>(
     `${baseUrl}/v5/order/history`,
     {
-      params: { category: "linear", orderId, symbol: pair },
+      params: { category: "spot", orderId, symbol: pair },
       headers: {
         "X-BAPI-API-KEY": apiKey,
         "X-BAPI-SIGN": signature,
@@ -411,7 +383,6 @@ async function getOkxOrderStatus(
 
   const timestamp = new Date().toISOString();
   const method = "GET";
-  // instId is the SWAP instrument e.g. "BTC-USDT-SWAP"
   const path = `/api/v5/trade/order?instId=${pair}&ordId=${orderId}`;
   const signPayload = timestamp + method + path;
   const signature = crypto
@@ -432,7 +403,7 @@ async function getOkxOrderStatus(
         "OK-ACCESS-SIGN": signature,
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": passphrase,
-        "x-simulated-trading": "0",
+        "x-simulated-trading": "1",
       },
     },
   );
@@ -464,8 +435,8 @@ async function getBitgetOrderStatus(
 
   const timestamp = Date.now().toString();
   const method = "GET";
-  // Futures order detail endpoint
-  const path = `/api/v2/mix/order/detail?symbol=${pair}&orderId=${orderId}&productType=USDT-FUTURES`;
+  const normalizedPair = pair.replace(/\//g, "");
+  const path = `/api/v2/mix/order/detail?symbol=${normalizedPair}&productType=USDT-FUTURES&orderId=${orderId}`;
   const signPayload = timestamp + method + path;
   const signature = crypto
     .createHmac("sha256", apiSecret)
@@ -474,13 +445,14 @@ async function getBitgetOrderStatus(
 
   interface BitgetStatusResponse {
     code: string;
-    data: { state: string; priceAvg: string };
+    data: Array<{ status: string; priceAvg: string }>;
   }
 
   const { data } = await http.get<BitgetStatusResponse>(
-    "https://api.bitget.com" + path,
+    BITGET_BASE_URL + path,
     {
       headers: {
+        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -490,9 +462,7 @@ async function getBitgetOrderStatus(
     },
   );
 
-  if (data.code !== "00000") throw new Error("Bitget order status error");
-
-  const order = data.data;
+  const order = data.data[0];
   if (!order) throw new Error("Order not found on Bitget.");
 
   const statusMap: Record<string, OrderStatusResult["status"]> = {
@@ -500,88 +470,346 @@ async function getBitgetOrderStatus(
     partial_fill: "pending",
     cancelled: "cancelled",
     live: "pending",
-    not_trigger: "pending",
   };
 
   return {
-    status: statusMap[order.state] ?? "pending",
+    status: statusMap[order.status] ?? "pending",
     filledPrice: order.priceAvg || null,
     raw: data,
   };
 }
 
-// ─── Market Price Fetchers (Futures Mark Price) ───────────────────────────────
-//
-// Mark price is the correct reference for futures — TP/SL triggers and entry
-// deviation checks should all compare against mark price, not last traded price.
-//
-// Binance  → /fapi/v1/premiumIndex          markPrice field
-// Bybit    → /v5/market/tickers             category: linear, markPrice field
-// OKX      → /api/v5/public/mark-price      instType: SWAP
-// Bitget   → /api/v2/mix/market/symbol-price  productType: USDT-FUTURES
+// ─── Market Price Fetchers ───────────────────────────────────────────────────
 
 async function getBinanceCurrentPrice(
   pair: string,
 ): Promise<CurrentPriceResult> {
-  const baseUrl =
-    process.env.BINANCE_FUTURES_URL ?? "https://testnet.binancefuture.com";
-  const { data } = await http.get(`${baseUrl}/fapi/v1/premiumIndex`, {
+  const baseUrl = process.env.BINANCE_TEST_API_URL!;
+  const { data } = await http.get(`${baseUrl}/api/v3/ticker/price`, {
     params: { symbol: pair },
   });
 
-  if (!data?.markPrice)
-    throw new Error("Binance returned an invalid futures mark price.");
-  return { price: String(data.markPrice), raw: data };
+  if (!data?.price) throw new Error("Binance returned an invalid ticker.");
+  return { price: String(data.price), raw: data };
 }
 
 async function getBybitCurrentPrice(pair: string): Promise<CurrentPriceResult> {
   const baseUrl = process.env.BYBIT_TEST_API_URL!;
   const { data } = await http.get(`${baseUrl}/v5/market/tickers`, {
-    params: { category: "linear", symbol: pair },
+    params: { category: "spot", symbol: pair },
   });
 
   if (data.retCode !== 0)
     throw new Error(data.retMsg || "Bybit ticker failed.");
   const ticker = data.result?.list?.[0];
-  if (!ticker?.markPrice)
-    throw new Error("Bybit returned an invalid futures mark price.");
+  if (!ticker?.lastPrice) throw new Error("Bybit returned an invalid ticker.");
 
-  return { price: String(ticker.markPrice), raw: data };
+  return { price: String(ticker.lastPrice), raw: data };
 }
 
 async function getOkxCurrentPrice(pair: string): Promise<CurrentPriceResult> {
-  // pair must be a SWAP instrument e.g. "BTC-USDT-SWAP"
-  const { data } = await http.get(
-    "https://www.okx.com/api/v5/public/mark-price",
-    { params: { instType: "SWAP", instId: pair } },
-  );
+  const { data } = await http.get("https://www.okx.com/api/v5/market/ticker", {
+    params: { instId: pair },
+  });
 
-  if (data.code !== "0") throw new Error(data.msg || "OKX mark price failed.");
+  if (data.code !== "0") throw new Error(data.msg || "OKX ticker failed.");
   const ticker = data.data?.[0];
-  if (!ticker?.markPx)
-    throw new Error("OKX returned an invalid futures mark price.");
+  if (!ticker?.last) throw new Error("OKX returned an invalid ticker.");
 
-  return { price: String(ticker.markPx), raw: data };
+  return { price: String(ticker.last), raw: data };
 }
 
 async function getBitgetCurrentPrice(
   pair: string,
 ): Promise<CurrentPriceResult> {
+  const normalizedPair = pair.replace(/\//g, "");
   const { data } = await http.get(
-    "https://api.bitget.com/api/v2/mix/market/symbol-price",
-    { params: { symbol: pair, productType: "USDT-FUTURES" } },
+    BITGET_BASE_URL + "/api/v2/mix/market/ticker",
+    {
+      params: { symbol: normalizedPair, productType: "USDT-FUTURES" },
+      headers: {
+        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+      },
+    },
+  );
+
+  console.log("Bitget Ticker API Raw Response:", JSON.stringify(data, null, 2));
+
+  if (data.code !== "00000")
+    throw new Error(data.msg || "Bitget ticker failed.");
+  const ticker = data.data?.[0];
+  if (!ticker?.lastPr) throw new Error("Bitget returned an invalid ticker.");
+
+  return { price: String(ticker.lastPr), raw: data };
+}
+
+// ─── Balance Fetchers ─────────────────────────────────────────────────────────
+
+async function getBinanceBalance(
+  credentials: RawCredentials,
+): Promise<ExchangeBalance> {
+  const { apiKey, apiSecret } = credentials;
+  const baseUrl = process.env.BINANCE_TEST_API_URL!;
+
+  try {
+    const { data: timeData } = await http.get(`${baseUrl}/api/v3/time`);
+    const timestamp = timeData.serverTime as number;
+
+    const qs = `timestamp=${timestamp}`;
+    const signature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(qs)
+      .digest("hex");
+
+    interface BinanceAccountResponse {
+      balances: Array<{ asset: string; free: string; locked: string }>;
+    }
+
+    const { data } = await http.get<BinanceAccountResponse>(
+      `${baseUrl}/api/v3/account`,
+      {
+        params: { timestamp, signature },
+        headers: { "X-MBX-APIKEY": apiKey },
+      },
+    );
+
+    const nonZero = data.balances.filter(
+      (b) => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0,
+    );
+
+    const usdtEntry = nonZero.find(
+      (b) => b.asset === "USDT" || b.asset === "BUSD",
+    );
+
+    const totalUsdtEquivalent = usdtEntry
+      ? String(parseFloat(usdtEntry.free) + parseFloat(usdtEntry.locked))
+      : null;
+
+    return {
+      balances: nonZero.map((b) => ({
+        asset: b.asset,
+        free: b.free,
+        locked: b.locked,
+      })),
+      totalUsdtEquivalent,
+    };
+  } catch (err: any) {
+    const status = err?.response?.status;
+    const msg = err?.response?.data?.msg || err?.message;
+
+    if (status === 401 || status === 403) {
+      throw new Error("Binance: Insufficient permissions");
+    }
+
+    if (msg?.toLowerCase?.().includes("permission")) {
+      throw new Error(`Binance: ${msg}`);
+    }
+
+    throw new Error(`Binance error: ${msg || "Unknown error"}`);
+  }
+}
+
+async function getBybitBalance(
+  credentials: RawCredentials,
+): Promise<ExchangeBalance> {
+  const { apiKey, apiSecret } = credentials;
+  const baseUrl = process.env.BYBIT_TEST_API_URL!;
+
+  try {
+    const timestamp = await getBybitTimestamp(baseUrl);
+    const recvWindow = "5000";
+    const queryString = "accountType=UNIFIED";
+    const signPayload = timestamp + apiKey + recvWindow + queryString;
+    const signature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(signPayload)
+      .digest("hex");
+
+    interface BybitBalanceResponse {
+      retCode: number;
+      retMsg: string;
+      result: {
+        list: Array<{
+          totalEquity: string;
+          coin: Array<{
+            coin: string;
+            walletBalance: string;
+            locked: string;
+          }>;
+        }>;
+      };
+    }
+
+    const { data } = await http.get<BybitBalanceResponse>(
+      `${baseUrl}/v5/account/wallet-balance`,
+      {
+        params: { accountType: "UNIFIED" },
+        headers: {
+          "X-BAPI-API-KEY": apiKey,
+          "X-BAPI-SIGN": signature,
+          "X-BAPI-TIMESTAMP": timestamp,
+          "X-BAPI-RECV-WINDOW": recvWindow,
+        },
+      },
+    );
+
+    if (data.retCode !== 0)
+      throw new Error(data.retMsg || "Bybit balance fetch failed.");
+
+    const account = data.result.list[0];
+    if (!account) throw new Error("Bybit returned an empty wallet response.");
+
+    const nonZero = account.coin.filter((c) => parseFloat(c.walletBalance) > 0);
+
+    return {
+      balances: nonZero.map((c) => ({
+        asset: c.coin,
+        free: String(parseFloat(c.walletBalance) - parseFloat(c.locked || "0")),
+        locked: c.locked || "0",
+      })),
+      totalUsdtEquivalent: account.totalEquity || null,
+    };
+  } catch (err: any) {
+    const status = err?.response?.status;
+    const msg = err?.response?.data?.retMsg || err?.message;
+
+    if (status === 401 || status === 403) {
+      throw new Error("Bybit: Insufficient permissions");
+    }
+
+    if (msg?.toLowerCase?.().includes("permission")) {
+      throw new Error(`Bybit: ${msg}`);
+    }
+
+    throw new Error(`Bybit error: ${msg || "Unknown error"}`);
+  }
+}
+
+async function getOkxBalance(
+  credentials: RawCredentials,
+): Promise<ExchangeBalance> {
+  const { apiKey, apiSecret, passphrase } = credentials;
+  if (!passphrase) throw new Error("OKX requires a passphrase.");
+
+  const timestamp = new Date().toISOString();
+  const method = "GET";
+  const path = "/api/v5/account/balance";
+  const signPayload = timestamp + method + path;
+  const signature = crypto
+    .createHmac("sha256", apiSecret)
+    .update(signPayload)
+    .digest("base64");
+
+  interface OkxBalanceResponse {
+    code: string;
+    msg: string;
+    data: Array<{
+      totalEq: string;
+      details: Array<{
+        ccy: string;
+        availBal: string;
+        frozenBal: string;
+      }>;
+    }>;
+  }
+
+  const { data } = await http.get<OkxBalanceResponse>(
+    "https://www.okx.com" + path,
+    {
+      headers: {
+        "OK-ACCESS-KEY": apiKey,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": passphrase,
+        "x-simulated-trading": "1",
+      },
+    },
+  );
+
+  if (data.code !== "0")
+    throw new Error(data.msg || "OKX balance fetch failed.");
+
+  const account = data.data[0];
+  if (!account) throw new Error("OKX returned an empty balance response.");
+
+  const nonZero = account.details.filter(
+    (d) => parseFloat(d.availBal) > 0 || parseFloat(d.frozenBal) > 0,
+  );
+
+  return {
+    balances: nonZero.map((d) => ({
+      asset: d.ccy,
+      free: d.availBal,
+      locked: d.frozenBal,
+    })),
+    totalUsdtEquivalent: account.totalEq || null,
+  };
+}
+
+async function getBitgetBalance(
+  credentials: RawCredentials,
+): Promise<ExchangeBalance> {
+  const { apiKey, apiSecret, passphrase } = credentials;
+  if (!passphrase) throw new Error("Bitget requires a passphrase.");
+
+  const timestamp = Date.now().toString();
+  const method = "GET";
+  const path = "/api/v2/spot/account/assets";
+  const signPayload = timestamp + method + path;
+  const signature = crypto
+    .createHmac("sha256", apiSecret)
+    .update(signPayload)
+    .digest("base64");
+
+  interface BitgetBalanceResponse {
+    code: string;
+    msg: string;
+    data: Array<{
+      coin: string;
+      available: string;
+      frozen: string;
+      locked: string;
+      usdtValue: string;
+    }>;
+  }
+
+  const { data } = await http.get<BitgetBalanceResponse>(
+    BITGET_BASE_URL + path,
+    {
+      headers: {
+        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        "ACCESS-KEY": apiKey,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": passphrase,
+        "Content-Type": "application/json",
+      },
+    },
   );
 
   if (data.code !== "00000")
-    throw new Error(data.msg || "Bitget futures mark price failed.");
-  const ticker = data.data?.[0];
-  if (!ticker?.markPrice)
-    throw new Error("Bitget returned an invalid futures mark price.");
+    throw new Error(data.msg || "Bitget balance fetch failed.");
 
-  return { price: String(ticker.markPrice), raw: data };
+  const nonZero = (data.data ?? []).filter(
+    (a) => parseFloat(a.available) > 0 || parseFloat(a.frozen) > 0,
+  );
+
+  const totalUsdt = nonZero.reduce(
+    (sum, a) => sum + parseFloat(a.usdtValue || "0"),
+    0,
+  );
+
+  return {
+    balances: nonZero.map((a) => ({
+      asset: a.coin,
+      free: a.available,
+      locked: String(parseFloat(a.frozen) + parseFloat(a.locked || "0")),
+    })),
+    totalUsdtEquivalent: totalUsdt > 0 ? String(totalUsdt) : null,
+  };
 }
 
-// ─── Registries ───────────────────────────────────────────────────────────────
+// ─── Order Registry ───────────────────────────────────────────────────────────
 
 const orderPlacer: Record<
   ExchangeId,
@@ -617,12 +845,18 @@ const priceFetcher: Record<
   bitget: getBitgetCurrentPrice,
 };
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+const balanceFetcher: Record<
+  ExchangeId,
+  (credentials: RawCredentials) => Promise<ExchangeBalance>
+> = {
+  binance: getBinanceBalance,
+  bybit: getBybitBalance,
+  okx: getOkxBalance,
+  bitget: getBitgetBalance,
+};
 
-/**
- * Places a futures limit order with TP/SL on the given exchange.
- * direction "buy" = open long position, "sell" = open short position.
- */
+// ─── Public Trading API ──────────────────────────────────────────────────────
+
 export async function placeOrder(
   exchange: ExchangeId,
   params: PlaceOrderParams,
@@ -634,10 +868,6 @@ export async function placeOrder(
   }
 }
 
-/**
- * Checks the current status of a previously placed futures order.
- * Used by the polling job to confirm fills and resolve trade results.
- */
 export async function getOrderStatus(
   exchange: ExchangeId,
   credentials: RawCredentials,
@@ -651,10 +881,6 @@ export async function getOrderStatus(
   }
 }
 
-/**
- * Returns the current futures mark price for a trading pair.
- * Mark price is used for TP/SL triggers and entry deviation checks.
- */
 export async function getCurrentPrice(
   exchange: ExchangeId,
   pair: string,
@@ -663,5 +889,30 @@ export async function getCurrentPrice(
     return await priceFetcher[exchange](pair);
   } catch (err) {
     throw normalizeError(err);
+  }
+}
+
+export async function attachBinanceTpSl(
+  params: PlaceOrderParams & { orderId: string },
+): Promise<void> {
+  try {
+    await placeBinanceTpSl(params);
+  } catch (err) {
+    throw normalizeError(err);
+  }
+}
+
+// ─── Public Balance API ───────────────────────────────────────────────────────
+
+export async function getExchangeBalance(
+  exchange: ExchangeId,
+  credentials: RawCredentials,
+): Promise<ExchangeBalance> {
+  try {
+    return await balanceFetcher[exchange](credentials);
+  } catch (err) {
+    const error = normalizeError(err);
+    (error as any).exchange = exchange;
+    throw error;
   }
 }

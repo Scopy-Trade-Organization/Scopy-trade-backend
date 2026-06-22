@@ -3,7 +3,7 @@ import {
   validateCredentials,
   encryptCredentials,
   decryptCredentials,
-} from "../services/exchangeService.js";
+} from "../services/exchangeConnectionService.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import {
   ConnectExchangeBody,
