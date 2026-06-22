@@ -1,6 +1,8 @@
 import { Request, Response } from "express";
 import AuditLog from "../models/auditLogModel.js";
 import { Signal } from "../models/signalModel.js";
+import User from "../models/userModel.js";
+import { TronWeb } from "tronweb";
 
 export const createSignal = async (req: Request, res: Response) => {
   try {
@@ -114,7 +116,7 @@ export const updateSignal = async (req: Request, res: Response) => {
       });
     }
 
-    const updatedSignal = await Signal.findByIdAndUpdate(
+    const updatedSignal = await Signal.findOneAndUpdate(
       { _id: signalId, trader: req.user },
       { pair, tp, notes, sl, direction, entry },
       { new: true },
@@ -168,8 +170,7 @@ export const getAllSignals = async (req: Request, res: Response) => {
     const signals = await Signal.find({ trader: req.user })
       .sort({ createdAt: -1 })
       .limit(limit)
-      .skip(skip)
-      .sort({ createdAt: -1 });
+      .skip(skip);
 
     return res.status(200).json({
       success: true,
@@ -178,7 +179,7 @@ export const getAllSignals = async (req: Request, res: Response) => {
       page: currentPage,
       limit,
       pageSize: signals.length,
-      pages: Math.ceil((await Signal.countDocuments()) / limit),
+      pages: Math.ceil((await Signal.countDocuments({ trader: req.user })) / limit),
     });
   } catch (error) {
     console.error("Error fetching signals:", error);
@@ -188,3 +189,149 @@ export const getAllSignals = async (req: Request, res: Response) => {
     });
   }
 };
+
+export const saveWalletAddress = async (req: Request, res: Response) => {
+  try {
+    console.log("saveWalletAddress req.body:", req.body);
+    const { address } = req.body;
+    
+    console.log("saveWalletAddress address length:", address?.length);
+
+    if (!address || typeof address !== "string" || !address.startsWith("T") || address.length !== 34) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid TRC-20 wallet address. It must be a non-empty string, start with 'T', and be exactly 34 characters long.",
+      });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user,
+      { withdrawalAddress: address },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    await AuditLog.create({
+      userId: req.user,
+      action: "Wallet Address Updated",
+      details: { address },
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Wallet address saved successfully",
+      withdrawalAddress: user.withdrawalAddress,
+    });
+  } catch (error) {
+    console.error("Error saving wallet address:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+};
+
+export const getWalletAddress = async (req: Request, res: Response) => {
+  try {
+    const user = await User.findById(req.user);
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.status(200).json({
+      success: true,
+      withdrawalAddress: user.withdrawalAddress || null,
+      requirements: {
+        format: "TRC-20 (Tron Network)",
+        mustStartWith: "T",
+        length: 34,
+        example: "TRX address from any Tron wallet",
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching wallet address:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+};
+
+export const withdrawFunds = async (req: Request, res: Response) => {
+  try {
+    const { amount } = req.body;
+
+    if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid amount is required",
+      });
+    }
+
+    const user = await User.findById(req.user);
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    if (!user.withdrawalAddress) {
+      return res.status(400).json({
+        success: false,
+        message: "No withdrawal address found. Please save your TRC-20 wallet address first.",
+      });
+    }
+
+    // TODO: Validate that the user has sufficient balance in the SCopyTrade system
+    // const hasSufficientBalance = ... 
+    // if (!hasSufficientBalance) return res.status(400).json({ message: "Insufficient balance" });
+
+    const privateKey = process.env.TRON_COMPANY_PRIVATE_KEY;
+    if (!privateKey) {
+      return res.status(500).json({ success: false, message: "Server configuration error: Missing Tron private key" });
+    }
+
+    const usdtContractAddress = process.env.TRON_USDT_CONTRACT_ADDRESS;
+    if (!usdtContractAddress) {
+      return res.status(500).json({ success: false, message: "Server configuration error: Missing USDT contract address" });
+    }
+
+    const tronHost = process.env.TRON_FULL_HOST || "https://api.trongrid.io";
+
+    const tronWeb = new TronWeb({
+      fullHost: tronHost,
+      privateKey: privateKey,
+    });
+
+    const contract = await tronWeb.contract().at(usdtContractAddress);
+    
+    // Convert amount to USDT decimals (6)
+    const amountInSun = tronWeb.toBigNumber(amount).times(1_000_000).toString(10);
+    
+    const transactionId = await contract.transfer(user.withdrawalAddress, amountInSun).send();
+
+    await AuditLog.create({
+      userId: req.user,
+      action: "Withdrawal Executed",
+      details: {
+        amount,
+        destinationAddress: user.withdrawalAddress,
+        transactionId,
+      },
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Withdrawal initiated successfully",
+      transactionId,
+    });
+  } catch (error) {
+    console.error("Error executing withdrawal:", error);
+    return res.status(500).json({
+      success: false,
+      message: (error as Error).message || "Internal server error",
+    });
+  }
+};
+

@@ -75,6 +75,10 @@ const userSchema = new Schema(
       type: String,
       enum: ["male", "female"],
     },
+    withdrawalAddress: {
+      type: String,
+      trim: true,
+    },
   },
   { timestamps: true },
 );
