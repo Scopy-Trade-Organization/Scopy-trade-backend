@@ -86,6 +86,31 @@ const tradeSchema = new Schema(
       type: Date,
       default: null,
     },
+    // ─── Trade Monitoring ─────────────────────────────────────────────────────
+    wsMonitoringActive: {
+      type: Boolean,
+      default: false,
+    },
+    // How the trade was closed (TP hit, SL hit, or manual)
+    closedVia: {
+      type: String,
+      enum: ["tp", "sl", "manual", null],
+      default: null,
+    },
+    // ─── Profit Sharing ───────────────────────────────────────────────────────
+    realizedPnl: {
+      type: String,
+      default: null,
+    },
+    platformFee: {
+      type: String,
+      default: null,
+    },
+    feeStatus: {
+      type: String,
+      enum: ["pending", "collected", "waived", null],
+      default: null,
+    },
   },
   { timestamps: true },
 );

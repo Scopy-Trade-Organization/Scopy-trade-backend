@@ -1,5 +1,5 @@
 import "dotenv/config";
-import app from "./app.js";
+import app, { server } from "./app.js";
 import mongoose from "mongoose";
 import type { Request, Response } from "express";
 
@@ -34,7 +34,9 @@ app.use((err: any, req: any, res: any, next: any) => {
   });
 });
 
-app.listen(PORT, (err) => {
-  if (err) throw err;
+// Use HTTP server (not app) to support WebSocket upgrades
+server.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
+  console.log(`WebSocket available at ws://localhost:${PORT}/ws/trades`);
 });
+

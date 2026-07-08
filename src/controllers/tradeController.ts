@@ -10,9 +10,12 @@ import {
 } from "../services/tradeService.js";
 import { ExchangeId } from "../types/index.js";
 import { decryptCredentials } from "../services/exchangeConnectionService.js";
-
-const DEFAULT_RISK_FRACTION = 0.03;
-const DEFAULT_MAX_ENTRY_DEVIATION = 0.02;
+import {
+  SUPPORTED_PAIRS,
+  SUPPORTED_TRADE_EXCHANGES,
+  MAX_RISK_PERCENT,
+  DEFAULT_MAX_ENTRY_DEVIATION,
+} from "../constants.js";
 
 // ─── Fetch Exchange Balances ──────────────────────────────────────────────────
 export async function fetchExchangeBalances(req: Request, res: Response) {
@@ -160,6 +163,15 @@ export async function initiateTrade(req: Request, res: Response) {
       });
     }
 
+    // ── 2b. Validate trading pair is supported ───────────────────────────────
+    const normalizedPair = signal.pair.toUpperCase().replace(/\//g, "");
+    if (!SUPPORTED_PAIRS.includes(normalizedPair as any)) {
+      return res.status(422).json({
+        success: false,
+        message: `Trading pair "${signal.pair}" is not currently supported. Supported pairs: ${SUPPORTED_PAIRS.join(", ")}`,
+      });
+    }
+
     // ── 3. Fetch & validate the exchange connection ──────────────────────────
     const connection = await ExchangeConnection.findOne({
       _id: exchangeConnectionId,
@@ -172,6 +184,14 @@ export async function initiateTrade(req: Request, res: Response) {
         success: true,
         message:
           "Exchange connection not found or does not belong to your account.",
+      });
+    }
+
+    // ── 3b. Validate exchange is supported for trading ───────────────────────
+    if (!SUPPORTED_TRADE_EXCHANGES.includes(connection.exchange as ExchangeId)) {
+      return res.status(422).json({
+        success: false,
+        message: `Exchange "${connection.exchange}" is not currently supported for trading. Supported: ${SUPPORTED_TRADE_EXCHANGES.join(", ")}`,
       });
     }
 
@@ -255,8 +275,19 @@ export async function initiateTrade(req: Request, res: Response) {
       });
     }
 
-    const capitalToUse = parsedBalance * DEFAULT_RISK_FRACTION;
-    const quantity = capitalToUse / currentPrice;
+    // ── 6. Position sizing — 2% risk model ───────────────────────────────────
+    const slPrice = parseFloat(signal.sl);
+    const priceDistance = Math.abs(entryPrice - slPrice);
+
+    if (!Number.isFinite(priceDistance) || priceDistance <= 0) {
+      return res.status(422).json({
+        message:
+          "Cannot calculate position size: entry and stop-loss prices are too close or identical.",
+      });
+    }
+
+    const riskAmount = parsedBalance * MAX_RISK_PERCENT;
+    const quantity = riskAmount / priceDistance;
     const parsedQty = parseFloat(quantity.toFixed(6));
 
     if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
@@ -302,13 +333,15 @@ export async function initiateTrade(req: Request, res: Response) {
       quantity: String(parsedQty),
       entryPrice: signal.entry,
       status: "pending",
+      wsMonitoringActive: true,
       rawOrderResponse: {
         order: placed.raw,
         marketPrice: currentPriceResult.raw,
         sizing: {
           balance: parsedBalance,
-          riskFraction: DEFAULT_RISK_FRACTION,
-          capitalToUse,
+          riskPercent: MAX_RISK_PERCENT,
+          riskAmount,
+          priceDistance,
           currentPrice: currentPriceResult.price,
           deviation,
         },
@@ -448,4 +481,183 @@ function resolveTradeResult(
   if (distToSl < distToTp) return "loss";
 
   return diff > 0 ? "profit" : "loss";
+}
+
+// ─── Preview Trade (No Order Placed) ──────────────────────────────────────────
+
+/**
+ * POST /trades/preview
+ * Calculates position sizing and risk metrics for a signal WITHOUT placing an order.
+ * Returns the preview so the frontend can display lot size, risk, and reward before user confirms.
+ */
+export async function previewTrade(req: Request, res: Response) {
+  try {
+    const userId = req.user as mongoose.Types.ObjectId;
+    const { signalId, exchangeConnectionId, balance } = req.body;
+
+    // ── 1. Input validation ──────────────────────────────────────────────────
+    if (!signalId || !exchangeConnectionId || !balance) {
+      return res.status(400).json({
+        success: false,
+        message: "signalId, exchangeConnectionId, and balance are required.",
+      });
+    }
+
+    if (
+      !mongoose.isValidObjectId(signalId) ||
+      !mongoose.isValidObjectId(exchangeConnectionId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid ID format.",
+      });
+    }
+
+    const parsedBalance = parseFloat(balance);
+    if (isNaN(parsedBalance) || parsedBalance <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "balance must be a positive number.",
+      });
+    }
+
+    // ── 2. Fetch & validate signal ───────────────────────────────────────────
+    const signal = await Signal.findById(signalId).lean();
+    if (!signal) {
+      return res.status(404).json({ success: false, message: "Signal not found." });
+    }
+    if (signal.status !== "active") {
+      return res.status(409).json({
+        success: false,
+        message: "This signal is no longer active.",
+      });
+    }
+
+    // Pair validation
+    const normalizedPair = signal.pair.toUpperCase().replace(/\//g, "");
+    if (!SUPPORTED_PAIRS.includes(normalizedPair as any)) {
+      return res.status(422).json({
+        success: false,
+        message: `Trading pair "${signal.pair}" is not currently supported. Supported: ${SUPPORTED_PAIRS.join(", ")}`,
+      });
+    }
+
+    // ── 3. Fetch & validate connection ───────────────────────────────────────
+    const connection = await ExchangeConnection.findOne({
+      _id: exchangeConnectionId,
+      userId,
+      isActive: true,
+    }).lean();
+
+    if (!connection) {
+      return res.status(404).json({
+        success: false,
+        message: "Exchange connection not found.",
+      });
+    }
+
+    if (!SUPPORTED_TRADE_EXCHANGES.includes(connection.exchange as ExchangeId)) {
+      return res.status(422).json({
+        success: false,
+        message: `Exchange "${connection.exchange}" is not supported for trading.`,
+      });
+    }
+
+    // ── 4. Fetch current market price ────────────────────────────────────────
+    const storedCreds = {
+      exchange: connection.exchange as ExchangeId,
+      apiKey: connection.encryptedApiKey!,
+      apiSecret: connection.encryptedApiSecret!,
+      ...(connection.encryptedPassphrase
+        ? { passphrase: connection.encryptedPassphrase }
+        : {}),
+    };
+    const rawCreds = decryptCredentials(storedCreds);
+
+    let currentPriceResult;
+    try {
+      currentPriceResult = await getCurrentPrice(
+        connection.exchange as ExchangeId,
+        signal.pair,
+      );
+    } catch (priceErr) {
+      const message =
+        priceErr instanceof Error
+          ? priceErr.message
+          : "Current price lookup failed.";
+      return res.status(502).json({
+        success: false,
+        message: "Failed to fetch current market price.",
+        detail: message,
+      });
+    }
+
+    // ── 5. Calculate 2% risk position sizing ─────────────────────────────────
+    const entryPrice = parseFloat(signal.entry);
+    const slPrice = parseFloat(signal.sl);
+    const tpPrice = parseFloat(signal.tp);
+    const currentPrice = parseFloat(currentPriceResult.price);
+
+    if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
+      return res.status(422).json({
+        success: false,
+        message: "Signal entry price is invalid.",
+      });
+    }
+
+    const priceDistance = Math.abs(entryPrice - slPrice);
+    if (!Number.isFinite(priceDistance) || priceDistance <= 0) {
+      return res.status(422).json({
+        success: false,
+        message: "Cannot calculate position size: entry and stop-loss prices are too close or identical.",
+      });
+    }
+
+    const riskAmount = parsedBalance * MAX_RISK_PERCENT;
+    const calculatedLotSize = parseFloat((riskAmount / priceDistance).toFixed(6));
+
+    if (!Number.isFinite(calculatedLotSize) || calculatedLotSize <= 0) {
+      return res.status(422).json({
+        success: false,
+        message: "Calculated lot size is invalid.",
+      });
+    }
+
+    // Risk/reward calculations
+    const distanceToTP = Math.abs(tpPrice - entryPrice);
+    const estimatedLossIfSL = priceDistance * calculatedLotSize;
+    const estimatedProfitIfTP = distanceToTP * calculatedLotSize;
+    const riskRewardRatio =
+      priceDistance > 0 ? parseFloat((distanceToTP / priceDistance).toFixed(2)) : 0;
+
+    // Deviation check (informational — not blocking in preview)
+    const deviation = Math.abs(currentPrice - entryPrice) / entryPrice;
+
+    return res.status(200).json({
+      success: true,
+      preview: {
+        pair: signal.pair,
+        direction: signal.direction,
+        exchange: connection.exchange,
+        entryPrice: signal.entry,
+        stopLoss: signal.sl,
+        takeProfit: signal.tp,
+        currentMarketPrice: currentPriceResult.price,
+        balance: String(parsedBalance),
+        riskPercent: MAX_RISK_PERCENT,
+        riskAmount: riskAmount.toFixed(2),
+        priceDistance: priceDistance.toFixed(2),
+        calculatedLotSize: String(calculatedLotSize),
+        estimatedLossIfSL: estimatedLossIfSL.toFixed(2),
+        estimatedProfitIfTP: estimatedProfitIfTP.toFixed(2),
+        riskRewardRatio: String(riskRewardRatio),
+        deviation: Number(deviation.toFixed(6)),
+        maxDeviation: DEFAULT_MAX_ENTRY_DEVIATION,
+        deviationWarning: deviation > DEFAULT_MAX_ENTRY_DEVIATION,
+      },
+    });
+  } catch (err) {
+    console.error("[previewTrade]", err);
+    return res.status(500).json({ success: false, message: "Internal server error." });
+  }
 }

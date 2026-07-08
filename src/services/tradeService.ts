@@ -564,7 +564,7 @@ async function getBitgetOrderStatus(
 
   interface BitgetStatusResponse {
     code: string;
-    data: Array<{ status: string; priceAvg: string }>;
+    data: { status: string; priceAvg: string };
   }
 
   const { data } = await http.get<BitgetStatusResponse>(
@@ -581,7 +581,7 @@ async function getBitgetOrderStatus(
     },
   );
 
-  const order = data.data[0];
+  const order = data.data;
   if (!order) throw new Error("Order not found on Bitget.");
 
   const statusMap: Record<string, OrderStatusResult["status"]> = {
@@ -868,8 +868,9 @@ async function getBitgetBalance(
 
   const timestamp = Date.now().toString();
   const method = "GET";
-  const path = "/api/v2/mix/account/account";
-  const signPayload = timestamp + method + path;
+  const queryString = "productType=USDT-FUTURES&marginCoin=USDT";
+  const path = "/api/v2/mix/account/accounts";
+  const signPayload = timestamp + method + path + "?" + queryString;
   const signature = crypto
     .createHmac("sha256", apiSecret)
     .update(signPayload)
@@ -882,13 +883,14 @@ async function getBitgetBalance(
       marginCoin: string;
       available: string;
       locked: string;
-      usdtValue: string;
+      usdtEquity: string;
     }>;
   }
 
   const { data } = await http.get<BitgetBalanceResponse>(
     BITGET_BASE_URL + path,
     {
+      params: { productType: "USDT-FUTURES", marginCoin: "USDT" },
       headers: {
         ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
@@ -908,7 +910,7 @@ async function getBitgetBalance(
   );
 
   const totalUsdt = nonZero.reduce(
-    (sum, a) => sum + parseFloat(a.usdtValue || "0"),
+    (sum, a) => sum + parseFloat(a.usdtEquity || "0"),
     0,
   );
 
