@@ -4,6 +4,7 @@ import {
   getUserTrades,
   getTradeById,
   fetchExchangeBalances,
+  previewTrade,
 } from "../controllers/tradeController.js";
 import {
   userAuthenticate,
@@ -15,6 +16,9 @@ const tradeRouter = Router();
 // All trade routes require authentication
 tradeRouter.use(userAuthenticate);
 tradeRouter.use(requireRole(["CopyTrader"]));
+
+// Preview trade — calculates position sizing without placing an order
+tradeRouter.post("/preview", previewTrade);
 
 // Initiates a copy trade for the authenticated user:
 tradeRouter.post("/", initiateTrade);

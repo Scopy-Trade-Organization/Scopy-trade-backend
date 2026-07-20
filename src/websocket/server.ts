@@ -1,306 +1,359 @@
-// // websocket/server.ts
-// import WebSocket from "ws";
-// import { Server as HttpServer } from "http";
-// import { parse } from "url";
-// import { getWebSocketManager } from "../services/websocketManager.js";
-// import { verifyToken } from "../services/authService.js";
-// import { Trade } from "../models/tradeModel.js";
-// import mongoose from "mongoose";
+/**
+ * websocket/server.ts
+ *
+ * Frontend-facing WebSocket server for real-time trade updates.
+ * Authenticates users via JWT, supports trade subscriptions,
+ * and broadcasts updates from the TradeMonitorService.
+ */
 
-// interface WebSocketClient {
-//   ws: WebSocket;
-//   userId: mongoose.Types.ObjectId;
-//   isAuthenticated: boolean;
-//   subscribedTrades: Set<string>;
-//   subscribedConnections: Set<string>;
-// }
+import WebSocket, { WebSocketServer as WsServer } from "ws";
+import { Server as HttpServer } from "http";
+import { parse } from "url";
+import { IncomingMessage } from "http";
+import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
+import { Trade } from "../models/tradeModel.js";
+import { getTradeMonitorService } from "../services/tradeMonitorService.js";
 
-// export class WebSocketServer {
-//   private wss: WebSocket.Server;
-//   private clients: Map<string, WebSocketClient> = new Map();
-//   private manager = getWebSocketManager();
+// ─── Types ──────────────────────────────────────────────────────────────────
 
-//   constructor(server: HttpServer) {
-//     this.wss = new WebSocket.Server({
-//       server,
-//       path: "/ws/trades",
-//     });
+interface WebSocketClient {
+  ws: WebSocket;
+  userId: string;
+  isAuthenticated: boolean;
+  subscribedTrades: Set<string>;
+}
 
-//     this.setupWebSocketServer();
-//     this.setupTradeUpdateListener();
-//   }
+interface ClientMessage {
+  type: string;
+  data?: any;
+  tradeId?: string;
+}
 
-//   private setupWebSocketServer(): void {
-//     this.wss.on("connection", async (ws: WebSocket, req) => {
-//       const query = parse(req.url || "", true).query;
-//       const token = query.token as string;
+// ─── WebSocket Server ───────────────────────────────────────────────────────
 
-//       // Authenticate the user
-//       let userId: mongoose.Types.ObjectId | null = null;
+export class TradeWebSocketServer {
+  private wss: WsServer;
+  private clients: Map<string, WebSocketClient> = new Map();
 
-//       try {
-//         const decoded = await verifyToken(token);
-//         userId = decoded.userId;
-//       } catch (err) {
-//         ws.send(
-//           JSON.stringify({
-//             type: "error",
-//             code: "UNAUTHORIZED",
-//             message: "Invalid or missing authentication token",
-//           }),
-//         );
-//         ws.close();
-//         return;
-//       }
+  constructor(server: HttpServer) {
+    this.wss = new WsServer({
+      server,
+      path: "/ws/trades",
+    });
 
-//       if (!userId) {
-//         ws.send(
-//           JSON.stringify({
-//             type: "error",
-//             code: "UNAUTHORIZED",
-//             message: "Authentication required",
-//           }),
-//         );
-//         ws.close();
-//         return;
-//       }
+    this.setupServer();
+    this.setupMonitorListener();
 
-//       const clientId = String(userId);
+    console.log("[WebSocketServer] Initialized on /ws/trades");
+  }
 
-//       // Close existing connection for this user if any
-//       if (this.clients.has(clientId)) {
-//         const existing = this.clients.get(clientId);
-//         if (existing) {
-//           existing.ws.close(1000, "New connection established");
-//         }
-//       }
+  // ─── Server Setup ───────────────────────────────────────────────────────
 
-//       const client: WebSocketClient = {
-//         ws,
-//         userId,
-//         isAuthenticated: true,
-//         subscribedTrades: new Set(),
-//         subscribedConnections: new Set(),
-//       };
+  private setupServer(): void {
+    this.wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
+      const query = parse(req.url || "", true).query;
+      const token = query.token as string;
 
-//       this.clients.set(clientId, client);
+      // Authenticate via JWT
+      let userId: string | null = null;
 
-//       // Send initial connection status
-//       ws.send(
-//         JSON.stringify({
-//           type: "connection",
-//           status: "connected",
-//           timestamp: new Date().toISOString(),
-//         }),
-//       );
+      try {
+        if (!token) throw new Error("No token provided.");
 
-//       // Send list of active connections
-//       const connections = this.manager.getActiveConnections();
-//       ws.send(
-//         JSON.stringify({
-//           type: "connections",
-//           data: connections,
-//         }),
-//       );
+        const secret = process.env.JWT_SECRET;
+        if (!secret) throw new Error("JWT_SECRET not configured.");
 
-//       console.log(`[WebSocketServer] Client connected: ${clientId}`);
+        const decoded = jwt.verify(token, secret) as { id: string };
+        if (!decoded?.id) throw new Error("Invalid token payload.");
 
-//       // Handle incoming messages
-//       ws.on("message", async (data: WebSocket.Data) => {
-//         try {
-//           const message = JSON.parse(data.toString());
-//           await this.handleClientMessage(client, message);
-//         } catch (err) {
-//           console.error("[WebSocketServer] Error handling message:", err);
-//           ws.send(
-//             JSON.stringify({
-//               type: "error",
-//               code: "INVALID_MESSAGE",
-//               message: "Invalid message format",
-//             }),
-//           );
-//         }
-//       });
+        userId = decoded.id;
+      } catch (err) {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            code: "UNAUTHORIZED",
+            message:
+              err instanceof Error
+                ? err.message
+                : "Invalid or missing authentication token",
+          }),
+        );
+        ws.close(1008, "Unauthorized");
+        return;
+      }
 
-//       ws.on("close", () => {
-//         this.clients.delete(clientId);
-//         console.log(`[WebSocketServer] Client disconnected: ${clientId}`);
-//       });
+      // Close existing connection for this user if any
+      const existing = this.clients.get(userId);
+      if (existing) {
+        existing.ws.close(1000, "New connection established");
+        this.clients.delete(userId);
+      }
 
-//       ws.on("error", (err) => {
-//         console.error(`[WebSocketServer] Client error ${clientId}:`, err);
-//         this.clients.delete(clientId);
-//       });
-//     });
+      const client: WebSocketClient = {
+        ws,
+        userId,
+        isAuthenticated: true,
+        subscribedTrades: new Set(),
+      };
 
-//     console.log("[WebSocketServer] WebSocket server initialized on /ws/trades");
-//   }
+      this.clients.set(userId, client);
 
-//   private setupTradeUpdateListener(): void {
-//     this.manager.on("tradeUpdate", (data) => {
-//       // Broadcast to all clients connected to this trade
-//       this.broadcastTradeUpdate(data);
-//     });
-//   }
+      // Send connection acknowledgment
+      this.sendToClient(client, {
+        type: "connected",
+        timestamp: new Date().toISOString(),
+      });
 
-//   private async handleClientMessage(
-//     client: WebSocketClient,
-//     message: any,
-//   ): Promise<void> {
-//     const { type, data } = message;
+      console.log(`[WebSocketServer] Client connected: ${userId}`);
 
-//     switch (type) {
-//       case "subscribe_trade":
-//         await this.subscribeTrade(client, data);
-//         break;
+      // Handle messages
+      ws.on("message", async (data: WebSocket.Data) => {
+        try {
+          const message: ClientMessage = JSON.parse(data.toString());
+          await this.handleMessage(client, message);
+        } catch (err) {
+          this.sendToClient(client, {
+            type: "error",
+            code: "INVALID_MESSAGE",
+            message: "Invalid message format",
+          });
+        }
+      });
 
-//       case "subscribe_connection":
-//         await this.subscribeConnection(client, data);
-//         break;
+      ws.on("close", () => {
+        this.clients.delete(userId!);
+        console.log(`[WebSocketServer] Client disconnected: ${userId}`);
+      });
 
-//       case "unsubscribe_trade":
-//         this.unsubscribeTrade(client, data);
-//         break;
+      ws.on("error", (err: Error) => {
+        console.error(`[WebSocketServer] Client error ${userId}:`, err);
+        this.clients.delete(userId!);
+      });
 
-//       case "unsubscribe_connection":
-//         this.unsubscribeConnection(client, data);
-//         break;
+      // Ping keepalive every 30 seconds
+      const pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.ping();
+        } else {
+          clearInterval(pingInterval);
+        }
+      }, 30000);
 
-//       case "get_trade_history":
-//         await this.sendTradeHistory(client, data);
-//         break;
+      ws.on("close", () => clearInterval(pingInterval));
+    });
+  }
 
-//       default:
-//         throw new Error(`Unknown message type: ${type}`);
-//     }
-//   }
+  // ─── Monitor Listener ──────────────────────────────────────────────────
 
-//   private async subscribeTrade(
-//     client: WebSocketClient,
-//     tradeId: string,
-//   ): Promise<void> {
-//     if (!tradeId) return;
+  private setupMonitorListener(): void {
+    const monitor = getTradeMonitorService();
 
-//     // Verify the trade belongs to this user
-//     const trade = await Trade.findOne({
-//       _id: tradeId,
-//       userId: client.userId,
-//     }).lean();
+    // Real-time trade status updates (pending → filled, etc.)
+    monitor.on("tradeUpdate", (data) => {
+      this.broadcastToTradeSubscribers(data.tradeId, {
+        type: "trade_update",
+        data: {
+          tradeId: data.tradeId,
+          exchangeOrderId: data.exchangeOrderId,
+          exchange: data.exchange,
+          status: data.status,
+          filledPrice: data.filledPrice,
+          filledQuantity: data.filledQuantity,
+          timestamp: data.timestamp,
+        },
+      });
+    });
 
-//     if (!trade) {
-//       client.ws.send(
-//         JSON.stringify({
-//           type: "error",
-//           code: "NOT_FOUND",
-//           message: "Trade not found or access denied",
-//         }),
-//       );
-//       return;
-//     }
+    // Trade closed (TP/SL/manual) with PnL
+    monitor.on("tradeClosed", (data) => {
+      this.broadcastToTradeSubscribers(data.tradeId, {
+        type: "trade_closed",
+        data: {
+          tradeId: data.tradeId,
+          realizedPnl: data.realizedPnl,
+          platformFee: data.platformFee,
+          feeStatus: data.feeStatus,
+          tradeResult: data.tradeResult,
+        },
+      });
+    });
+  }
 
-//     client.subscribedTrades.add(tradeId);
+  // ─── Message Handlers ──────────────────────────────────────────────────
 
-//     // Send current state immediately
-//     client.ws.send(
-//       JSON.stringify({
-//         type: "trade_state",
-//         data: {
-//           tradeId,
-//           status: trade.status,
-//           filledPrice: trade.filledPrice,
-//           filledQuantity: trade.filledQuantity,
-//           updatedAt: trade.updatedAt,
-//         },
-//       }),
-//     );
-//   }
+  private async handleMessage(
+    client: WebSocketClient,
+    message: ClientMessage,
+  ): Promise<void> {
+    switch (message.type) {
+      case "subscribe_trade":
+        await this.subscribeTrade(client, message.tradeId || message.data);
+        break;
 
-//   private async subscribeConnection(
-//     client: WebSocketClient,
-//     connectionId: string,
-//   ): Promise<void> {
-//     if (!connectionId) return;
+      case "unsubscribe_trade":
+        this.unsubscribeTrade(client, message.tradeId || message.data);
+        break;
 
-//     // Verify connection belongs to this user
-//     // (Would need to check in database)
-//     client.subscribedConnections.add(connectionId);
+      case "get_active_trades":
+        await this.sendActiveTrades(client);
+        break;
 
-//     const status = this.manager.getConnectionStatus(connectionId);
-//     client.ws.send(
-//       JSON.stringify({
-//         type: "connection_status",
-//         data: {
-//           connectionId,
-//           ...status,
-//         },
-//       }),
-//     );
-//   }
+      default:
+        this.sendToClient(client, {
+          type: "error",
+          code: "UNKNOWN_TYPE",
+          message: `Unknown message type: ${message.type}`,
+        });
+    }
+  }
 
-//   private unsubscribeTrade(client: WebSocketClient, tradeId: string): void {
-//     client.subscribedTrades.delete(tradeId);
-//   }
+  private async subscribeTrade(
+    client: WebSocketClient,
+    tradeId: string,
+  ): Promise<void> {
+    if (!tradeId || !mongoose.isValidObjectId(tradeId)) {
+      this.sendToClient(client, {
+        type: "error",
+        code: "INVALID_TRADE_ID",
+        message: "Invalid trade ID.",
+      });
+      return;
+    }
 
-//   private unsubscribeConnection(
-//     client: WebSocketClient,
-//     connectionId: string,
-//   ): void {
-//     client.subscribedConnections.delete(connectionId);
-//   }
+    // Verify trade belongs to user
+    const trade = await Trade.findOne({
+      _id: tradeId,
+      userId: client.userId,
+    }).lean();
 
-//   private async sendTradeHistory(
-//     client: WebSocketClient,
-//     filters: any,
-//   ): Promise<void> {
-//     const { limit = 50, status } = filters || {};
+    if (!trade) {
+      this.sendToClient(client, {
+        type: "error",
+        code: "NOT_FOUND",
+        message: "Trade not found or access denied.",
+      });
+      return;
+    }
 
-//     const trades = await Trade.find({
-//       userId: client.userId,
-//       ...(status && { status }),
-//     })
-//       .sort({ createdAt: -1 })
-//       .limit(Math.min(limit, 100))
-//       .lean();
+    client.subscribedTrades.add(tradeId);
 
-//     client.ws.send(
-//       JSON.stringify({
-//         type: "trade_history",
-//         data: trades,
-//       }),
-//     );
-//   }
+    // Send current trade state immediately
+    this.sendToClient(client, {
+      type: "trade_state",
+      data: {
+        tradeId,
+        status: trade.status,
+        entryPrice: trade.entryPrice,
+        entryFillPrice: trade.entryFillPrice,
+        exitPrice: trade.exitPrice,
+        tp: trade.tp,
+        sl: trade.sl,
+        direction: trade.direction,
+        quantity: trade.quantity,
+        pair: trade.pair,
+        realizedPnl: trade.realizedPnl,
+        platformFee: trade.platformFee,
+        feeStatus: trade.feeStatus,
+        tradeResult: trade.tradeResult,
+        closedVia: trade.closedVia,
+        wsMonitoringActive: trade.wsMonitoringActive,
+        createdAt: trade.createdAt,
+        closedAt: trade.closedAt,
+      },
+    });
 
-//   private broadcastTradeUpdate(data: any): void {
-//     const message = JSON.stringify({
-//       type: "trade_update",
-//       data,
-//     });
+    console.log(
+      `[WebSocketServer] User ${client.userId} subscribed to trade ${tradeId}`,
+    );
+  }
 
-//     // Send to all clients that are subscribed to this trade
-//     for (const [clientId, client] of this.clients) {
-//       if (client.subscribedTrades.has(data.tradeId)) {
-//         client.ws.send(message);
-//       }
-//     }
-//   }
+  private unsubscribeTrade(client: WebSocketClient, tradeId: string): void {
+    if (!tradeId) return;
+    client.subscribedTrades.delete(tradeId);
+    console.log(
+      `[WebSocketServer] User ${client.userId} unsubscribed from trade ${tradeId}`,
+    );
+  }
 
-//   public broadcast(message: any): void {
-//     const serialized = JSON.stringify(message);
-//     for (const [clientId, client] of this.clients) {
-//       if (client.ws.readyState === WebSocket.OPEN) {
-//         client.ws.send(serialized);
-//       }
-//     }
-//   }
+  private async sendActiveTrades(client: WebSocketClient): Promise<void> {
+    const trades = await Trade.find({
+      userId: client.userId,
+      status: { $in: ["pending", "filled"] },
+    })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
 
-//   public shutdown(): void {
-//     console.log("[WebSocketServer] Shutting down...");
+    this.sendToClient(client, {
+      type: "active_trades",
+      data: trades.map((t) => ({
+        tradeId: String(t._id),
+        pair: t.pair,
+        direction: t.direction,
+        status: t.status,
+        entryPrice: t.entryPrice,
+        tp: t.tp,
+        sl: t.sl,
+        quantity: t.quantity,
+        wsMonitoringActive: t.wsMonitoringActive,
+        createdAt: t.createdAt,
+      })),
+    });
+  }
 
-//     for (const [clientId, client] of this.clients) {
-//       client.ws.close(1000, "Server shutting down");
-//     }
+  // ─── Broadcasting ─────────────────────────────────────────────────────
 
-//     this.clients.clear();
-//     this.wss.close();
-//   }
-// }
+  private broadcastToTradeSubscribers(tradeId: string, message: any): void {
+    const serialized = JSON.stringify(message);
+
+    for (const [, client] of this.clients) {
+      if (
+        client.subscribedTrades.has(tradeId) &&
+        client.ws.readyState === WebSocket.OPEN
+      ) {
+        client.ws.send(serialized);
+      }
+    }
+  }
+
+  /**
+   * Broadcast a message to all connected, authenticated clients.
+   */
+  public broadcast(message: any): void {
+    const serialized = JSON.stringify(message);
+
+    for (const [, client] of this.clients) {
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(serialized);
+      }
+    }
+  }
+
+  // ─── Helpers ──────────────────────────────────────────────────────────
+
+  private sendToClient(client: WebSocketClient, message: any): void {
+    if (client.ws.readyState === WebSocket.OPEN) {
+      client.ws.send(JSON.stringify(message));
+    }
+  }
+
+  // ─── Lifecycle ────────────────────────────────────────────────────────
+
+  public shutdown(): void {
+    console.log("[WebSocketServer] Shutting down...");
+
+    for (const [, client] of this.clients) {
+      client.ws.close(1001, "Server shutting down");
+    }
+
+    this.clients.clear();
+    this.wss.close();
+
+    console.log("[WebSocketServer] Shutdown complete.");
+  }
+
+  public getConnectedClientCount(): number {
+    return this.clients.size;
+  }
+}

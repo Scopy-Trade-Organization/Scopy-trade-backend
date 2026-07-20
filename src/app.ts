@@ -7,8 +7,8 @@ import cookieParser from "cookie-parser";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
 import { createServer } from "http";
-// import { WebSocketServer } from "./websocket/server.js";
-// import { getWebSocketManager } from "./services/websocketManager.js";
+import { TradeWebSocketServer } from "./websocket/server.js";
+import { getTradeMonitorService } from "./services/tradeMonitorService.js";
 import authRouter from "./routes/userAuthRoutes.js";
 import exchangeRouter from "./routes/exchangeRoutes.js";
 import adminDashboardRouter from "./routes/adminDashboardRoutes.js";
@@ -34,31 +34,38 @@ const allowedOrigins = [
 const app = express();
 const server = createServer(app);
 
-// const wsManager = getWebSocketManager();
+// ─── WebSocket Server ────────────────────────────────────────────────────────
+const wsServer = new TradeWebSocketServer(server);
 
-// // Start WebSocket connections for exchange monitoring
-// wsManager
-//   .initialize()
-//   .then(() => {
-//     console.log("[App] WebSocket manager initialized");
-//   })
-//   .catch((err) => {
-//     console.error("[App] Failed to initialize WebSocket manager:", err);
-//   });
+// ─── Trade Monitor Service ───────────────────────────────────────────────────
+const tradeMonitor = getTradeMonitorService();
 
-// Initialize WebSocket server for frontend
-// const wsServer = new WebSocketServer(server);
+// Resume monitoring active trades after startup
+// (Delayed to allow MongoDB to fully connect in index.ts)
+setTimeout(() => {
+  tradeMonitor
+    .resumeActiveMonitoring()
+    .then(() => {
+      console.log("[App] Trade monitor resumed active monitoring");
+    })
+    .catch((err) => {
+      console.error("[App] Failed to resume trade monitoring:", err);
+    });
+}, 3000);
 
-// Graceful shutdown
-// process.on("SIGTERM", async () => {
-//   console.log("[App] Received SIGTERM, shutting down...");
-//   wsServer.shutdown();
-//   await wsManager.shutdown();
-//   server.close(() => {
-//     console.log("[App] Server closed");
-//     process.exit(0);
-//   });
-// });
+// ─── Graceful Shutdown ───────────────────────────────────────────────────────
+async function gracefulShutdown() {
+  console.log("[App] Shutting down gracefully...");
+  wsServer.shutdown();
+  await tradeMonitor.shutdown();
+  server.close(() => {
+    console.log("[App] Server closed");
+    process.exit(0);
+  });
+}
+
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);
 
 app.get("/ip", async (_, res) => {
   const response = await fetch("https://api.ipify.org?format=json");
@@ -103,4 +110,7 @@ app.use("/api/admin/auth", adminAuthRouter);
 app.use("/api/pro-trader/dashboard", proTraderDashboardRouter);
 app.use("/api/copy-trader/dashboard", copyTraderDashboardRouter);
 app.use("/api/trades", tradeRouter);
+
+export { server };
 export default app;
+
