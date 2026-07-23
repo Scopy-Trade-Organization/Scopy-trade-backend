@@ -6,8 +6,7 @@ export const SUPPORTED_PAIRS = ["BTCUSDT", "ETHUSDT", "DOGEUSDT"] as const;
 export type SupportedPair = (typeof SUPPORTED_PAIRS)[number];
 
 // ─── Supported Exchanges for Trading ────────────────────────────────────────
-// Bybit is excluded due to inconsistent demo market pricing.
-export const SUPPORTED_TRADE_EXCHANGES: ExchangeId[] = ["binance", "bitget"];
+export const SUPPORTED_TRADE_EXCHANGES: ExchangeId[] = ["binance", "bybit"];
 
 // ─── Risk Management ───────────────────────────────────────────────────────
 // Maximum percentage of available balance at risk per trade.

@@ -6,6 +6,7 @@ import {
   normalizeError,
   getBybitTimestamp,
 } from "./exchangeConnectionService.js";
+import { getExchangeRestUrl } from "./exchangeEnvironment.js";
 
 const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
 
@@ -24,6 +25,12 @@ export interface PlaceOrderParams {
 export interface PlacedOrderResult {
   orderId: string;
   raw: unknown;
+  execution?: {
+    quantity: string;
+    entryPrice: string;
+    tp: string;
+    sl: string;
+  };
 }
 
 export interface OrderStatusResult {
@@ -69,6 +76,77 @@ function normalizePairForExchange(exchange: ExchangeId, pair: string): string {
   return normalized;
 }
 
+function decimalPlaces(step: string): number {
+  const normalized = step.replace(/0+$/, "");
+  const dot = normalized.indexOf(".");
+  return dot === -1 ? 0 : normalized.length - dot - 1;
+}
+
+function alignToStep(value: string, step: string, roundDown = false): string {
+  const numericValue = Number(value);
+  const numericStep = Number(step);
+  if (!Number.isFinite(numericValue) || !Number.isFinite(numericStep) || numericStep <= 0) {
+    throw new Error(`Invalid exchange precision value: ${value} / ${step}`);
+  }
+  const units = numericValue / numericStep;
+  const alignedUnits = roundDown ? Math.floor(units + 1e-10) : Math.round(units);
+  return (alignedUnits * numericStep).toFixed(decimalPlaces(step));
+}
+
+async function prepareFuturesOrder(
+  exchange: ExchangeId,
+  p: PlaceOrderParams,
+): Promise<PlaceOrderParams> {
+  if (exchange !== "binance" && exchange !== "bybit") return p;
+
+  const baseUrl = getExchangeRestUrl(exchange);
+  const symbol = normalizePairForExchange(exchange, p.pair);
+
+  if (exchange === "binance") {
+    const { data } = await http.get(`${baseUrl}/fapi/v1/exchangeInfo`);
+    const instrument = data.symbols?.find((item: any) => item.symbol === symbol);
+    if (!instrument) throw new Error(`Binance Futures does not support ${symbol}.`);
+    const priceFilter = instrument.filters?.find((item: any) => item.filterType === "PRICE_FILTER");
+    const lotFilter = instrument.filters?.find((item: any) => item.filterType === "LOT_SIZE");
+    const minNotionalFilter = instrument.filters?.find((item: any) => item.filterType === "MIN_NOTIONAL");
+    if (!priceFilter?.tickSize || !lotFilter?.stepSize) {
+      throw new Error(`Binance returned incomplete Futures rules for ${symbol}.`);
+    }
+    const quantity = alignToStep(p.quantity, lotFilter.stepSize, true);
+    const entryPrice = alignToStep(p.entryPrice, priceFilter.tickSize);
+    const tp = alignToStep(p.tp, priceFilter.tickSize);
+    const sl = alignToStep(p.sl, priceFilter.tickSize);
+    if (
+      Number(quantity) < Number(lotFilter.minQty || 0) ||
+      Number(quantity) * Number(entryPrice) < Number(minNotionalFilter?.notional || 0)
+    ) {
+      throw new Error(`Calculated quantity is below Binance Futures minimum for ${symbol}.`);
+    }
+    return { ...p, quantity, entryPrice, tp, sl };
+  }
+
+  const { data } = await http.get(`${baseUrl}/v5/market/instruments-info`, {
+    params: { category: "linear", symbol },
+  });
+  if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit instrument lookup failed.");
+  const instrument = data.result?.list?.[0];
+  if (!instrument) throw new Error(`Bybit Linear does not support ${symbol}.`);
+  const qtyStep = instrument.lotSizeFilter?.qtyStep;
+  const tickSize = instrument.priceFilter?.tickSize;
+  if (!qtyStep || !tickSize) throw new Error(`Bybit returned incomplete Linear rules for ${symbol}.`);
+  const quantity = alignToStep(p.quantity, qtyStep, true);
+  const entryPrice = alignToStep(p.entryPrice, tickSize);
+  const tp = alignToStep(p.tp, tickSize);
+  const sl = alignToStep(p.sl, tickSize);
+  if (
+    Number(quantity) < Number(instrument.lotSizeFilter?.minOrderQty || 0) ||
+    Number(quantity) * Number(entryPrice) < Number(instrument.lotSizeFilter?.minNotionalValue || 0)
+  ) {
+    throw new Error(`Calculated quantity is below Bybit Linear minimum for ${symbol}.`);
+  }
+  return { ...p, quantity, entryPrice, tp, sl };
+}
+
 // ─── Order Placement ──────────────────────────────────────────────────────────
 
 // ── Binance Futures — places limit order with TP/SL
@@ -76,8 +154,7 @@ async function placeBinanceOrder(
   p: PlaceOrderParams,
 ): Promise<PlacedOrderResult> {
   const { apiKey, apiSecret } = p.credentials;
-  const baseUrl =
-    process.env.BINANCE_TEST_API_URL || "https://fapi.binance.com";
+  const baseUrl = getExchangeRestUrl("binance");
   const normalizedPair = normalizePairForExchange("binance", p.pair);
 
   const getTimestamp = async () => {
@@ -107,33 +184,16 @@ async function placeBinanceOrder(
 
   const orderId = String(orderData.orderId);
 
-  // 2. Set TP using TAKE_PROFIT_MARKET
-  try {
-    const tpSide = p.direction === "buy" ? "SELL" : "BUY";
-    const tpQs = `symbol=${normalizedPair}&side=${tpSide}&type=TAKE_PROFIT_MARKET&quantity=${p.quantity}&stopPrice=${p.tp}&timestamp=${ts + 1}`;
-    await http.post(`${baseUrl}/fapi/v1/order`, null, {
-      params: {
-        ...Object.fromEntries(new URLSearchParams(tpQs)),
-        signature: sign(tpQs),
-      },
-      headers: { "X-MBX-APIKEY": apiKey },
-    });
-
-    // 3. Set SL using STOP_MARKET
-    const slSide = p.direction === "buy" ? "SELL" : "BUY";
-    const slQs = `symbol=${normalizedPair}&side=${slSide}&type=STOP_MARKET&quantity=${p.quantity}&stopPrice=${p.sl}&timestamp=${ts + 2}`;
-    await http.post(`${baseUrl}/fapi/v1/order`, null, {
-      params: {
-        ...Object.fromEntries(new URLSearchParams(slQs)),
-        signature: sign(slQs),
-      },
-      headers: { "X-MBX-APIKEY": apiKey },
-    });
-  } catch (tpSlErr) {
-    console.warn("Failed to set TP/SL for Binance futures:", tpSlErr);
-  }
-
-  return { orderId, raw: orderData };
+  return {
+    orderId,
+    raw: orderData,
+    execution: {
+      quantity: p.quantity,
+      entryPrice: p.entryPrice,
+      tp: p.tp,
+      sl: p.sl,
+    },
+  };
 }
 
 // ── Bybit Futures (Linear) — places limit order with TP/SL in a single call
@@ -141,7 +201,7 @@ async function placeBybitOrder(
   p: PlaceOrderParams,
 ): Promise<PlacedOrderResult> {
   const { apiKey, apiSecret } = p.credentials;
-  const baseUrl = process.env.BYBIT_TEST_API_URL || "https://api.bybit.com";
+  const baseUrl = getExchangeRestUrl("bybit");
   const normalizedPair = normalizePairForExchange("bybit", p.pair);
 
   const timestamp = await getBybitTimestamp(baseUrl);
@@ -156,6 +216,11 @@ async function placeBybitOrder(
     price: p.entryPrice,
     takeProfit: p.tp,
     stopLoss: p.sl,
+    tpslMode: "Full",
+    tpOrderType: "Market",
+    slOrderType: "Market",
+    tpTriggerBy: "MarkPrice",
+    slTriggerBy: "MarkPrice",
     timeInForce: "GTC",
     positionIdx: 0,
   });
@@ -187,7 +252,16 @@ async function placeBybitOrder(
   );
 
   if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit order failed.");
-  return { orderId: data.result.orderId, raw: data };
+  return {
+    orderId: data.result.orderId,
+    raw: data,
+    execution: {
+      quantity: p.quantity,
+      entryPrice: p.entryPrice,
+      tp: p.tp,
+      sl: p.sl,
+    },
+  };
 }
 
 // ── OKX Futures — places limit order with attached TP/SL
@@ -397,8 +471,7 @@ async function getBinanceOrderStatus(
   orderId: string,
 ): Promise<OrderStatusResult> {
   const { apiKey, apiSecret } = credentials;
-  const baseUrl =
-    process.env.BINANCE_TEST_API_URL || "https://fapi.binance.com";
+  const baseUrl = getExchangeRestUrl("binance");
   const normalizedPair = normalizePairForExchange("binance", pair);
 
   const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
@@ -440,7 +513,7 @@ async function getBybitOrderStatus(
   orderId: string,
 ): Promise<OrderStatusResult> {
   const { apiKey, apiSecret } = credentials;
-  const baseUrl = process.env.BYBIT_TEST_API_URL || "https://api.bybit.com";
+  const baseUrl = getExchangeRestUrl("bybit");
   const normalizedPair = normalizePairForExchange("bybit", pair);
 
   const timestamp = await getBybitTimestamp(baseUrl);
@@ -603,8 +676,7 @@ async function getBitgetOrderStatus(
 async function getBinanceCurrentPrice(
   pair: string,
 ): Promise<CurrentPriceResult> {
-  const baseUrl =
-    process.env.BINANCE_TEST_API_URL || "https://fapi.binance.com";
+  const baseUrl = getExchangeRestUrl("binance");
   const normalizedPair = normalizePairForExchange("binance", pair);
 
   const { data } = await http.get(`${baseUrl}/fapi/v1/ticker/price`, {
@@ -616,7 +688,7 @@ async function getBinanceCurrentPrice(
 }
 
 async function getBybitCurrentPrice(pair: string): Promise<CurrentPriceResult> {
-  const baseUrl = process.env.BYBIT_TEST_API_URL || "https://api.bybit.com";
+  const baseUrl = getExchangeRestUrl("bybit");
   const normalizedPair = normalizePairForExchange("bybit", pair);
 
   const { data } = await http.get(`${baseUrl}/v5/market/tickers`, {
@@ -674,8 +746,7 @@ async function getBinanceBalance(
   credentials: RawCredentials,
 ): Promise<ExchangeBalance> {
   const { apiKey, apiSecret } = credentials;
-  const baseUrl =
-    process.env.BINANCE_TEST_API_URL || "https://fapi.binance.com";
+  const baseUrl = getExchangeRestUrl("binance");
 
   try {
     const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
@@ -731,7 +802,7 @@ async function getBybitBalance(
   credentials: RawCredentials,
 ): Promise<ExchangeBalance> {
   const { apiKey, apiSecret } = credentials;
-  const baseUrl = process.env.BYBIT_TEST_API_URL || "https://api.bybit.com";
+  const baseUrl = getExchangeRestUrl("bybit");
 
   try {
     const timestamp = await getBybitTimestamp(baseUrl);
@@ -977,7 +1048,17 @@ export async function placeOrder(
   params: PlaceOrderParams,
 ): Promise<PlacedOrderResult> {
   try {
-    return await orderPlacer[exchange](params);
+    const prepared = await prepareFuturesOrder(exchange, params);
+    const placed = await orderPlacer[exchange](prepared);
+    return {
+      ...placed,
+      execution: {
+        quantity: prepared.quantity,
+        entryPrice: prepared.entryPrice,
+        tp: prepared.tp,
+        sl: prepared.sl,
+      },
+    };
   } catch (err) {
     throw normalizeError(err);
   }
@@ -1009,9 +1090,43 @@ export async function getCurrentPrice(
 
 export async function attachBinanceTpSl(
   params: PlaceOrderParams & { orderId: string },
-): Promise<void> {
+): Promise<{ tpOrderId: string; slOrderId: string }> {
   try {
-    await placeBinanceOrder(params);
+    const { apiKey, apiSecret } = params.credentials;
+    const baseUrl = getExchangeRestUrl("binance");
+    const symbol = normalizePairForExchange("binance", params.pair);
+    const side = params.direction === "buy" ? "SELL" : "BUY";
+    const sign = (query: string) =>
+      crypto.createHmac("sha256", apiSecret).update(query).digest("hex");
+    const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
+
+    const placeTrigger = async (
+      type: "TAKE_PROFIT_MARKET" | "STOP_MARKET",
+      stopPrice: string,
+      timestamp: number,
+    ) => {
+      const query = `symbol=${symbol}&side=${side}&type=${type}&stopPrice=${stopPrice}&closePosition=true&workingType=MARK_PRICE&timestamp=${timestamp}`;
+      const { data } = await http.post(`${baseUrl}/fapi/v1/order`, null, {
+        params: {
+          ...Object.fromEntries(new URLSearchParams(query)),
+          signature: sign(query),
+        },
+        headers: { "X-MBX-APIKEY": apiKey },
+      });
+      return String(data.orderId);
+    };
+
+    const tpOrderId = await placeTrigger(
+      "TAKE_PROFIT_MARKET",
+      params.tp,
+      Number(timeData.serverTime),
+    );
+    const slOrderId = await placeTrigger(
+      "STOP_MARKET",
+      params.sl,
+      Number(timeData.serverTime) + 1,
+    );
+    return { tpOrderId, slOrderId };
   } catch (err) {
     throw normalizeError(err);
   }

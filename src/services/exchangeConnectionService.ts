@@ -11,6 +11,7 @@ import {
   BitgetAccountInfo,
 } from "../types/index.js";
 import axiosRetry from "axios-retry";
+import { getExchangeRestUrl } from "./exchangeEnvironment.js";
 
 const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
 
@@ -131,9 +132,8 @@ const validateBinance: Validator<BinanceAccountInfo> = async ({
   apiSecret,
 }) => {
   try {
-    const { data: timeData } = await http.get(
-      process.env.BINANCE_TEST_API_URL + "/api/v3/time",
-    );
+    const baseUrl = getExchangeRestUrl("binance");
+    const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
     const timestamp = timeData.serverTime;
     const queryString = `timestamp=${timestamp}`;
     const signature = crypto
@@ -142,7 +142,7 @@ const validateBinance: Validator<BinanceAccountInfo> = async ({
       .digest("hex");
 
     const { data } = await http.get<BinanceAccountInfo & { canTrade: boolean }>(
-      process.env.BINANCE_TEST_API_URL + "/api/v3/account",
+      `${baseUrl}/fapi/v2/account`,
       {
         params: { timestamp, signature },
         headers: { "X-MBX-APIKEY": apiKey },
@@ -152,10 +152,10 @@ const validateBinance: Validator<BinanceAccountInfo> = async ({
     if (!data.canTrade)
       throw new Error("API key does not have trading permissions enabled.");
     return {
-      accountType: data.accountType,
+      accountType: "USD-M_FUTURES",
       canTrade: data.canTrade,
-      canWithdraw: data.canWithdraw,
-      permissions: data.permissions,
+      canWithdraw: false,
+      permissions: ["FUTURES"],
     };
   } catch (err) {
     throw normalizeError(err);
@@ -167,7 +167,7 @@ const validateBybit: Validator<BybitAccountInfo> = async ({
   apiSecret,
 }) => {
   try {
-    const baseUrl = process.env.BYBIT_TEST_API_URL!;
+    const baseUrl = getExchangeRestUrl("bybit");
     const timestamp = await getBybitTimestamp(baseUrl);
     const recvWindow = "5000";
     const signPayload = timestamp + apiKey + recvWindow;
@@ -204,12 +204,11 @@ const validateBybit: Validator<BybitAccountInfo> = async ({
     const info = data.result;
 
     const hasTradePermission =
-      (info.permissions?.Spot?.includes("SpotTrade") ?? false) ||
-      (info.permissions?.Derivatives?.includes("DerivativesTrade") ?? false);
+      info.permissions?.Derivatives?.includes("DerivativesTrade") ?? false;
 
     if (!hasTradePermission)
       throw new Error(
-        "API key does not have trading permissions. Enable Spot or Derivatives trading in Bybit API settings.",
+        "API key does not have derivatives trading permission in Bybit API settings.",
       );
     return {
       accountType: info.accountType,

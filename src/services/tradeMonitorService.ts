@@ -19,6 +19,11 @@ import { decryptCredentials } from "./exchangeConnectionService.js";
 import { http } from "./exchangeConnectionService.js";
 import { processTradeClose } from "./profitSharingService.js";
 import { ExchangeId } from "../types/index.js";
+import {
+  getExchangeRestUrl,
+  getExchangeWebSocketUrl,
+} from "./exchangeEnvironment.js";
+import { attachBinanceTpSl } from "./tradeService.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -31,6 +36,7 @@ interface MonitoredTrade {
   entryPrice: string;
   tp: string;
   sl: string;
+  protectionOrderIds?: Set<string>;
 }
 
 interface ExchangeWsConnection {
@@ -98,15 +104,16 @@ export class TradeMonitorService extends EventEmitter {
 
     const exchange = connection.exchange as ExchangeId;
 
-    // Only support Binance and Bitget
-    if (exchange !== "binance" && exchange !== "bitget") {
+    if (exchange !== "binance" && exchange !== "bybit") {
       console.warn(
         `[TradeMonitor] Exchange ${exchange} not supported for WS monitoring.`,
       );
       return;
     }
 
-    const connKey = `${String(connection.userId)}_${exchange}`;
+    // Each saved connection has its own API credentials and therefore needs
+    // its own private stream, even when a user connects two accounts on one exchange.
+    const connKey = String(connection._id);
 
     const monitoredTrade: MonitoredTrade = {
       tradeId: String(trade._id),
@@ -160,8 +167,8 @@ export class TradeMonitorService extends EventEmitter {
     if (!wsConn!.isConnected && !wsConn!.ws) {
       if (exchange === "binance") {
         await this.connectBinance(wsConn!);
-      } else if (exchange === "bitget") {
-        await this.connectBitget(wsConn!);
+      } else if (exchange === "bybit") {
+        await this.connectBybit(wsConn!);
       }
     }
 
@@ -247,27 +254,16 @@ export class TradeMonitorService extends EventEmitter {
   // ─── Binance Futures WebSocket ──────────────────────────────────────────
 
   private async connectBinance(wsConn: ExchangeWsConnection): Promise<void> {
-    const { apiKey, apiSecret } = wsConn.credentials;
-    const baseUrl =
-      process.env.BINANCE_TEST_API_URL || "https://testnet.binancefuture.com";
-    const wsUrl =
-      process.env.BINANCE_WS_URL || "wss://fstream.binancefuture.com";
+    const { apiKey } = wsConn.credentials;
+    const baseUrl = getExchangeRestUrl("binance");
+    const wsUrl = getExchangeWebSocketUrl("binance");
 
     try {
       // 1. Create listenKey via REST
-      const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
-      const timestamp = timeData.serverTime as number;
-      const qs = `timestamp=${timestamp}`;
-      const sig = crypto
-        .createHmac("sha256", apiSecret)
-        .update(qs)
-        .digest("hex");
-
       const { data: listenKeyData } = await http.post(
         `${baseUrl}/fapi/v1/listenKey`,
         null,
         {
-          params: { timestamp, signature: sig },
           headers: { "X-MBX-APIKEY": apiKey },
         },
       );
@@ -293,16 +289,7 @@ export class TradeMonitorService extends EventEmitter {
         // Keep listenKey alive every 30 minutes
         const refreshTimer = setInterval(async () => {
           try {
-            const { data: td } = await http.get(`${baseUrl}/fapi/v1/time`);
-            const ts = td.serverTime as number;
-            const q = `timestamp=${ts}`;
-            const s = crypto
-              .createHmac("sha256", apiSecret)
-              .update(q)
-              .digest("hex");
-
             await http.put(`${baseUrl}/fapi/v1/listenKey`, null, {
-              params: { timestamp: ts, signature: s },
               headers: { "X-MBX-APIKEY": apiKey },
             });
           } catch (err: any) {
@@ -370,8 +357,20 @@ export class TradeMonitorService extends EventEmitter {
     if (!order) return;
 
     const orderId = String(order.i);
-    const monitored = wsConn.activeTrades.get(orderId);
-
+    let monitored = wsConn.activeTrades.get(orderId);
+    if (
+      !monitored &&
+      (order.ot === "TAKE_PROFIT_MARKET" || order.ot === "STOP_MARKET")
+    ) {
+      monitored = [...wsConn.activeTrades.values()].find(
+        (trade) =>
+          trade.pair.replace(/\//g, "").toUpperCase() ===
+          String(order.s || "").toUpperCase(),
+      );
+      if (monitored && !monitored.protectionOrderIds) {
+        monitored.protectionOrderIds = new Set([orderId]);
+      }
+    }
     if (!monitored) return;
 
     const statusMap: Record<string, string> = {
@@ -405,13 +404,42 @@ export class TradeMonitorService extends EventEmitter {
     if (newStatus === "filled") {
       update.status = "filled";
       update.entryFillPrice = filledPrice;
+      if (!monitored.protectionOrderIds) {
+        try {
+          const protection = await attachBinanceTpSl({
+            credentials: wsConn.credentials,
+            pair: monitored.pair,
+            direction: monitored.direction,
+            quantity: monitored.quantity,
+            entryPrice: monitored.entryPrice,
+            tp: monitored.tp,
+            sl: monitored.sl,
+            orderId: monitored.exchangeOrderId,
+          });
+          monitored.protectionOrderIds = new Set([
+            protection.tpOrderId,
+            protection.slOrderId,
+          ]);
+          wsConn.activeTrades.set(protection.tpOrderId, monitored);
+          wsConn.activeTrades.set(protection.slOrderId, monitored);
+        } catch (err) {
+          console.error(
+            `[TradeMonitor][Binance] Failed to attach TP/SL for ${monitored.tradeId}:`,
+            err,
+          );
+        }
+      }
       console.log(
         `[TradeMonitor][Binance] Trade ${monitored.tradeId} entry FILLED at ${filledPrice}`,
       );
     } else if (newStatus === "cancelled" || newStatus === "failed") {
       update.status = newStatus;
       update.wsMonitoringActive = false;
-      wsConn.activeTrades.delete(orderId);
+      for (const [trackedOrderId, trade] of wsConn.activeTrades) {
+        if (trade.tradeId === monitored.tradeId) {
+          wsConn.activeTrades.delete(trackedOrderId);
+        }
+      }
       console.log(
         `[TradeMonitor][Binance] Trade ${monitored.tradeId} ${newStatus}`,
       );
@@ -440,6 +468,18 @@ export class TradeMonitorService extends EventEmitter {
 
       if (originalTrade && exitPrice) {
         try {
+          const siblingProtectionIds = [
+            ...(originalTrade.protectionOrderIds ?? []),
+          ].filter((protectionOrderId) => protectionOrderId !== orderId);
+          await Promise.allSettled(
+            siblingProtectionIds.map((protectionOrderId) =>
+              this.cancelBinanceOrder(
+                wsConn,
+                String(order.s),
+                protectionOrderId,
+              ),
+            ),
+          );
           const result = await processTradeClose(
             originalTrade.tradeId,
             exitPrice,
@@ -447,14 +487,17 @@ export class TradeMonitorService extends EventEmitter {
           );
 
           this.emit("tradeClosed", result);
-          wsConn.activeTrades.delete(originalTrade.exchangeOrderId);
+          for (const [trackedOrderId, trade] of wsConn.activeTrades) {
+            if (trade.tradeId === originalTrade.tradeId) {
+              wsConn.activeTrades.delete(trackedOrderId);
+            }
+          }
           console.log(
             `[TradeMonitor][Binance] Trade ${originalTrade.tradeId} closed via ${closedVia}`,
           );
 
           if (wsConn.activeTrades.size === 0) {
-            const connKey = `${wsConn.userId}_${wsConn.exchange}`;
-            this.closeConnection(connKey);
+            this.closeConnection(wsConn.connectionId);
           }
         } catch (err: any) {
           console.error(
@@ -467,6 +510,193 @@ export class TradeMonitorService extends EventEmitter {
   }
 
   // ─── Bitget Futures WebSocket ───────────────────────────────────────────
+
+  private async cancelBinanceOrder(
+    wsConn: ExchangeWsConnection,
+    symbol: string,
+    orderId: string,
+  ): Promise<void> {
+    const baseUrl = getExchangeRestUrl("binance");
+    const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
+    const query = `symbol=${symbol}&orderId=${orderId}&timestamp=${timeData.serverTime}`;
+    const signature = crypto
+      .createHmac("sha256", wsConn.credentials.apiSecret)
+      .update(query)
+      .digest("hex");
+    await http.delete(`${baseUrl}/fapi/v1/order`, {
+      params: {
+        ...Object.fromEntries(new URLSearchParams(query)),
+        signature,
+      },
+      headers: { "X-MBX-APIKEY": wsConn.credentials.apiKey },
+    });
+  }
+
+  private async connectBybit(wsConn: ExchangeWsConnection): Promise<void> {
+    const { apiKey, apiSecret } = wsConn.credentials;
+    const wsUrl = getExchangeWebSocketUrl("bybit");
+
+    try {
+      const ws = new WebSocket(wsUrl);
+      wsConn.ws = ws;
+
+      ws.on("open", () => {
+        const expires = Date.now() + 10_000;
+        const signature = crypto
+          .createHmac("sha256", apiSecret)
+          .update(`GET/realtime${expires}`)
+          .digest("hex");
+        ws.send(
+          JSON.stringify({
+            op: "auth",
+            args: [apiKey, expires, signature],
+          }),
+        );
+
+        wsConn.keepaliveTimer = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ op: "ping" }));
+          }
+        }, 20_000);
+      });
+
+      ws.on("message", async (raw: WebSocket.Data) => {
+        try {
+          const message = JSON.parse(raw.toString());
+          if (message.op === "auth") {
+            if (!message.success) {
+              throw new Error(message.ret_msg || "Bybit WebSocket authentication failed.");
+            }
+            wsConn.isConnected = true;
+            wsConn.reconnectAttempts = 0;
+            ws.send(JSON.stringify({ op: "subscribe", args: ["order"] }));
+            return;
+          }
+          if (message.topic === "order" && Array.isArray(message.data)) {
+            for (const order of message.data) {
+              await this.handleBybitOrder(wsConn, order);
+            }
+          }
+        } catch (err) {
+          console.error("[TradeMonitor][Bybit] Error processing message:", err);
+        }
+      });
+
+      ws.on("error", (err) => {
+        console.error("[TradeMonitor][Bybit] WS error:", err);
+      });
+
+      ws.on("close", () => {
+        wsConn.isConnected = false;
+        wsConn.ws = null;
+        if (wsConn.keepaliveTimer) {
+          clearInterval(wsConn.keepaliveTimer);
+          wsConn.keepaliveTimer = null;
+        }
+        if (wsConn.activeTrades.size > 0) {
+          this.scheduleReconnect(wsConn, () => this.connectBybit(wsConn));
+        }
+      });
+    } catch (err) {
+      console.error("[TradeMonitor][Bybit] Connection error:", err);
+      if (wsConn.activeTrades.size > 0) {
+        this.scheduleReconnect(wsConn, () => this.connectBybit(wsConn));
+      }
+    }
+  }
+
+  private async handleBybitOrder(
+    wsConn: ExchangeWsConnection,
+    order: any,
+  ): Promise<void> {
+    const orderId = String(order.orderId || "");
+    let monitored = wsConn.activeTrades.get(orderId);
+
+    if (!monitored && order.orderStatus === "Filled") {
+      const symbol = String(order.symbol || "").toUpperCase();
+      monitored = [...wsConn.activeTrades.values()].find(
+        (trade) => trade.pair.replace(/\//g, "").toUpperCase() === symbol,
+      );
+      if (
+        monitored &&
+        !order.reduceOnly &&
+        !order.closeOnTrigger &&
+        !order.stopOrderType
+      ) {
+        monitored = undefined;
+      }
+    }
+    if (!monitored) return;
+
+    const statusMap: Record<string, string> = {
+      New: "pending",
+      PartiallyFilled: "pending",
+      Filled: "filled",
+      Cancelled: "cancelled",
+      Rejected: "failed",
+      Deactivated: "cancelled",
+    };
+    const status = statusMap[order.orderStatus] || "pending";
+    const filledPrice = order.avgPrice || order.price || null;
+    const isExit =
+      orderId !== monitored.exchangeOrderId &&
+      status === "filled" &&
+      (order.reduceOnly ||
+        order.closeOnTrigger ||
+        order.stopOrderType === "TakeProfit" ||
+        order.stopOrderType === "StopLoss");
+
+    if (isExit && filledPrice) {
+      const tpDistance = Math.abs(Number(filledPrice) - Number(monitored.tp));
+      const slDistance = Math.abs(Number(filledPrice) - Number(monitored.sl));
+      const closedVia =
+        order.stopOrderType === "TakeProfit"
+          ? "tp"
+          : order.stopOrderType === "StopLoss"
+            ? "sl"
+            : tpDistance < slDistance
+              ? "tp"
+              : "sl";
+      const result = await processTradeClose(
+        monitored.tradeId,
+        String(filledPrice),
+        closedVia,
+      );
+      this.emit("tradeClosed", result);
+      for (const [trackedOrderId, trade] of wsConn.activeTrades) {
+        if (trade.tradeId === monitored.tradeId) {
+          wsConn.activeTrades.delete(trackedOrderId);
+        }
+      }
+      if (wsConn.activeTrades.size === 0) {
+        this.closeConnection(wsConn.connectionId);
+      }
+      return;
+    }
+
+    const update: Record<string, unknown> = {
+      lastCheckedAt: new Date(),
+      rawStatusResponse: order,
+    };
+    if (status === "filled") {
+      update.status = "filled";
+      update.entryFillPrice = filledPrice;
+    } else if (status === "cancelled" || status === "failed") {
+      update.status = status;
+      update.wsMonitoringActive = false;
+      wsConn.activeTrades.delete(orderId);
+    }
+    await Trade.updateOne({ _id: monitored.tradeId }, { $set: update });
+    this.emit("tradeUpdate", {
+      tradeId: monitored.tradeId,
+      exchangeOrderId: orderId,
+      exchange: "bybit",
+      status,
+      filledPrice,
+      filledQuantity: order.cumExecQty || null,
+      timestamp: new Date(Number(order.updatedTime) || Date.now()),
+    });
+  }
 
   private async connectBitget(wsConn: ExchangeWsConnection): Promise<void> {
     const { apiKey, apiSecret, passphrase } = wsConn.credentials;
@@ -691,8 +921,7 @@ export class TradeMonitorService extends EventEmitter {
                 );
 
                 if (wsConn.activeTrades.size === 0) {
-                  const connKey = `${wsConn.userId}_${wsConn.exchange}`;
-                  this.closeConnection(connKey);
+                  this.closeConnection(wsConn.connectionId);
                 }
               } catch (err: any) {
                 console.error(

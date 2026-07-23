@@ -10,6 +10,11 @@ import {
 } from "../services/tradeService.js";
 import { ExchangeId } from "../types/index.js";
 import { decryptCredentials } from "../services/exchangeConnectionService.js";
+import { getTradeMonitorService } from "../services/tradeMonitorService.js";
+import {
+  getExchangeMode,
+  shouldRebaseTestnetSignals,
+} from "../services/exchangeEnvironment.js";
 import {
   SUPPORTED_PAIRS,
   SUPPORTED_TRADE_EXCHANGES,
@@ -240,10 +245,10 @@ export async function initiateTrade(req: Request, res: Response) {
       });
     }
 
-    const entryPrice = parseFloat(signal.entry);
+    const signalEntryPrice = parseFloat(signal.entry);
     const currentPrice = parseFloat(currentPriceResult.price);
 
-    if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
+    if (!Number.isFinite(signalEntryPrice) || signalEntryPrice <= 0) {
       return res.status(422).json({
         message: "Signal entry price is invalid.",
       });
@@ -262,9 +267,11 @@ export async function initiateTrade(req: Request, res: Response) {
       Number.isFinite(configuredMaxDeviation) && configuredMaxDeviation > 0
         ? configuredMaxDeviation
         : DEFAULT_MAX_ENTRY_DEVIATION;
-    const deviation = Math.abs(currentPrice - entryPrice) / entryPrice;
+    const deviation =
+      Math.abs(currentPrice - signalEntryPrice) / signalEntryPrice;
+    const rebaseForTestnet = shouldRebaseTestnetSignals();
 
-    if (deviation > maxDeviation) {
+    if (!rebaseForTestnet && deviation > maxDeviation) {
       return res.status(409).json({
         message: "Current market price is too far from the signal entry price.",
         pair: signal.pair,
@@ -276,8 +283,31 @@ export async function initiateTrade(req: Request, res: Response) {
     }
 
     // ── 6. Position sizing — 2% risk model ───────────────────────────────────
-    const slPrice = parseFloat(signal.sl);
-    const priceDistance = Math.abs(entryPrice - slPrice);
+    const testnetScale = rebaseForTestnet
+      ? currentPrice / signalEntryPrice
+      : 1;
+    const executionEntryPrice = rebaseForTestnet
+      ? currentPrice
+      : signalEntryPrice;
+    const executionTpPrice = parseFloat(signal.tp) * testnetScale;
+    const executionSlPrice = parseFloat(signal.sl) * testnetScale;
+    const validLevels =
+      Number.isFinite(executionTpPrice) &&
+      Number.isFinite(executionSlPrice) &&
+      executionTpPrice > 0 &&
+      executionSlPrice > 0 &&
+      (signal.direction === "buy"
+        ? executionSlPrice < executionEntryPrice &&
+          executionEntryPrice < executionTpPrice
+        : executionTpPrice < executionEntryPrice &&
+          executionEntryPrice < executionSlPrice);
+    if (!validLevels) {
+      return res.status(422).json({
+        message:
+          "Signal price levels are invalid for its direction. A long requires SL < entry < TP; a short requires TP < entry < SL.",
+      });
+    }
+    const priceDistance = Math.abs(executionEntryPrice - executionSlPrice);
 
     if (!Number.isFinite(priceDistance) || priceDistance <= 0) {
       return res.status(422).json({
@@ -304,9 +334,9 @@ export async function initiateTrade(req: Request, res: Response) {
         pair: signal.pair,
         direction: signal.direction as "buy" | "sell",
         quantity: String(parsedQty),
-        entryPrice: signal.entry,
-        tp: signal.tp,
-        sl: signal.sl,
+        entryPrice: String(executionEntryPrice),
+        tp: String(executionTpPrice),
+        sl: String(executionSlPrice),
       });
     } catch (orderErr) {
       const message =
@@ -325,13 +355,14 @@ export async function initiateTrade(req: Request, res: Response) {
       userId,
       pair: signal.pair,
       direction: signal.direction,
-      tp: signal.tp,
-      sl: signal.sl,
+      tp: placed.execution?.tp ?? String(executionTpPrice),
+      sl: placed.execution?.sl ?? String(executionSlPrice),
       signalId,
       exchangeConnectionId,
       exchangeOrderId: placed.orderId,
-      quantity: String(parsedQty),
-      entryPrice: signal.entry,
+      quantity: placed.execution?.quantity ?? String(parsedQty),
+      entryPrice:
+        placed.execution?.entryPrice ?? String(executionEntryPrice),
       status: "pending",
       wsMonitoringActive: true,
       rawOrderResponse: {
@@ -344,9 +375,26 @@ export async function initiateTrade(req: Request, res: Response) {
           priceDistance,
           currentPrice: currentPriceResult.price,
           deviation,
+          exchangeMode: getExchangeMode(),
+          signalPricesRebased: rebaseForTestnet,
+          originalSignalPrices: {
+            entry: signal.entry,
+            tp: signal.tp,
+            sl: signal.sl,
+          },
         },
       },
     });
+
+    try {
+      await getTradeMonitorService().startMonitoring(String(trade._id));
+    } catch (monitorErr) {
+      await Trade.updateOne(
+        { _id: trade._id },
+        { $set: { wsMonitoringActive: false } },
+      );
+      console.error("[initiateTrade] Failed to start trade monitor:", monitorErr);
+    }
 
     return res.status(201).json({
       message: "Trade initiated successfully.",
@@ -594,8 +642,6 @@ export async function previewTrade(req: Request, res: Response) {
 
     // ── 5. Calculate 2% risk position sizing ─────────────────────────────────
     const entryPrice = parseFloat(signal.entry);
-    const slPrice = parseFloat(signal.sl);
-    const tpPrice = parseFloat(signal.tp);
     const currentPrice = parseFloat(currentPriceResult.price);
 
     if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
@@ -605,7 +651,12 @@ export async function previewTrade(req: Request, res: Response) {
       });
     }
 
-    const priceDistance = Math.abs(entryPrice - slPrice);
+    const previewRebased = shouldRebaseTestnetSignals();
+    const previewScale = previewRebased ? currentPrice / entryPrice : 1;
+    const previewEntry = previewRebased ? currentPrice : entryPrice;
+    const slPrice = parseFloat(signal.sl) * previewScale;
+    const tpPrice = parseFloat(signal.tp) * previewScale;
+    const priceDistance = Math.abs(previewEntry - slPrice);
     if (!Number.isFinite(priceDistance) || priceDistance <= 0) {
       return res.status(422).json({
         success: false,
@@ -624,7 +675,7 @@ export async function previewTrade(req: Request, res: Response) {
     }
 
     // Risk/reward calculations
-    const distanceToTP = Math.abs(tpPrice - entryPrice);
+    const distanceToTP = Math.abs(tpPrice - previewEntry);
     const estimatedLossIfSL = priceDistance * calculatedLotSize;
     const estimatedProfitIfTP = distanceToTP * calculatedLotSize;
     const riskRewardRatio =
@@ -639,9 +690,14 @@ export async function previewTrade(req: Request, res: Response) {
         pair: signal.pair,
         direction: signal.direction,
         exchange: connection.exchange,
-        entryPrice: signal.entry,
-        stopLoss: signal.sl,
-        takeProfit: signal.tp,
+        entryPrice: String(previewEntry),
+        stopLoss: String(slPrice),
+        takeProfit: String(tpPrice),
+        originalSignalPrices: previewRebased
+          ? { entry: signal.entry, stopLoss: signal.sl, takeProfit: signal.tp }
+          : null,
+        signalPricesRebased: previewRebased,
+        exchangeMode: getExchangeMode(),
         currentMarketPrice: currentPriceResult.price,
         balance: String(parsedBalance),
         riskPercent: MAX_RISK_PERCENT,
@@ -653,7 +709,8 @@ export async function previewTrade(req: Request, res: Response) {
         riskRewardRatio: String(riskRewardRatio),
         deviation: Number(deviation.toFixed(6)),
         maxDeviation: DEFAULT_MAX_ENTRY_DEVIATION,
-        deviationWarning: deviation > DEFAULT_MAX_ENTRY_DEVIATION,
+        deviationWarning:
+          !previewRebased && deviation > DEFAULT_MAX_ENTRY_DEVIATION,
       },
     });
   } catch (err) {

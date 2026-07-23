@@ -9,6 +9,10 @@ import cors from "cors";
 import { createServer } from "http";
 import { TradeWebSocketServer } from "./websocket/server.js";
 import { getTradeMonitorService } from "./services/tradeMonitorService.js";
+import {
+  startTradeStatusJob,
+  stopTradeStatusJob,
+} from "./services/tradeStatusJob.js";
 import authRouter from "./routes/userAuthRoutes.js";
 import exchangeRouter from "./routes/exchangeRoutes.js";
 import adminDashboardRouter from "./routes/adminDashboardRoutes.js";
@@ -43,6 +47,7 @@ const tradeMonitor = getTradeMonitorService();
 // Resume monitoring active trades after startup
 // (Delayed to allow MongoDB to fully connect in index.ts)
 setTimeout(() => {
+  startTradeStatusJob();
   tradeMonitor
     .resumeActiveMonitoring()
     .then(() => {
@@ -57,6 +62,7 @@ setTimeout(() => {
 async function gracefulShutdown() {
   console.log("[App] Shutting down gracefully...");
   wsServer.shutdown();
+  stopTradeStatusJob();
   await tradeMonitor.shutdown();
   server.close(() => {
     console.log("[App] Server closed");

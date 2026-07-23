@@ -24,6 +24,22 @@ const BATCH_SIZE = 50;
 // Minimum milliseconds between checks for the same trade
 // 2 minutes — respects exchange rate limits
 const MIN_CHECK_INTERVAL_MS = 2 * 60 * 1000;
+let statusTask: ReturnType<typeof cron.schedule> | null = null;
+
+export function startTradeStatusJob(): void {
+  if (statusTask) return;
+  statusTask = cron.schedule("* * * * *", () => {
+    void processBatch().catch((err) => {
+      console.error("[tradeStatusJob] Unhandled batch failure:", err);
+    });
+  });
+  console.log("[tradeStatusJob] Scheduled polling fallback.");
+}
+
+export function stopTradeStatusJob(): void {
+  statusTask?.stop();
+  statusTask = null;
+}
 
 async function processBatch() {
   console.log("[tradeStatusJob] Starting batch...");
