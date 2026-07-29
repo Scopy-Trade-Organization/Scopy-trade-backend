@@ -31,6 +31,7 @@ import { attachBinanceTpSl, getOrderStatus } from "./tradeService.js";
 interface MonitoredTrade {
   tradeId: string;
   exchangeOrderId: string;
+  initialStatus: "pending" | "filled";
   exchangeClientOrderId?: string;
   pair: string;
   direction: "buy" | "sell";
@@ -123,6 +124,7 @@ export class TradeMonitorService extends EventEmitter {
     const monitoredTrade: MonitoredTrade = {
       tradeId: String(trade._id),
       exchangeOrderId: trade.exchangeOrderId,
+      initialStatus: trade.status as "pending" | "filled",
       ...(trade.exchangeClientOrderId
         ? { exchangeClientOrderId: trade.exchangeClientOrderId }
         : {}),
@@ -651,11 +653,11 @@ export class TradeMonitorService extends EventEmitter {
     await http.delete(
       `${baseUrl}/fapi/v1/${transport === "algo" ? "algoOrder" : "order"}`,
       {
-      params: {
-        ...Object.fromEntries(new URLSearchParams(query)),
-        signature,
-      },
-      headers: { "X-MBX-APIKEY": wsConn.credentials.apiKey },
+        params: {
+          ...Object.fromEntries(new URLSearchParams(query)),
+          signature,
+        },
+        headers: { "X-MBX-APIKEY": wsConn.credentials.apiKey },
       },
     );
   }
@@ -889,7 +891,11 @@ export class TradeMonitorService extends EventEmitter {
           update.entryFillPrice = result.filledPrice;
         }
         if (wsConn.exchange === "binance") {
-          await this.ensureBinanceProtection(wsConn, monitored);
+          await this.ensureBinanceProtection(
+            wsConn,
+            monitored,
+            monitored.initialStatus !== "filled",
+          );
         }
       } else if (
         result.status === "cancelled" ||
@@ -930,10 +936,11 @@ export class TradeMonitorService extends EventEmitter {
   private async ensureBinanceProtection(
     wsConn: ExchangeWsConnection,
     monitored: MonitoredTrade,
+    allowCreate = true,
   ): Promise<void> {
     if (
       monitored.protectionSetupStarted ||
-      (monitored.protectionOrderIds?.size ?? 0) >= 2
+      (allowCreate && (monitored.protectionOrderIds?.size ?? 0) >= 2)
     ) {
       return;
     }
@@ -962,6 +969,13 @@ export class TradeMonitorService extends EventEmitter {
                 existingProtection.transport,
             },
           },
+        );
+        return;
+      }
+
+      if (!allowCreate) {
+        console.warn(
+          `[TradeMonitor][Binance] Trade ${monitored.tradeId} was already filled before startup but has ${existingProtectionIds.length} open protection orders; refusing to create replacement orders without a confirmed open position.`,
         );
         return;
       }
@@ -1067,41 +1081,41 @@ export class TradeMonitorService extends EventEmitter {
 
     const matchOrders = (orders: any[], transport: "algo" | "legacy") =>
       orders
-      .filter((order: any) => {
-        const orderType =
-          transport === "algo" ? order.orderType : order.type;
-        if (
-          orderType !== "TAKE_PROFIT_MARKET" &&
-          orderType !== "STOP_MARKET"
-        ) {
-          return false;
-        }
-        if (expectedClientIds) {
-          const clientId =
-            transport === "algo"
-              ? order.clientAlgoId
-              : order.clientOrderId;
-          return expectedClientIds.has(String(clientId || ""));
-        }
-        const stopPrice = Number(
-          transport === "algo" ? order.triggerPrice : order.stopPrice,
+        .filter((order: any) => {
+          const orderType =
+            transport === "algo" ? order.orderType : order.type;
+          if (
+            orderType !== "TAKE_PROFIT_MARKET" &&
+            orderType !== "STOP_MARKET"
+          ) {
+            return false;
+          }
+          if (expectedClientIds) {
+            const clientId =
+              transport === "algo"
+                ? order.clientAlgoId
+                : order.clientOrderId;
+            return expectedClientIds.has(String(clientId || ""));
+          }
+          const stopPrice = Number(
+            transport === "algo" ? order.triggerPrice : order.stopPrice,
+          );
+          return (
+            stopPrice === Number(monitored.tp) ||
+            stopPrice === Number(monitored.sl)
+          );
+        })
+        .sort((left: any, right: any) => {
+          const rank = (order: any) =>
+            (transport === "algo" ? order.orderType : order.type) ===
+            "TAKE_PROFIT_MARKET"
+              ? 0
+              : 1;
+          return rank(left) - rank(right);
+        })
+        .map((order: any) =>
+          String(transport === "algo" ? order.algoId : order.orderId),
         );
-        return (
-          stopPrice === Number(monitored.tp) ||
-          stopPrice === Number(monitored.sl)
-        );
-      })
-      .sort((left: any, right: any) => {
-        const rank = (order: any) =>
-          (transport === "algo" ? order.orderType : order.type) ===
-          "TAKE_PROFIT_MARKET"
-            ? 0
-            : 1;
-        return rank(left) - rank(right);
-      })
-      .map((order: any) =>
-        String(transport === "algo" ? order.algoId : order.orderId),
-      );
 
     const algoIds = matchOrders(algoOrders, "algo");
     if (algoIds.length) return { ids: algoIds, transport: "algo" };
