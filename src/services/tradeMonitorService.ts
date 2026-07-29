@@ -134,7 +134,7 @@ export class TradeMonitorService extends EventEmitter {
       entryPrice: trade.entryPrice,
       tp: trade.tp,
       sl: trade.sl,
-      ...(trade.exchangeProtectionOrderIds.length
+      ...(trade.exchangeProtectionOrderIds?.length
         ? {
             protectionOrderIds: new Set(
               trade.exchangeProtectionOrderIds.map(String),
