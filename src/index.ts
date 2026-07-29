@@ -1,5 +1,5 @@
 import "dotenv/config";
-import app, { server } from "./app.js";
+import app, { initializeTradeMonitoring, server } from "./app.js";
 import mongoose from "mongoose";
 import type { Request, Response } from "express";
 
@@ -16,8 +16,9 @@ if (!MONGO_URI) {
 try {
   await mongoose.connect(MONGO_URI);
   console.log("MongoDB Connected Successfully");
+  await initializeTradeMonitoring();
 } catch (error) {
-  console.error("MongoDB Connection Error:", error);
+  console.error("Application initialization error:", error);
   process.exit(1);
 }
 

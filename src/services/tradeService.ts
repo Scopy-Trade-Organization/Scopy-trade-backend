@@ -16,6 +16,7 @@ export interface PlaceOrderParams {
   credentials: RawCredentials;
   pair: string; // e.g. "BTCUSDT"
   direction: "buy" | "sell";
+  clientOrderId?: string;
   quantity: string; // base asset quantity
   entryPrice: string; // limit price
   tp: string;
@@ -169,7 +170,17 @@ async function placeBinanceOrder(
   const ts = await getTimestamp();
   const side = p.direction.toUpperCase();
 
-  const entryQs = `symbol=${normalizedPair}&side=${side}&type=LIMIT&timeInForce=GTC&quantity=${p.quantity}&price=${p.entryPrice}&timestamp=${ts}`;
+  const entryParams = new URLSearchParams({
+    symbol: normalizedPair,
+    side,
+    type: "LIMIT",
+    timeInForce: "GTC",
+    quantity: p.quantity,
+    price: p.entryPrice,
+    ...(p.clientOrderId ? { newClientOrderId: p.clientOrderId } : {}),
+    timestamp: String(ts),
+  });
+  const entryQs = entryParams.toString();
   const { data: orderData } = await http.post(
     `${baseUrl}/fapi/v1/order`,
     null,
@@ -210,6 +221,7 @@ async function placeBybitOrder(
   const body = JSON.stringify({
     category: "linear",
     symbol: normalizedPair,
+    ...(p.clientOrderId ? { orderLinkId: p.clientOrderId } : {}),
     side: p.direction === "buy" ? "Buy" : "Sell",
     orderType: "Limit",
     qty: p.quantity,
@@ -1102,29 +1114,42 @@ export async function attachBinanceTpSl(
 
     const placeTrigger = async (
       type: "TAKE_PROFIT_MARKET" | "STOP_MARKET",
-      stopPrice: string,
+      triggerPrice: string,
       timestamp: number,
+      clientOrderId?: string,
     ) => {
-      const query = `symbol=${symbol}&side=${side}&type=${type}&stopPrice=${stopPrice}&closePosition=true&workingType=MARK_PRICE&timestamp=${timestamp}`;
-      const { data } = await http.post(`${baseUrl}/fapi/v1/order`, null, {
+      const query = new URLSearchParams({
+        algoType: "CONDITIONAL",
+        symbol,
+        side,
+        type,
+        triggerPrice,
+        closePosition: "true",
+        workingType: "MARK_PRICE",
+        ...(clientOrderId ? { clientAlgoId: clientOrderId } : {}),
+        timestamp: String(timestamp),
+      }).toString();
+      const { data } = await http.post(`${baseUrl}/fapi/v1/algoOrder`, null, {
         params: {
           ...Object.fromEntries(new URLSearchParams(query)),
           signature: sign(query),
         },
         headers: { "X-MBX-APIKEY": apiKey },
       });
-      return String(data.orderId);
+      return String(data.algoId);
     };
 
     const tpOrderId = await placeTrigger(
       "TAKE_PROFIT_MARKET",
       params.tp,
       Number(timeData.serverTime),
+      params.clientOrderId ? `${params.clientOrderId}_tp` : undefined,
     );
     const slOrderId = await placeTrigger(
       "STOP_MARKET",
       params.sl,
       Number(timeData.serverTime) + 1,
+      params.clientOrderId ? `${params.clientOrderId}_sl` : undefined,
     );
     return { tpOrderId, slOrderId };
   } catch (err) {

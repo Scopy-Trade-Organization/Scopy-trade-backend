@@ -36,6 +36,20 @@ const tradeSchema = new Schema(
       type: String,
       default: null,
     },
+    // Stable client-generated ID used to correlate exchange child/TP/SL orders.
+    exchangeClientOrderId: {
+      type: String,
+      default: null,
+    },
+    exchangeProtectionOrderIds: {
+      type: [String],
+      default: [],
+    },
+    exchangeProtectionOrderTransport: {
+      type: String,
+      enum: ["algo", "legacy", null],
+      default: null,
+    },
     direction: {
       type: String,
       enum: ["buy", "sell"],

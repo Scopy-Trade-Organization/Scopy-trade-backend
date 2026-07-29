@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { randomUUID } from "crypto";
 import mongoose from "mongoose";
 import { Signal } from "../models/signalModel.js";
 import { Trade } from "../models/tradeModel.js";
@@ -327,12 +328,14 @@ export async function initiateTrade(req: Request, res: Response) {
     }
 
     // ── 6. Place the order on the exchange ───────────────────────────────────
+    const exchangeClientOrderId = `sc_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     let placed;
     try {
       placed = await placeOrder(connection.exchange as ExchangeId, {
         credentials: rawCreds,
         pair: signal.pair,
         direction: signal.direction as "buy" | "sell",
+        clientOrderId: exchangeClientOrderId,
         quantity: String(parsedQty),
         entryPrice: String(executionEntryPrice),
         tp: String(executionTpPrice),
@@ -360,6 +363,7 @@ export async function initiateTrade(req: Request, res: Response) {
       signalId,
       exchangeConnectionId,
       exchangeOrderId: placed.orderId,
+      exchangeClientOrderId,
       quantity: placed.execution?.quantity ?? String(parsedQty),
       entryPrice:
         placed.execution?.entryPrice ?? String(executionEntryPrice),
