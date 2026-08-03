@@ -8,7 +8,6 @@
 
 import WebSocket, { WebSocketServer as WsServer } from "ws";
 import { Server as HttpServer } from "http";
-import { parse } from "url";
 import { IncomingMessage } from "http";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
@@ -28,6 +27,22 @@ interface ClientMessage {
   type: string;
   data?: any;
   tradeId?: string;
+}
+
+function readCookie(header: string | undefined, name: string): string | null {
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    const key = part.slice(0, separator).trim();
+    if (key !== name) continue;
+    try {
+      return decodeURIComponent(part.slice(separator + 1).trim());
+    } catch {
+      return part.slice(separator + 1).trim();
+    }
+  }
+  return null;
 }
 
 // ─── WebSocket Server ───────────────────────────────────────────────────────
@@ -52,14 +67,23 @@ export class TradeWebSocketServer {
 
   private setupServer(): void {
     this.wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
-      const query = parse(req.url || "", true).query;
-      const token = query.token as string;
+      const origin = req.headers.origin;
+      const allowedOrigins = [
+        process.env.FRONTEND_URL,
+        process.env.FRONTEND_LOCALHOST,
+      ].filter(Boolean) as string[];
+      if (origin && !allowedOrigins.includes(origin)) {
+        ws.close(1008, "Origin not allowed");
+        return;
+      }
+
+      const token = readCookie(req.headers.cookie, "user_token");
 
       // Authenticate via JWT
       let userId: string | null = null;
 
       try {
-        if (!token) throw new Error("No token provided.");
+        if (!token) throw new Error("Authentication cookie is missing.");
 
         const secret = process.env.JWT_SECRET;
         if (!secret) throw new Error("JWT_SECRET not configured.");
@@ -165,6 +189,13 @@ export class TradeWebSocketServer {
       });
     });
 
+    monitor.on("monitoringUpdate", (data) => {
+      this.broadcastToTradeSubscribers(data.tradeId, {
+        type: "monitoring_update",
+        data,
+      });
+    });
+
     // Trade closed (TP/SL/manual) with PnL
     monitor.on("tradeClosed", (data) => {
       this.broadcastToTradeSubscribers(data.tradeId, {
@@ -221,10 +252,13 @@ export class TradeWebSocketServer {
       return;
     }
 
-    // Verify trade belongs to user
+    // Users may monitor their own trades and active public pro trades.
     const trade = await Trade.findOne({
       _id: tradeId,
-      userId: client.userId,
+      $or: [
+        { userId: client.userId },
+        { tradeOrigin: "pro", status: { $in: ["pending", "filled"] } },
+      ],
     }).lean();
 
     if (!trade) {
@@ -258,6 +292,10 @@ export class TradeWebSocketServer {
         tradeResult: trade.tradeResult,
         closedVia: trade.closedVia,
         wsMonitoringActive: trade.wsMonitoringActive,
+        monitoringStatus: trade.monitoringStatus,
+        monitoringError: trade.monitoringError,
+        monitoringConnectedAt: trade.monitoringConnectedAt,
+        lastCheckedAt: trade.lastCheckedAt,
         createdAt: trade.createdAt,
         closedAt: trade.closedAt,
       },
@@ -297,6 +335,10 @@ export class TradeWebSocketServer {
         sl: t.sl,
         quantity: t.quantity,
         wsMonitoringActive: t.wsMonitoringActive,
+        monitoringStatus: t.monitoringStatus,
+        monitoringError: t.monitoringError,
+        monitoringConnectedAt: t.monitoringConnectedAt,
+        lastCheckedAt: t.lastCheckedAt,
         createdAt: t.createdAt,
       })),
     });

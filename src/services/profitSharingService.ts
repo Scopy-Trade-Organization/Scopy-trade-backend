@@ -118,6 +118,8 @@ export async function processTradeClose(
         feeStatus,
         tradeResult,
         wsMonitoringActive: false,
+        monitoringStatus: "disconnected",
+        monitoringError: null,
       },
     },
   );

@@ -62,11 +62,19 @@ interface ExchangeWsConnection {
   keepaliveTimer: NodeJS.Timeout | null;
 }
 
+type MonitoringStatus =
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "disconnected"
+  | "unsupported";
+
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const MAX_RECONNECT_DELAY_MS = 60000;
 const BINANCE_LISTENKEY_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
 const BITGET_PING_INTERVAL_MS = 30000;
+const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000;
 
 // ─── Trade Monitor Service ──────────────────────────────────────────────────
 
@@ -75,6 +83,8 @@ export class TradeMonitorService extends EventEmitter {
   private binanceListenKeys: Map<string, string> = new Map(); // connectionId → listenKey
   private binanceListenKeyTimers: Map<string, NodeJS.Timeout> = new Map();
   private isShuttingDown = false;
+  private reconciliationTimer: NodeJS.Timeout | null = null;
+  private reconciliationRunning = false;
 
   constructor() {
     super();
@@ -90,13 +100,11 @@ export class TradeMonitorService extends EventEmitter {
   async startMonitoring(tradeId: string): Promise<void> {
     const trade = await Trade.findById(tradeId).lean();
     if (!trade) {
-      console.error(`[TradeMonitor] Trade ${tradeId} not found.`);
-      return;
+      throw new Error(`Trade ${tradeId} not found.`);
     }
 
     if (!trade.exchangeOrderId) {
-      console.error(`[TradeMonitor] Trade ${tradeId} has no exchangeOrderId.`);
-      return;
+      throw new Error(`Trade ${tradeId} has no exchange order ID.`);
     }
 
     const connection = await ExchangeConnection.findById(
@@ -104,17 +112,24 @@ export class TradeMonitorService extends EventEmitter {
     ).lean();
 
     if (!connection) {
-      console.error(`[TradeMonitor] Connection for trade ${tradeId} not found.`);
-      return;
+      throw new Error(`Exchange connection for trade ${tradeId} was not found.`);
     }
 
     const exchange = connection.exchange as ExchangeId;
 
     if (exchange !== "binance" && exchange !== "bybit") {
-      console.warn(
-        `[TradeMonitor] Exchange ${exchange} not supported for WS monitoring.`,
+      const message = `Exchange ${exchange} is not supported for WebSocket monitoring.`;
+      await Trade.updateOne(
+        { _id: tradeId },
+        {
+          $set: {
+            wsMonitoringActive: false,
+            monitoringStatus: "unsupported",
+            monitoringError: message,
+          },
+        },
       );
-      return;
+      throw new Error(message);
     }
 
     // Each saved connection has its own API credentials and therefore needs
@@ -193,7 +208,13 @@ export class TradeMonitorService extends EventEmitter {
     }
     await Trade.updateOne(
       { _id: tradeId },
-      { $set: { wsMonitoringActive: true } },
+      {
+        $set: {
+          wsMonitoringActive: wsConn!.isConnected,
+          monitoringStatus: wsConn!.isConnected ? "connected" : "connecting",
+          monitoringError: null,
+        },
+      },
     );
 
     // Connect WS if not already connected
@@ -229,7 +250,12 @@ export class TradeMonitorService extends EventEmitter {
           // Update DB
           await Trade.updateOne(
             { _id: tradeId },
-            { $set: { wsMonitoringActive: false } },
+            {
+              $set: {
+                wsMonitoringActive: false,
+                monitoringStatus: "disconnected",
+              },
+            },
           );
 
           // If no more trades, close the connection
@@ -268,12 +294,81 @@ export class TradeMonitorService extends EventEmitter {
     }
   }
 
-  /**
-   * Graceful shutdown — close all WebSocket connections.
-   */
+  /** Reconcile active exchange orders in case a push event was missed. */
+  startBackgroundReconciliation(
+    intervalMs = RECONCILIATION_INTERVAL_MS,
+  ): void {
+    if (this.reconciliationTimer) return;
+    this.reconciliationTimer = setInterval(() => {
+      void this.reconcileActiveTrades();
+    }, intervalMs);
+    console.log(
+      `[TradeMonitor] Background reconciliation scheduled every ${intervalMs}ms`,
+    );
+  }
+
+  async reconcileActiveTrades(): Promise<void> {
+    if (this.reconciliationRunning || this.isShuttingDown) return;
+    this.reconciliationRunning = true;
+    try {
+      const trades = await Trade.find({
+        status: { $in: ["pending", "filled"] },
+        exchangeOrderId: { $ne: null },
+      }).lean();
+
+      for (const trade of trades) {
+        const tradeId = String(trade._id);
+        const existing = this.findMonitoredTrade(tradeId);
+        try {
+          if (existing) {
+            if (
+              !existing.wsConn.isConnected &&
+              !existing.wsConn.ws &&
+              !existing.wsConn.reconnectTimer
+            ) {
+              if (existing.wsConn.exchange === "binance") {
+                await this.connectBinance(existing.wsConn);
+              } else if (existing.wsConn.exchange === "bybit") {
+                await this.connectBybit(existing.wsConn);
+              }
+            }
+            await this.reconcileEntryOrder(existing.wsConn, existing.trade);
+          } else {
+            await this.startMonitoring(tradeId);
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          await Trade.updateOne(
+            { _id: trade._id },
+            {
+              $set: {
+                wsMonitoringActive: false,
+                monitoringStatus: "disconnected",
+                monitoringError: message,
+              },
+            },
+          );
+          this.emit("monitoringUpdate", {
+            tradeId,
+            wsMonitoringActive: false,
+            monitoringStatus: "disconnected",
+            monitoringError: message,
+          });
+        }
+      }
+    } finally {
+      this.reconciliationRunning = false;
+    }
+  }
+
+  /** Graceful shutdown — close all WebSocket connections. */
   async shutdown(): Promise<void> {
     console.log("[TradeMonitor] Shutting down...");
     this.isShuttingDown = true;
+    if (this.reconciliationTimer) {
+      clearInterval(this.reconciliationTimer);
+      this.reconciliationTimer = null;
+    }
 
     for (const [connKey] of this.connections) {
       this.closeConnection(connKey);
@@ -323,6 +418,7 @@ export class TradeMonitorService extends EventEmitter {
         );
         wsConn.isConnected = true;
         wsConn.reconnectAttempts = 0;
+        void this.setConnectionMonitoringState(wsConn, "connected");
 
         // Keep listenKey alive every 30 minutes
         const refreshTimer = setInterval(async () => {
@@ -359,6 +455,11 @@ export class TradeMonitorService extends EventEmitter {
 
       ws.on("error", (err) => {
         console.error("[TradeMonitor][Binance] WS error:", err);
+        void this.setConnectionMonitoringState(
+          wsConn,
+          "reconnecting",
+          err instanceof Error ? err.message : String(err),
+        );
       });
 
       ws.on("close", () => {
@@ -367,6 +468,14 @@ export class TradeMonitorService extends EventEmitter {
         );
         wsConn.isConnected = false;
         wsConn.ws = null;
+
+        if (!this.isShuttingDown && wsConn.activeTrades.size > 0) {
+          void this.setConnectionMonitoringState(
+            wsConn,
+            "reconnecting",
+            "Exchange WebSocket disconnected.",
+          );
+        }
 
         // Clean up listenKey timer
         const timer = this.binanceListenKeyTimers.get(wsConn.connectionId);
@@ -382,9 +491,15 @@ export class TradeMonitorService extends EventEmitter {
       });
     } catch (err: any) {
       console.error("[TradeMonitor][Binance] Connection error:", err);
+      await this.setConnectionMonitoringState(
+        wsConn,
+        "reconnecting",
+        err instanceof Error ? err.message : String(err),
+      );
       if (wsConn.activeTrades.size > 0) {
         this.scheduleReconnect(wsConn, () => this.connectBinance(wsConn));
       }
+      throw err;
     }
   }
 
@@ -471,6 +586,7 @@ export class TradeMonitorService extends EventEmitter {
     ) {
       update.status = newStatus;
       update.wsMonitoringActive = false;
+      update.monitoringStatus = "disconnected";
       for (const [trackedOrderId, trade] of wsConn.activeTrades) {
         if (trade.tradeId === monitored.tradeId) {
           wsConn.activeTrades.delete(trackedOrderId);
@@ -481,7 +597,14 @@ export class TradeMonitorService extends EventEmitter {
       );
     }
 
-    await Trade.updateOne({ _id: monitored.tradeId }, { $set: update });
+    const allowedStatuses =
+      newStatus === "cancelled" || newStatus === "failed"
+        ? ["pending"]
+        : ["pending", "filled"];
+    await Trade.updateOne(
+      { _id: monitored.tradeId, status: { $in: allowedStatuses } },
+      { $set: update },
+    );
     if (
       orderId === monitored.exchangeOrderId &&
       (newStatus === "cancelled" || newStatus === "failed") &&
@@ -704,6 +827,7 @@ export class TradeMonitorService extends EventEmitter {
             }
             wsConn.isConnected = true;
             wsConn.reconnectAttempts = 0;
+            void this.setConnectionMonitoringState(wsConn, "connected");
             ws.send(
               JSON.stringify({ op: "subscribe", args: ["order.linear"] }),
             );
@@ -737,6 +861,11 @@ export class TradeMonitorService extends EventEmitter {
 
       ws.on("error", (err) => {
         console.error("[TradeMonitor][Bybit] WS error:", err);
+        void this.setConnectionMonitoringState(
+          wsConn,
+          "reconnecting",
+          err instanceof Error ? err.message : String(err),
+        );
       });
 
       ws.on("close", () => {
@@ -745,6 +874,13 @@ export class TradeMonitorService extends EventEmitter {
         );
         wsConn.isConnected = false;
         wsConn.ws = null;
+        if (!this.isShuttingDown && wsConn.activeTrades.size > 0) {
+          void this.setConnectionMonitoringState(
+            wsConn,
+            "reconnecting",
+            "Exchange WebSocket disconnected.",
+          );
+        }
         if (wsConn.keepaliveTimer) {
           clearInterval(wsConn.keepaliveTimer);
           wsConn.keepaliveTimer = null;
@@ -755,9 +891,15 @@ export class TradeMonitorService extends EventEmitter {
       });
     } catch (err) {
       console.error("[TradeMonitor][Bybit] Connection error:", err);
+      await this.setConnectionMonitoringState(
+        wsConn,
+        "reconnecting",
+        err instanceof Error ? err.message : String(err),
+      );
       if (wsConn.activeTrades.size > 0) {
         this.scheduleReconnect(wsConn, () => this.connectBybit(wsConn));
       }
+      throw err;
     }
   }
 
@@ -845,13 +987,21 @@ export class TradeMonitorService extends EventEmitter {
     } else if (status === "cancelled" || status === "failed") {
       update.status = status;
       update.wsMonitoringActive = false;
+      update.monitoringStatus = "disconnected";
       for (const [trackedOrderId, trade] of wsConn.activeTrades) {
         if (trade.tradeId === monitored.tradeId) {
           wsConn.activeTrades.delete(trackedOrderId);
         }
       }
     }
-    await Trade.updateOne({ _id: monitored.tradeId }, { $set: update });
+    const allowedStatuses =
+      status === "cancelled" || status === "failed"
+        ? ["pending"]
+        : ["pending", "filled"];
+    await Trade.updateOne(
+      { _id: monitored.tradeId, status: { $in: allowedStatuses } },
+      { $set: update },
+    );
     this.emit("tradeUpdate", {
       tradeId: monitored.tradeId,
       exchangeOrderId: orderId,
@@ -883,6 +1033,7 @@ export class TradeMonitorService extends EventEmitter {
       const update: Record<string, unknown> = {
         lastCheckedAt: new Date(),
         rawStatusResponse: result.raw,
+        monitoringError: null,
       };
 
       if (result.status === "filled") {
@@ -903,6 +1054,7 @@ export class TradeMonitorService extends EventEmitter {
       ) {
         update.status = result.status;
         update.wsMonitoringActive = false;
+        update.monitoringStatus = "disconnected";
         for (const [orderId, trade] of wsConn.activeTrades) {
           if (trade.tradeId === monitored.tradeId) {
             wsConn.activeTrades.delete(orderId);
@@ -910,7 +1062,14 @@ export class TradeMonitorService extends EventEmitter {
         }
       }
 
-      await Trade.updateOne({ _id: monitored.tradeId }, { $set: update });
+      const allowedStatuses =
+        result.status === "cancelled" || result.status === "failed"
+          ? ["pending"]
+          : ["pending", "filled"];
+      await Trade.updateOne(
+        { _id: monitored.tradeId, status: { $in: allowedStatuses } },
+        { $set: update },
+      );
       this.emit("tradeUpdate", {
         tradeId: monitored.tradeId,
         exchangeOrderId: monitored.exchangeOrderId,
@@ -920,12 +1079,30 @@ export class TradeMonitorService extends EventEmitter {
         filledQuantity: null,
         timestamp: new Date(),
       });
+      this.emit("monitoringUpdate", {
+        tradeId: monitored.tradeId,
+        wsMonitoringActive: wsConn.isConnected,
+        monitoringStatus: wsConn.isConnected ? "connected" : "reconnecting",
+        monitoringError: null,
+        lastCheckedAt: update.lastCheckedAt,
+      });
 
       if (wsConn.activeTrades.size === 0) {
         this.closeConnection(wsConn.connectionId);
       }
     } catch (err) {
       // A failed snapshot does not disable the live private stream.
+      const message = err instanceof Error ? err.message : String(err);
+      await Trade.updateOne(
+        { _id: monitored.tradeId, status: { $in: ["pending", "filled"] } },
+        { $set: { monitoringError: message } },
+      );
+      this.emit("monitoringUpdate", {
+        tradeId: monitored.tradeId,
+        wsMonitoringActive: wsConn.isConnected,
+        monitoringStatus: wsConn.isConnected ? "connected" : "reconnecting",
+        monitoringError: message,
+      });
       console.error(
         `[TradeMonitor][${wsConn.exchange}] Initial reconciliation failed for trade ${monitored.tradeId}:`,
         err,
@@ -1377,6 +1554,50 @@ export class TradeMonitorService extends EventEmitter {
   }
 
   // ─── Connection Management ──────────────────────────────────────────────
+
+  private findMonitoredTrade(tradeId: string): {
+    wsConn: ExchangeWsConnection;
+    trade: MonitoredTrade;
+  } | null {
+    for (const wsConn of this.connections.values()) {
+      for (const trade of wsConn.activeTrades.values()) {
+        if (trade.tradeId === tradeId) return { wsConn, trade };
+      }
+    }
+    return null;
+  }
+
+  private async setConnectionMonitoringState(
+    wsConn: ExchangeWsConnection,
+    monitoringStatus: MonitoringStatus,
+    monitoringError: string | null = null,
+  ): Promise<void> {
+    const tradeIds = [
+      ...new Set(
+        [...wsConn.activeTrades.values()].map((trade) => trade.tradeId),
+      ),
+    ];
+    if (tradeIds.length === 0) return;
+
+    const connected = monitoringStatus === "connected";
+    const update: Record<string, unknown> = {
+      wsMonitoringActive: connected,
+      monitoringStatus,
+      monitoringError,
+    };
+    if (connected) update.monitoringConnectedAt = new Date();
+
+    await Trade.updateMany(
+      { _id: { $in: tradeIds }, status: { $in: ["pending", "filled"] } },
+      { $set: update },
+    );
+    for (const tradeId of tradeIds) {
+      this.emit("monitoringUpdate", {
+        tradeId,
+        ...update,
+      });
+    }
+  }
 
   private closeConnection(connKey: string): void {
     const wsConn = this.connections.get(connKey);

@@ -441,7 +441,9 @@ export async function initiateTrade(req: Request, res: Response) {
       entryPrice:
         placed.execution?.entryPrice ?? String(executionEntryPrice),
       status: "pending",
-      wsMonitoringActive: true,
+      wsMonitoringActive: false,
+      monitoringStatus: "connecting",
+      monitoringError: null,
       rawOrderResponse: {
         order: placed.raw,
         marketPrice: currentPriceResult.raw,
@@ -463,12 +465,23 @@ export async function initiateTrade(req: Request, res: Response) {
       },
     });
 
+    let monitoringWarning: string | null = null;
     try {
       await getTradeMonitorService().startMonitoring(String(trade._id));
     } catch (monitorErr) {
+      monitoringWarning =
+        monitorErr instanceof Error
+          ? monitorErr.message
+          : "Real-time monitoring could not be started.";
       await Trade.updateOne(
         { _id: trade._id },
-        { $set: { wsMonitoringActive: false } },
+        {
+          $set: {
+            wsMonitoringActive: false,
+            monitoringStatus: "disconnected",
+            monitoringError: monitoringWarning,
+          },
+        },
       );
       console.error("[initiateTrade] Failed to start trade monitor:", monitorErr);
     }
@@ -478,6 +491,7 @@ export async function initiateTrade(req: Request, res: Response) {
       message: isProTrade
         ? "Pro trade opened successfully."
         : "Copy trade initiated successfully.",
+      monitoringWarning,
       trade: {
         _id: trade._id,
         pair: trade.pair,
@@ -490,6 +504,9 @@ export async function initiateTrade(req: Request, res: Response) {
         tradeOrigin: trade.tradeOrigin,
         sourceTradeId: trade.sourceTradeId,
         exchangeOrderId: trade.exchangeOrderId,
+        wsMonitoringActive: monitoringWarning === null && trade.wsMonitoringActive,
+        monitoringStatus: monitoringWarning ? "disconnected" : "connecting",
+        monitoringError: monitoringWarning,
         createdAt: trade.createdAt,
       },
     });

@@ -42,6 +42,7 @@ const tradeMonitor = getTradeMonitorService();
 
 export async function initializeTradeMonitoring(): Promise<void> {
   await tradeMonitor.resumeActiveMonitoring();
+  tradeMonitor.startBackgroundReconciliation();
   console.log("[App] Trade monitor resumed active monitoring");
 }
 

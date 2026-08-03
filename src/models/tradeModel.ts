@@ -118,6 +118,26 @@ const tradeSchema = new Schema(
       type: Boolean,
       default: false,
     },
+    monitoringStatus: {
+      type: String,
+      enum: [
+        "connecting",
+        "connected",
+        "reconnecting",
+        "disconnected",
+        "unsupported",
+      ],
+      default: "disconnected",
+      index: true,
+    },
+    monitoringError: {
+      type: String,
+      default: null,
+    },
+    monitoringConnectedAt: {
+      type: Date,
+      default: null,
+    },
     // How the trade was closed (TP hit, SL hit, or manual)
     closedVia: {
       type: String,
