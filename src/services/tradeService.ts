@@ -45,6 +45,22 @@ export interface CurrentPriceResult {
   raw: unknown;
 }
 
+export interface AmendTradeParams extends PlaceOrderParams {
+  orderId: string;
+  status: "pending" | "filled";
+  protectionOrderIds?: string[];
+  protectionTransport?: "algo" | "legacy" | null;
+}
+
+export interface AmendTradeResult {
+  entryPrice: string;
+  tp: string;
+  sl: string;
+  protectionOrderIds?: string[];
+  protectionTransport?: "algo" | "legacy";
+  raw: unknown;
+}
+
 // ─── Balance Types ────────────────────────────────────────────────────────────
 
 export interface AssetBalance {
@@ -1053,6 +1069,180 @@ const balanceFetcher: Record<
   bitget: getBitgetBalance,
 };
 
+async function amendBinanceTrade(p: AmendTradeParams): Promise<AmendTradeResult> {
+  const prepared = await prepareFuturesOrder("binance", p);
+  const { apiKey, apiSecret } = p.credentials;
+  const baseUrl = getExchangeRestUrl("binance");
+  const symbol = normalizePairForExchange("binance", p.pair);
+  const sign = (query: string) =>
+    crypto.createHmac("sha256", apiSecret).update(query).digest("hex");
+
+  if (p.status === "pending") {
+    const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
+    const query = new URLSearchParams({
+      symbol,
+      orderId: p.orderId,
+      side: p.direction.toUpperCase(),
+      quantity: prepared.quantity,
+      price: prepared.entryPrice,
+      timestamp: String(timeData.serverTime),
+    }).toString();
+    const { data } = await http.put(`${baseUrl}/fapi/v1/order`, null, {
+      params: {
+        ...Object.fromEntries(new URLSearchParams(query)),
+        signature: sign(query),
+      },
+      headers: { "X-MBX-APIKEY": apiKey },
+    });
+    return {
+      entryPrice: prepared.entryPrice,
+      tp: prepared.tp,
+      sl: prepared.sl,
+      raw: data,
+    };
+  }
+
+  // Create replacement protection before cancelling the old orders so the
+  // position is never left unprotected if the exchange rejects the new levels.
+  const protection = await attachBinanceTpSl({ ...prepared, orderId: p.orderId });
+  await Promise.allSettled(
+    (p.protectionOrderIds ?? []).map(async (protectionOrderId) => {
+      const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
+      const isAlgo = p.protectionTransport !== "legacy";
+      const query = new URLSearchParams({
+        symbol,
+        ...(isAlgo ? { algoId: protectionOrderId } : { orderId: protectionOrderId }),
+        timestamp: String(timeData.serverTime),
+      }).toString();
+      await http.delete(
+        `${baseUrl}${isAlgo ? "/fapi/v1/algoOrder" : "/fapi/v1/order"}`,
+        {
+          params: {
+            ...Object.fromEntries(new URLSearchParams(query)),
+            signature: sign(query),
+          },
+          headers: { "X-MBX-APIKEY": apiKey },
+        },
+      );
+    }),
+  );
+  return {
+    entryPrice: prepared.entryPrice,
+    tp: prepared.tp,
+    sl: prepared.sl,
+    protectionOrderIds: [protection.tpOrderId, protection.slOrderId],
+    protectionTransport: "algo",
+    raw: protection,
+  };
+}
+
+async function amendBybitTrade(p: AmendTradeParams): Promise<AmendTradeResult> {
+  const prepared = await prepareFuturesOrder("bybit", p);
+  const { apiKey, apiSecret } = p.credentials;
+  const baseUrl = getExchangeRestUrl("bybit");
+  const symbol = normalizePairForExchange("bybit", p.pair);
+  const timestamp = await getBybitTimestamp(baseUrl);
+  const recvWindow = "5000";
+  const path = p.status === "pending" ? "/v5/order/amend" : "/v5/position/trading-stop";
+  const body = JSON.stringify(
+    p.status === "pending"
+      ? {
+          category: "linear",
+          symbol,
+          orderId: p.orderId,
+          price: prepared.entryPrice,
+          takeProfit: prepared.tp,
+          stopLoss: prepared.sl,
+          tpslMode: "Full",
+          tpTriggerBy: "MarkPrice",
+          slTriggerBy: "MarkPrice",
+        }
+      : {
+          category: "linear",
+          symbol,
+          takeProfit: prepared.tp,
+          stopLoss: prepared.sl,
+          tpslMode: "Full",
+          tpTriggerBy: "MarkPrice",
+          slTriggerBy: "MarkPrice",
+          positionIdx: 0,
+        },
+  );
+  const signature = crypto
+    .createHmac("sha256", apiSecret)
+    .update(timestamp + apiKey + recvWindow + body)
+    .digest("hex");
+  const { data } = await http.post(`${baseUrl}${path}`, body, {
+    headers: {
+      "X-BAPI-API-KEY": apiKey,
+      "X-BAPI-SIGN": signature,
+      "X-BAPI-TIMESTAMP": timestamp,
+      "X-BAPI-RECV-WINDOW": recvWindow,
+      "Content-Type": "application/json",
+    },
+  });
+  if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit amendment failed.");
+  return { entryPrice: prepared.entryPrice, tp: prepared.tp, sl: prepared.sl, raw: data };
+}
+
+async function amendOkxPendingTrade(p: AmendTradeParams): Promise<AmendTradeResult> {
+  const { apiKey, apiSecret, passphrase } = p.credentials;
+  if (!passphrase) throw new Error("OKX requires a passphrase.");
+  const timestamp = new Date().toISOString();
+  const path = "/api/v5/trade/amend-order";
+  const body = JSON.stringify({
+    instId: normalizePairForExchange("okx", p.pair),
+    ordId: p.orderId,
+    newPx: p.entryPrice,
+  });
+  const signature = crypto.createHmac("sha256", apiSecret)
+    .update(timestamp + "POST" + path + body).digest("base64");
+  const { data } = await http.post("https://www.okx.com" + path, body, {
+    headers: {
+      "OK-ACCESS-KEY": apiKey,
+      "OK-ACCESS-SIGN": signature,
+      "OK-ACCESS-TIMESTAMP": timestamp,
+      "OK-ACCESS-PASSPHRASE": passphrase,
+      "Content-Type": "application/json",
+      "x-simulated-trading": "1",
+    },
+  });
+  if (data.code !== "0" || data.data?.[0]?.sCode !== "0") {
+    throw new Error(data.data?.[0]?.sMsg || data.msg || "OKX amendment failed.");
+  }
+  return { entryPrice: p.entryPrice, tp: p.tp, sl: p.sl, raw: data };
+}
+
+async function amendBitgetPendingTrade(p: AmendTradeParams): Promise<AmendTradeResult> {
+  const { apiKey, apiSecret, passphrase } = p.credentials;
+  if (!passphrase) throw new Error("Bitget requires a passphrase.");
+  const timestamp = Date.now().toString();
+  const path = "/api/v2/mix/order/modify-order";
+  const body = JSON.stringify({
+    symbol: normalizePairForExchange("bitget", p.pair),
+    productType: "USDT-FUTURES",
+    orderId: p.orderId,
+    newPrice: p.entryPrice,
+    newSize: p.quantity,
+    presetStopSurplusPrice: p.tp,
+    presetStopLossPrice: p.sl,
+  });
+  const signature = crypto.createHmac("sha256", apiSecret)
+    .update(timestamp + "POST" + path + body).digest("base64");
+  const { data } = await http.post(BITGET_BASE_URL + path, body, {
+    headers: {
+      ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+      "ACCESS-KEY": apiKey,
+      "ACCESS-SIGN": signature,
+      "ACCESS-TIMESTAMP": timestamp,
+      "ACCESS-PASSPHRASE": passphrase,
+      "Content-Type": "application/json",
+    },
+  });
+  if (data.code !== "00000") throw new Error(data.msg || "Bitget amendment failed.");
+  return { entryPrice: p.entryPrice, tp: p.tp, sl: p.sl, raw: data };
+}
+
 // ─── Public Trading API ──────────────────────────────────────────────────────
 
 export async function placeOrder(
@@ -1071,6 +1261,25 @@ export async function placeOrder(
         sl: prepared.sl,
       },
     };
+  } catch (err) {
+    throw normalizeError(err);
+  }
+}
+
+export async function amendTradeOrder(
+  exchange: ExchangeId,
+  params: AmendTradeParams,
+): Promise<AmendTradeResult> {
+  try {
+    if (exchange === "binance") return await amendBinanceTrade(params);
+    if (exchange === "bybit") return await amendBybitTrade(params);
+    if (params.status !== "pending") {
+      throw new Error(
+        `${exchange.toUpperCase()} does not currently support changing protection after entry fill.`,
+      );
+    }
+    if (exchange === "okx") return await amendOkxPendingTrade(params);
+    return await amendBitgetPendingTrade(params);
   } catch (err) {
     throw normalizeError(err);
   }

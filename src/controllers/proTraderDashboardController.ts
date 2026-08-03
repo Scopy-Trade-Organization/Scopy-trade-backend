@@ -2,6 +2,14 @@ import { Request, Response } from "express";
 import AuditLog from "../models/auditLogModel.js";
 import { Signal } from "../models/signalModel.js";
 import { Trade } from "../models/tradeModel.js";
+import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
+import {
+  amendTradeOrder,
+  getOrderStatus,
+} from "../services/tradeService.js";
+import { decryptCredentials } from "../services/exchangeConnectionService.js";
+import { getTradeMonitorService } from "../services/tradeMonitorService.js";
+import { ExchangeId } from "../types/index.js";
 import User from "../models/userModel.js";
 import { TronWeb } from "tronweb";
 
@@ -13,6 +21,7 @@ export const getProTrades = async (req: Request, res: Response) => {
     const [trades, total] = await Promise.all([
       Trade.find(filter)
         .populate("signalId", "notes")
+        .populate("exchangeConnectionId", "exchange label")
         .sort({ createdAt: -1 })
         .limit(limit)
         .skip((page - 1) * limit)
@@ -34,6 +43,214 @@ export const getProTrades = async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch trades",
+    });
+  }
+};
+
+export const updateProTrade = async (req: Request, res: Response) => {
+  try {
+    const { tradeId } = req.params;
+    const trade = await Trade.findOne({
+      _id: tradeId,
+      userId: req.user,
+      tradeOrigin: "pro",
+      status: { $in: ["pending", "filled"] },
+    });
+
+    if (!trade) {
+      return res.status(404).json({
+        success: false,
+        message: "Active pro trade not found.",
+      });
+    }
+
+    const connection = await ExchangeConnection.findOne({
+      _id: trade.exchangeConnectionId,
+      userId: req.user,
+      isActive: true,
+    }).lean();
+    if (!connection?.encryptedApiKey || !connection.encryptedApiSecret) {
+      return res.status(409).json({
+        success: false,
+        message: "The exchange connection for this trade is unavailable.",
+      });
+    }
+    if (!trade.exchangeOrderId) {
+      return res.status(409).json({
+        success: false,
+        message: "This trade has no exchange order to amend.",
+      });
+    }
+
+    const credentials = decryptCredentials({
+      exchange: connection.exchange as ExchangeId,
+      apiKey: connection.encryptedApiKey,
+      apiSecret: connection.encryptedApiSecret,
+      ...(connection.encryptedPassphrase
+        ? { passphrase: connection.encryptedPassphrase }
+        : {}),
+    });
+    const live = await getOrderStatus(
+      connection.exchange as ExchangeId,
+      credentials,
+      trade.pair,
+      trade.exchangeOrderId,
+    );
+    if (!["pending", "filled"].includes(live.status)) {
+      return res.status(409).json({
+        success: false,
+        message: `The exchange reports this order as ${live.status}; it can no longer be edited.`,
+      });
+    }
+
+    const raw = live.raw as any;
+    const partiallyFilled =
+      Number(raw?.executedQty ?? 0) > 0 ||
+      raw?.result?.list?.[0]?.orderStatus === "PartiallyFilled" ||
+      raw?.data?.[0]?.state === "partially_filled" ||
+      raw?.data?.status === "partial_fill";
+    const entryLocked =
+      live.status === "filled" || trade.status === "filled" || partiallyFilled;
+
+    const requestedEntry = String(req.body.entryPrice ?? trade.entryPrice);
+    const requestedTp = String(req.body.tp ?? trade.tp);
+    const requestedSl = String(req.body.sl ?? trade.sl);
+    const values = [requestedEntry, requestedTp, requestedSl].map(Number);
+    if (values.some((value) => !Number.isFinite(value) || value <= 0)) {
+      return res.status(400).json({
+        success: false,
+        message: "Entry, take-profit, and stop-loss must be positive numbers.",
+      });
+    }
+    if (entryLocked && requestedEntry !== trade.entryPrice) {
+      return res.status(409).json({
+        success: false,
+        message: "Entry price cannot be changed after the order starts filling.",
+      });
+    }
+
+    const effectiveEntry = Number(
+      entryLocked ? live.filledPrice || trade.entryFillPrice || trade.entryPrice : requestedEntry,
+    );
+    const takeProfit = Number(requestedTp);
+    const stopLoss = Number(requestedSl);
+    const validLevels =
+      trade.direction === "buy"
+        ? stopLoss < effectiveEntry && effectiveEntry < takeProfit
+        : takeProfit < effectiveEntry && effectiveEntry < stopLoss;
+    if (!validLevels) {
+      return res.status(422).json({
+        success: false,
+        message:
+          trade.direction === "buy"
+            ? "A long trade requires stop loss < entry < take profit."
+            : "A short trade requires take profit < entry < stop loss.",
+      });
+    }
+
+    const entryChanged = requestedEntry !== trade.entryPrice;
+    const tpChanged = requestedTp !== trade.tp;
+    const slChanged = requestedSl !== trade.sl;
+    if (!entryChanged && !tpChanged && !slChanged) {
+      return res.status(200).json({
+        success: true,
+        message: "Trade parameters are unchanged.",
+        trade: {
+          ...trade.toObject(),
+          exchangeConnectionId: {
+            _id: connection._id,
+            exchange: connection.exchange,
+            label: connection.label,
+          },
+          entryEditable: !entryLocked,
+        },
+      });
+    }
+    if (connection.exchange === "okx" && (tpChanged || slChanged)) {
+      return res.status(422).json({
+        success: false,
+        message: "OKX protection amendments are not yet supported; only a pending entry price can be changed.",
+      });
+    }
+
+    const amended = await amendTradeOrder(connection.exchange as ExchangeId, {
+      credentials,
+      pair: trade.pair,
+      direction: trade.direction as "buy" | "sell",
+      quantity: trade.quantity,
+      entryPrice: requestedEntry,
+      tp: requestedTp,
+      sl: requestedSl,
+      orderId: trade.exchangeOrderId,
+      status: entryLocked ? "filled" : "pending",
+      protectionOrderIds: trade.exchangeProtectionOrderIds,
+      ...(trade.exchangeProtectionOrderTransport !== undefined
+        ? { protectionTransport: trade.exchangeProtectionOrderTransport }
+        : {}),
+    });
+
+    trade.entryPrice = amended.entryPrice;
+    trade.tp = amended.tp;
+    trade.sl = amended.sl;
+    if (live.status === "filled") trade.status = "filled";
+    if (live.filledPrice) trade.entryFillPrice = live.filledPrice;
+    if (amended.protectionOrderIds) {
+      trade.exchangeProtectionOrderIds = amended.protectionOrderIds;
+      trade.exchangeProtectionOrderTransport = amended.protectionTransport ?? "algo";
+    }
+    trade.rawStatusResponse = {
+      status: live.raw,
+      lastAmendment: amended.raw,
+      amendedAt: new Date().toISOString(),
+    };
+    await trade.save();
+    await Signal.updateOne(
+      { _id: trade.signalId },
+      { $set: { entry: trade.entryPrice, tp: trade.tp, sl: trade.sl } },
+    );
+
+    const monitor = getTradeMonitorService();
+    await monitor.stopMonitoring(String(trade._id));
+    await monitor.startMonitoring(String(trade._id));
+
+    await AuditLog.create({
+      userId: req.user,
+      action: "Pro Trade Parameters Updated",
+      details: {
+        tradeId: trade._id,
+        entryPrice: trade.entryPrice,
+        tp: trade.tp,
+        sl: trade.sl,
+        entryLocked,
+        exchange: connection.exchange,
+      },
+      targetId: trade._id,
+      targetType: "Trade",
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Trade parameters updated successfully.",
+      trade: {
+        ...trade.toObject(),
+        exchangeConnectionId: {
+          _id: connection._id,
+          exchange: connection.exchange,
+          label: connection.label,
+        },
+        entryEditable: !entryLocked,
+      },
+    });
+  } catch (error) {
+    console.error("Error updating pro trade:", error);
+    return res.status(502).json({
+      success: false,
+      message:
+        error instanceof Error
+          ? error.message
+          : "Failed to update trade parameters.",
     });
   }
 };
