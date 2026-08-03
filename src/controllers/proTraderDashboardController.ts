@@ -183,6 +183,8 @@ export const updateProTrade = async (req: Request, res: Response) => {
       sl: requestedSl,
       orderId: trade.exchangeOrderId,
       status: entryLocked ? "filled" : "pending",
+      entryChanged,
+      protectionChanged: tpChanged || slChanged,
       protectionOrderIds: trade.exchangeProtectionOrderIds,
       ...(trade.exchangeProtectionOrderTransport !== undefined
         ? { protectionTransport: trade.exchangeProtectionOrderTransport }
@@ -192,6 +194,7 @@ export const updateProTrade = async (req: Request, res: Response) => {
     trade.entryPrice = amended.entryPrice;
     trade.tp = amended.tp;
     trade.sl = amended.sl;
+    if (amended.orderId) trade.exchangeOrderId = amended.orderId;
     if (live.status === "filled") trade.status = "filled";
     if (live.filledPrice) trade.entryFillPrice = live.filledPrice;
     if (amended.protectionOrderIds) {

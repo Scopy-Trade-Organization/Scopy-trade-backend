@@ -50,9 +50,12 @@ export interface AmendTradeParams extends PlaceOrderParams {
   status: "pending" | "filled";
   protectionOrderIds?: string[];
   protectionTransport?: "algo" | "legacy" | null;
+  entryChanged?: boolean;
+  protectionChanged?: boolean;
 }
 
 export interface AmendTradeResult {
+  orderId?: string;
   entryPrice: string;
   tp: string;
   sl: string;
@@ -373,6 +376,8 @@ async function placeBitgetOrder(
     tradeSide: "open",
     orderType: "limit",
     force: "gtc",
+    presetStopSurplusPrice: p.tp,
+    presetStopLossPrice: p.sl,
   });
 
   const signPayload = timestamp + method + path + body;
@@ -406,87 +411,6 @@ async function placeBitgetOrder(
     throw new Error(data.msg || "Bitget order failed.");
 
   const orderId = data.data.orderId;
-
-  // Bitget requires separate TP/SL orders after placing the main order
-  try {
-    // Set Take Profit
-    const tpBody = JSON.stringify({
-      symbol: normalizedPair,
-      productType: "USDT-FUTURES",
-      marginCoin: "USDT",
-      size: p.quantity,
-      triggerPrice: p.tp,
-      executePrice: p.tp,
-      side: p.direction === "buy" ? "sell" : "buy",
-      orderType: "limit",
-      triggerType: "fill_price",
-      tradeSide: "close",
-    });
-
-    const tpSignPayload =
-      timestamp + method + "/api/v2/mix/order/place-tp-sl-order" + tpBody;
-    const tpSignature = crypto
-      .createHmac("sha256", apiSecret)
-      .update(tpSignPayload)
-      .digest("base64");
-
-    await http.post(
-      BITGET_BASE_URL + "/api/v2/mix/order/place-tp-sl-order",
-      tpBody,
-      {
-        headers: {
-          ...(process.env.BITGET_DEMO_MODE === "true"
-            ? { paptrading: "1" }
-            : {}),
-          "ACCESS-KEY": apiKey,
-          "ACCESS-SIGN": tpSignature,
-          "ACCESS-TIMESTAMP": timestamp,
-          "ACCESS-PASSPHRASE": passphrase,
-          "Content-Type": "application/json",
-        },
-      },
-    );
-
-    // Set Stop Loss
-    const slBody = JSON.stringify({
-      symbol: normalizedPair,
-      productType: "USDT-FUTURES",
-      marginCoin: "USDT",
-      size: p.quantity,
-      triggerPrice: p.sl,
-      executePrice: p.sl,
-      side: p.direction === "buy" ? "sell" : "buy",
-      orderType: "limit",
-      triggerType: "fill_price",
-      tradeSide: "close",
-    });
-
-    const slSignPayload =
-      timestamp + method + "/api/v2/mix/order/place-tp-sl-order" + slBody;
-    const slSignature = crypto
-      .createHmac("sha256", apiSecret)
-      .update(slSignPayload)
-      .digest("base64");
-
-    await http.post(
-      BITGET_BASE_URL + "/api/v2/mix/order/place-tp-sl-order",
-      slBody,
-      {
-        headers: {
-          ...(process.env.BITGET_DEMO_MODE === "true"
-            ? { paptrading: "1" }
-            : {}),
-          "ACCESS-KEY": apiKey,
-          "ACCESS-SIGN": slSignature,
-          "ACCESS-TIMESTAMP": timestamp,
-          "ACCESS-PASSPHRASE": passphrase,
-          "Content-Type": "application/json",
-        },
-      },
-    );
-  } catch (tpSlErr) {
-    console.warn("Failed to set TP/SL for Bitget:", tpSlErr);
-  }
 
   return { orderId, raw: data };
 }
@@ -1216,31 +1140,54 @@ async function amendOkxPendingTrade(p: AmendTradeParams): Promise<AmendTradeResu
 async function amendBitgetPendingTrade(p: AmendTradeParams): Promise<AmendTradeResult> {
   const { apiKey, apiSecret, passphrase } = p.credentials;
   if (!passphrase) throw new Error("Bitget requires a passphrase.");
-  const timestamp = Date.now().toString();
   const path = "/api/v2/mix/order/modify-order";
-  const body = JSON.stringify({
-    symbol: normalizePairForExchange("bitget", p.pair),
-    productType: "USDT-FUTURES",
-    orderId: p.orderId,
-    newPrice: p.entryPrice,
-    newSize: p.quantity,
-    presetStopSurplusPrice: p.tp,
-    presetStopLossPrice: p.sl,
-  });
-  const signature = crypto.createHmac("sha256", apiSecret)
-    .update(timestamp + "POST" + path + body).digest("base64");
-  const { data } = await http.post(BITGET_BASE_URL + path, body, {
-    headers: {
-      ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
-      "ACCESS-KEY": apiKey,
-      "ACCESS-SIGN": signature,
-      "ACCESS-TIMESTAMP": timestamp,
-      "ACCESS-PASSPHRASE": passphrase,
-      "Content-Type": "application/json",
-    },
-  });
-  if (data.code !== "00000") throw new Error(data.msg || "Bitget amendment failed.");
-  return { entryPrice: p.entryPrice, tp: p.tp, sl: p.sl, raw: data };
+  const sendAmendment = async (payload: Record<string, string>) => {
+    const timestamp = Date.now().toString();
+    const body = JSON.stringify(payload);
+    const signature = crypto.createHmac("sha256", apiSecret)
+      .update(timestamp + "POST" + path + body).digest("base64");
+    const { data } = await http.post(BITGET_BASE_URL + path, body, {
+      headers: {
+        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        "ACCESS-KEY": apiKey,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": passphrase,
+        "Content-Type": "application/json",
+      },
+    });
+    if (data.code !== "00000") {
+      throw new Error(data.msg || "Bitget amendment failed.");
+    }
+    return data;
+  };
+
+  let orderId = p.orderId;
+  const responses: unknown[] = [];
+  if (p.entryChanged) {
+    const entryResponse = await sendAmendment({
+      symbol: normalizePairForExchange("bitget", p.pair),
+      productType: "USDT-FUTURES",
+      orderId,
+      newClientOid: `sc_amend_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`,
+      newPrice: p.entryPrice,
+      newSize: p.quantity,
+    });
+    responses.push(entryResponse);
+    orderId = String(entryResponse.data?.orderId || orderId);
+  }
+  if (p.protectionChanged) {
+    responses.push(
+      await sendAmendment({
+        symbol: normalizePairForExchange("bitget", p.pair),
+        productType: "USDT-FUTURES",
+        orderId,
+        newPresetStopSurplusPrice: p.tp,
+        newPresetStopLossPrice: p.sl,
+      }),
+    );
+  }
+  return { orderId, entryPrice: p.entryPrice, tp: p.tp, sl: p.sl, raw: responses };
 }
 
 // ─── Public Trading API ──────────────────────────────────────────────────────
