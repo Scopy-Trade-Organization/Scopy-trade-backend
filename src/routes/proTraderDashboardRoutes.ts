@@ -4,10 +4,6 @@ import {
   requireRole,
 } from "../middleware/authenticationMiddleware.js";
 import {
-  createSignal,
-  deleteSignal,
-  getAllSignals,
-  updateSignal,
   withdrawFunds,
   saveWalletAddress,
   getWalletAddress,
@@ -33,14 +29,6 @@ proTraderDashboardRouter.post(
   initiateTrade,
 );
 proTraderDashboardRouter.get("/trades", getProTrades);
-
-proTraderDashboardRouter.post("/signals", createSignal);
-
-proTraderDashboardRouter.get("/signals", getAllSignals);
-
-proTraderDashboardRouter.delete("/signals/:signalId", deleteSignal);
-
-proTraderDashboardRouter.patch("/signals/:signalId", updateSignal);
 
 proTraderDashboardRouter.post("/withdraw", withdrawFunds);
 
