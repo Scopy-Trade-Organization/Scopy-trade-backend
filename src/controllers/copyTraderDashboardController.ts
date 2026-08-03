@@ -1,6 +1,89 @@
 import { Request, Response } from "express";
 import { Signal } from "../models/signalModel.js";
 import { Trade } from "../models/tradeModel.js";
+
+export async function getActiveProTrades(req: Request, res: Response) {
+  try {
+    const userId = req.user as mongoose.Types.ObjectId;
+    const trades = await Trade.find({
+      tradeOrigin: "pro",
+      status: { $in: ["pending", "filled"] },
+    })
+      .populate("userId", "firstName lastName traderID profilePhoto")
+      .populate("signalId", "notes")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const sourceIds = trades.map((trade) => trade._id);
+    const [myCopies, copierCounts] = await Promise.all([
+      Trade.find({
+        userId,
+        tradeOrigin: "copy",
+        sourceTradeId: { $in: sourceIds },
+      })
+        .select("sourceTradeId status tradeResult")
+        .lean(),
+      Trade.aggregate<{ _id: mongoose.Types.ObjectId; count: number }>([
+        {
+          $match: {
+            tradeOrigin: "copy",
+            sourceTradeId: { $in: sourceIds },
+          },
+        },
+        { $group: { _id: "$sourceTradeId", count: { $sum: 1 } } },
+      ]),
+    ]);
+
+    const myCopyBySource = new Map(
+      myCopies.map((trade) => [String(trade.sourceTradeId), trade]),
+    );
+    const countBySource = new Map(
+      copierCounts.map((entry) => [String(entry._id), entry.count]),
+    );
+
+    return res.status(200).json({
+      success: true,
+      trades: trades.map((trade) => ({
+        ...trade,
+        copiers: countBySource.get(String(trade._id)) ?? 0,
+        myTrade: myCopyBySource.get(String(trade._id)) ?? null,
+      })),
+    });
+  } catch (err) {
+    console.error("[getActiveProTrades]", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch active pro trades.",
+    });
+  }
+}
+
+export async function getProTradeById(req: Request, res: Response) {
+  try {
+    const { tradeId } = req.params;
+    if (!mongoose.isValidObjectId(tradeId)) {
+      return res.status(400).json({ success: false, message: "Invalid trade ID." });
+    }
+
+    const trade = await Trade.findOne({
+      _id: tradeId,
+      tradeOrigin: "pro",
+      status: { $in: ["pending", "filled"] },
+    })
+      .populate("userId", "firstName lastName traderID profilePhoto")
+      .populate("signalId", "notes")
+      .lean();
+
+    if (!trade) {
+      return res.status(404).json({ success: false, message: "Active pro trade not found." });
+    }
+
+    return res.status(200).json({ success: true, trade });
+  } catch (err) {
+    console.error("[getProTradeById]", err);
+    return res.status(500).json({ success: false, message: "Failed to fetch trade." });
+  }
+}
 import mongoose from "mongoose";
 
 //GET  all active signals.

@@ -25,6 +25,19 @@ const tradeSchema = new Schema(
       ref: "Signal",
       required: true,
     },
+    tradeOrigin: {
+      type: String,
+      enum: ["pro", "copy"],
+      default: "copy",
+      required: true,
+      index: true,
+    },
+    sourceTradeId: {
+      type: Schema.Types.ObjectId,
+      ref: "Trade",
+      default: null,
+      index: true,
+    },
     // References ExchangeConnection, not a raw exchange name
     exchangeConnectionId: {
       type: Schema.Types.ObjectId,
@@ -131,6 +144,14 @@ const tradeSchema = new Schema(
 
 // Prevent duplicate trades for the same signal on the same exchange connection
 tradeSchema.index({ signalId: 1, exchangeConnectionId: 1 }, { unique: true });
+
+tradeSchema.index(
+  { sourceTradeId: 1, exchangeConnectionId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { sourceTradeId: { $type: "objectId" } },
+  },
+);
 
 tradeSchema.index({ userId: 1, status: 1, createdAt: -1 });
 

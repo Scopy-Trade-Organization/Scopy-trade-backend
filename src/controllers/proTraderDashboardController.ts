@@ -1,8 +1,42 @@
 import { Request, Response } from "express";
 import AuditLog from "../models/auditLogModel.js";
 import { Signal } from "../models/signalModel.js";
+import { Trade } from "../models/tradeModel.js";
 import User from "../models/userModel.js";
 import { TronWeb } from "tronweb";
+
+export const getProTrades = async (req: Request, res: Response) => {
+  try {
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const limit = 10;
+    const filter = { userId: req.user, tradeOrigin: "pro" as const };
+    const [trades, total] = await Promise.all([
+      Trade.find(filter)
+        .populate("signalId", "notes")
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .skip((page - 1) * limit)
+        .lean(),
+      Trade.countDocuments(filter),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      message: "Trades retrieved successfully",
+      trades,
+      page,
+      limit,
+      pageSize: trades.length,
+      pages: Math.max(Math.ceil(total / limit), 1),
+    });
+  } catch (error) {
+    console.error("Error fetching pro trades:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch trades",
+    });
+  }
+};
 
 export const createSignal = async (req: Request, res: Response) => {
   try {

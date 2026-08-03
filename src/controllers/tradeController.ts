@@ -38,6 +38,7 @@ export async function fetchExchangeBalances(req: Request, res: Response) {
 
     if (!connections.length) {
       const response = {
+        success: true,
         balances: [],
         message: "No active exchange connections found.",
       };
@@ -111,7 +112,7 @@ export async function fetchExchangeBalances(req: Request, res: Response) {
       };
     });
 
-    const response = { balances };
+    const response = { success: true, balances };
     console.info("[fetchExchangeBalances] response", response);
     return res.status(200).json(response);
   } catch (err) {
@@ -126,22 +127,35 @@ export async function fetchExchangeBalances(req: Request, res: Response) {
 export async function initiateTrade(req: Request, res: Response) {
   try {
     const userId = req.user as mongoose.Types.ObjectId;
-    const { signalId, exchangeConnectionId, balance } = req.body;
+    const isProTrade = res.locals.tradeOrigin === "pro";
+    const {
+      sourceTradeId,
+      exchangeConnectionId,
+      balance,
+      pair,
+      tp,
+      sl,
+      direction,
+      entry,
+      notes,
+    } = req.body;
 
     // ── 1. Input validation ──────────────────────────────────────────────────
-    if (!signalId || !exchangeConnectionId || !balance) {
+    if (!exchangeConnectionId || !balance || (!isProTrade && !sourceTradeId)) {
       return res.status(400).json({
-        success: true,
-        message: "signalId, exchangeConnectionId, and balance are required.",
+        success: false,
+        message: isProTrade
+          ? "exchangeConnectionId and balance are required."
+          : "sourceTradeId, exchangeConnectionId, and balance are required.",
       });
     }
 
     if (
-      !mongoose.isValidObjectId(signalId) ||
+      (!isProTrade && !mongoose.isValidObjectId(sourceTradeId)) ||
       !mongoose.isValidObjectId(exchangeConnectionId)
     ) {
       return res.status(400).json({
-        success: true,
+        success: false,
         message: "Invalid ID format.",
       });
     }
@@ -149,23 +163,77 @@ export async function initiateTrade(req: Request, res: Response) {
     const parsedBalance = parseFloat(balance);
     if (isNaN(parsedBalance) || parsedBalance <= 0) {
       return res.status(400).json({
-        success: true,
+        success: false,
         message: "balance must be a positive number.",
       });
     }
 
     // ── 2. Fetch & validate the signal ───────────────────────────────────────
-    const signal = await Signal.findById(signalId).lean();
+    let signal: any;
+    let signalId: mongoose.Types.ObjectId;
+
+    if (isProTrade) {
+      if (!pair || !tp || !sl || !direction || !entry) {
+        return res.status(400).json({
+          success: false,
+          message: "pair, entry, tp, sl, and direction are required.",
+        });
+      }
+      if (!['buy', 'sell'].includes(direction)) {
+        return res.status(400).json({
+          success: false,
+          message: "direction must be either buy or sell.",
+        });
+      }
+
+      signal = new Signal({
+        pair,
+        tp,
+        sl,
+        entry,
+        direction,
+        notes,
+        trader: userId,
+      });
+      signalId = signal._id;
+    } else {
+      const sourceTrade = await Trade.findOne({
+        _id: sourceTradeId,
+        tradeOrigin: "pro",
+        status: { $in: ["pending", "filled"] },
+      }).lean();
+
+      if (!sourceTrade) {
+        return res.status(404).json({
+          success: false,
+          message: "Active pro trade not found.",
+        });
+      }
+
+      signalId = sourceTrade.signalId;
+      const template = await Signal.findById(signalId).lean();
+      signal = template
+        ? {
+            ...template,
+            pair: sourceTrade.pair,
+            direction: sourceTrade.direction,
+            entry: sourceTrade.entryFillPrice ?? sourceTrade.entryPrice,
+            tp: sourceTrade.tp,
+            sl: sourceTrade.sl,
+          }
+        : null;
+    }
+
     if (!signal) {
       return res.status(404).json({
-        success: true,
-        message: "Signal not found.",
+        success: false,
+        message: "The pro trade execution template was not found.",
       });
     }
-    if (signal.status !== "active") {
+    if (!isProTrade && signal.status !== "active") {
       return res.status(409).json({
-        success: true,
-        message: "This signal is no longer active and cannot be copied.",
+        success: false,
+        message: "This pro trade is no longer active and cannot be copied.",
       });
     }
 
@@ -202,16 +270,15 @@ export async function initiateTrade(req: Request, res: Response) {
     }
 
     // ── 4. Guard against duplicate trade ─────────────────────────────────────
-    const existing = await Trade.findOne({
-      signalId,
-      exchangeConnectionId,
-    }).lean();
+    const existing = isProTrade
+      ? null
+      : await Trade.findOne({ sourceTradeId, exchangeConnectionId }).lean();
 
     if (existing) {
       return res.status(409).json({
-        success: true,
+        success: false,
         message:
-          "You have already initiated a trade for this signal on this exchange.",
+          "You have already copied this pro trade on this exchange.",
         trade: { _id: existing._id, status: existing.status },
       });
     }
@@ -354,6 +421,10 @@ export async function initiateTrade(req: Request, res: Response) {
     }
 
     // ── 7. Persist trade record ──────────────────────────────────────────────
+    if (isProTrade) {
+      await signal.save();
+    }
+
     const trade = await Trade.create({
       userId,
       pair: signal.pair,
@@ -361,6 +432,8 @@ export async function initiateTrade(req: Request, res: Response) {
       tp: placed.execution?.tp ?? String(executionTpPrice),
       sl: placed.execution?.sl ?? String(executionSlPrice),
       signalId,
+      tradeOrigin: isProTrade ? "pro" : "copy",
+      sourceTradeId: isProTrade ? null : sourceTradeId,
       exchangeConnectionId,
       exchangeOrderId: placed.orderId,
       exchangeClientOrderId,
@@ -401,7 +474,10 @@ export async function initiateTrade(req: Request, res: Response) {
     }
 
     return res.status(201).json({
-      message: "Trade initiated successfully.",
+      success: true,
+      message: isProTrade
+        ? "Pro trade opened successfully."
+        : "Copy trade initiated successfully.",
       trade: {
         _id: trade._id,
         pair: trade.pair,
@@ -411,6 +487,8 @@ export async function initiateTrade(req: Request, res: Response) {
         sl: trade.sl,
         quantity: trade.quantity,
         status: trade.status,
+        tradeOrigin: trade.tradeOrigin,
+        sourceTradeId: trade.sourceTradeId,
         exchangeOrderId: trade.exchangeOrderId,
         createdAt: trade.createdAt,
       },
@@ -545,18 +623,18 @@ function resolveTradeResult(
 export async function previewTrade(req: Request, res: Response) {
   try {
     const userId = req.user as mongoose.Types.ObjectId;
-    const { signalId, exchangeConnectionId, balance } = req.body;
+    const { sourceTradeId, exchangeConnectionId, balance } = req.body;
 
     // ── 1. Input validation ──────────────────────────────────────────────────
-    if (!signalId || !exchangeConnectionId || !balance) {
+    if (!sourceTradeId || !exchangeConnectionId || !balance) {
       return res.status(400).json({
         success: false,
-        message: "signalId, exchangeConnectionId, and balance are required.",
+        message: "sourceTradeId, exchangeConnectionId, and balance are required.",
       });
     }
 
     if (
-      !mongoose.isValidObjectId(signalId) ||
+      !mongoose.isValidObjectId(sourceTradeId) ||
       !mongoose.isValidObjectId(exchangeConnectionId)
     ) {
       return res.status(400).json({
@@ -574,7 +652,29 @@ export async function previewTrade(req: Request, res: Response) {
     }
 
     // ── 2. Fetch & validate signal ───────────────────────────────────────────
-    const signal = await Signal.findById(signalId).lean();
+    const sourceTrade = await Trade.findOne({
+      _id: sourceTradeId,
+      tradeOrigin: "pro",
+      status: { $in: ["pending", "filled"] },
+    }).lean();
+    if (!sourceTrade) {
+      return res.status(404).json({
+        success: false,
+        message: "Active pro trade not found.",
+      });
+    }
+
+    const template = await Signal.findById(sourceTrade.signalId).lean();
+    const signal = template
+      ? {
+          ...template,
+          pair: sourceTrade.pair,
+          direction: sourceTrade.direction,
+          entry: sourceTrade.entryFillPrice ?? sourceTrade.entryPrice,
+          tp: sourceTrade.tp,
+          sl: sourceTrade.sl,
+        }
+      : null;
     if (!signal) {
       return res.status(404).json({ success: false, message: "Signal not found." });
     }

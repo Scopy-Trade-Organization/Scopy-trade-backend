@@ -15,21 +15,28 @@ const tradeRouter = Router();
 
 // All trade routes require authentication
 tradeRouter.use(userAuthenticate);
-tradeRouter.use(requireRole(["CopyTrader"]));
 
 // Preview trade — calculates position sizing without placing an order
-tradeRouter.post("/preview", previewTrade);
+tradeRouter.post("/preview", requireRole(["CopyTrader"]), previewTrade);
 
 // Initiates a copy trade for the authenticated user:
-tradeRouter.post("/", initiateTrade);
+tradeRouter.post("/", requireRole(["CopyTrader"]), initiateTrade);
 
 // GET User Trades
-tradeRouter.get("/", getUserTrades);
+tradeRouter.get("/", requireRole(["CopyTrader", "Pro Trader"]), getUserTrades);
 
 // GET User exchange balances for all connected accounts
-tradeRouter.get("/balances", fetchExchangeBalances);
+tradeRouter.get(
+  "/balances",
+  requireRole(["CopyTrader", "Pro Trader"]),
+  fetchExchangeBalances,
+);
 
 // Returns a single trade with populated signal and exchange connection info.
-tradeRouter.get("/:tradeId", getTradeById);
+tradeRouter.get(
+  "/:tradeId",
+  requireRole(["CopyTrader", "Pro Trader"]),
+  getTradeById,
+);
 
 export default tradeRouter;

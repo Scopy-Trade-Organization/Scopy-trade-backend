@@ -6,6 +6,8 @@ import {
 import {
   getSignalById,
   getActiveSignals,
+  getActiveProTrades,
+  getProTradeById,
 } from "../controllers/copyTraderDashboardController.js";
 
 const copyTraderDashboardRouter = Router();
@@ -17,5 +19,8 @@ copyTraderDashboardRouter.use(requireRole(["CopyTrader"]));
 copyTraderDashboardRouter.get("/signals", getActiveSignals);
 
 copyTraderDashboardRouter.get("/signals/:signalId", getSignalById);
+
+copyTraderDashboardRouter.get("/trades", getActiveProTrades);
+copyTraderDashboardRouter.get("/trades/:tradeId", getProTradeById);
 
 export default copyTraderDashboardRouter;

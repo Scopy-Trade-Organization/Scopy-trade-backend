@@ -97,7 +97,9 @@ export async function processTradeClose(
   let platformFee = 0;
   let feeStatus: "pending" | "waived" = "waived";
 
-  if (tradeResult === "profit") {
+  // Pro trades are the source strategy. Performance fees apply only to
+  // copy-trader positions opened from that strategy.
+  if (trade.tradeOrigin === "copy" && tradeResult === "profit") {
     platformFee = pnl * PLATFORM_FEE_PERCENT;
     feeStatus = "pending";
   }
