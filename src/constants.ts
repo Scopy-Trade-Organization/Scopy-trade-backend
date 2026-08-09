@@ -17,4 +17,6 @@ export const DEFAULT_MAX_ENTRY_DEVIATION = 0.02;
 
 // ─── Platform Fees ──────────────────────────────────────────────────────────
 // Percentage of realized profit taken as platform fee.
-export const PLATFORM_FEE_PERCENT = 0.10;
+export const PLATFORM_FEE_PERCENT = 0.20;
+export const PLATFORM_SHARE_PERCENT = 0.15;
+export const PRO_TRADER_SHARE_PERCENT = 0.05;

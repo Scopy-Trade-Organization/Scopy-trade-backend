@@ -153,11 +153,38 @@ const tradeSchema = new Schema(
       type: String,
       default: null,
     },
-    feeStatus: {
+    platformShare: {
       type: String,
-      enum: ["pending", "collected", "waived", null],
       default: null,
     },
+    proTraderShare: {
+      type: String,
+      default: null,
+    },
+    feeStatus: {
+      type: String,
+      enum: ["pending", "processing", "collected", "failed", "waived", null],
+      default: null,
+    },
+    settlementNetwork: { type: String, default: null },
+    settlementAddress: { type: String, default: null },
+    settlementTransactionId: { type: String, default: null },
+    settlementError: { type: String, default: null },
+    settlementStartedAt: { type: Date, default: null },
+    settlementCompletedAt: { type: Date, default: null },
+    proTraderCreditStatus: {
+      type: String,
+      enum: ["pending", "credited", "waived", null],
+      default: null,
+    },
+    proTraderCreditedAt: { type: Date, default: null },
+    parameterSyncStatus: {
+      type: String,
+      enum: ["pending", "synced", "failed", null],
+      default: null,
+    },
+    parameterSyncError: { type: String, default: null },
+    parameterSyncedAt: { type: Date, default: null },
   },
   { timestamps: true },
 );

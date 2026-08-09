@@ -528,7 +528,9 @@ export async function getUserTrades(req: Request, res: Response) {
     const { status, page = "1", limit = "20" } = req.query;
 
     const filter: Record<string, unknown> = { userId };
-    if (status) filter.status = status;
+    if (status === "active") filter.status = { $in: ["pending", "filled"] };
+    else if (status === "history") filter.status = { $in: ["closed", "cancelled", "failed"] };
+    else if (status) filter.status = status;
 
     const pageNum = Math.max(1, parseInt(String(page), 10));
     const limitNum = Math.min(100, Math.max(1, parseInt(String(limit), 10)));
@@ -538,6 +540,11 @@ export async function getUserTrades(req: Request, res: Response) {
       Trade.find(filter)
         .populate("signalId", "pair direction entry tp sl trader")
         .populate("exchangeConnectionId", "exchange label")
+        .populate({
+          path: "sourceTradeId",
+          select: "userId pair",
+          populate: { path: "userId", select: "firstName lastName traderID profilePhoto" },
+        })
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limitNum)
@@ -546,6 +553,7 @@ export async function getUserTrades(req: Request, res: Response) {
     ]);
 
     return res.status(200).json({
+      success: true,
       trades,
       pagination: {
         total,
@@ -581,7 +589,22 @@ export async function getTradeById(req: Request, res: Response) {
       return res.status(404).json({ message: "Trade not found." });
     }
 
-    return res.status(200).json({ trade });
+    let copyStats = null;
+    if (trade.tradeOrigin === "pro") {
+      const [stats] = await Trade.aggregate([
+        { $match: { tradeOrigin: "copy", sourceTradeId: trade._id } },
+        {
+          $group: {
+            _id: "$sourceTradeId",
+            total: { $sum: 1 },
+            active: { $sum: { $cond: [{ $in: ["$status", ["pending", "filled"]] }, 1, 0] } },
+            profitable: { $sum: { $cond: [{ $eq: ["$tradeResult", "profit"] }, 1, 0] } },
+          },
+        },
+      ]);
+      copyStats = stats ?? { total: 0, active: 0, profitable: 0 };
+    }
+    return res.status(200).json({ success: true, trade: { ...trade, copyStats } });
   } catch (err) {
     console.error("[getTradeById]", err);
     return res.status(500).json({ message: "Failed to fetch trade." });

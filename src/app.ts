@@ -17,6 +17,7 @@ import adminAuthRouter from "./routes/adminAuthRoutes.js";
 import { sanitize } from "./middleware/mongodbSantizer.js";
 import proTraderDashboardRouter from "./routes/proTraderDashboardRoutes.js";
 import copyTraderDashboardRouter from "./routes/copyTraderDashboardRoutes.js";
+import { resumePendingProfitSettlements } from "./services/profitSharingService.js";
 // import "./config/passport.js";
 
 // Rate limiting configuration
@@ -43,6 +44,7 @@ const tradeMonitor = getTradeMonitorService();
 export async function initializeTradeMonitoring(): Promise<void> {
   await tradeMonitor.resumeActiveMonitoring();
   tradeMonitor.startBackgroundReconciliation();
+  await resumePendingProfitSettlements();
   console.log("[App] Trade monitor resumed active monitoring");
 }
 

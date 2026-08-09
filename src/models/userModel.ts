@@ -79,6 +79,11 @@ const userSchema = new Schema(
       type: String,
       trim: true,
     },
+    proEarningsBalance: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
   },
   { timestamps: true },
 );

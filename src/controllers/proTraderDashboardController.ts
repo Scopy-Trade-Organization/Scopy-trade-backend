@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import mongoose from "mongoose";
 import AuditLog from "../models/auditLogModel.js";
 import { Signal } from "../models/signalModel.js";
 import { Trade } from "../models/tradeModel.js";
@@ -12,12 +13,17 @@ import { getTradeMonitorService } from "../services/tradeMonitorService.js";
 import { ExchangeId } from "../types/index.js";
 import User from "../models/userModel.js";
 import { TronWeb } from "tronweb";
+import { queueCopiedTradeUpdate } from "../services/copiedTradeUpdateService.js";
 
 export const getProTrades = async (req: Request, res: Response) => {
   try {
     const page = Math.max(Number(req.query.page) || 1, 1);
-    const limit = 10;
-    const filter = { userId: req.user, tradeOrigin: "pro" as const };
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+    const requestedStatus = String(req.query.status || "all");
+    const filter: Record<string, unknown> = { userId: req.user, tradeOrigin: "pro" };
+    if (requestedStatus === "active") filter.status = { $in: ["pending", "filled"] };
+    else if (requestedStatus === "history") filter.status = { $in: ["closed", "cancelled", "failed"] };
+    else if (requestedStatus !== "all") filter.status = requestedStatus;
     const [trades, total] = await Promise.all([
       Trade.find(filter)
         .populate("signalId", "notes")
@@ -29,10 +35,39 @@ export const getProTrades = async (req: Request, res: Response) => {
       Trade.countDocuments(filter),
     ]);
 
+    const tradeIds = trades.map((trade) => trade._id);
+    const copyStats = await Trade.aggregate<{
+      _id: mongoose.Types.ObjectId;
+      total: number;
+      active: number;
+      profitable: number;
+      copiedVolume: number;
+    }>([
+      { $match: { tradeOrigin: "copy", sourceTradeId: { $in: tradeIds } } },
+      {
+        $group: {
+          _id: "$sourceTradeId",
+          total: { $sum: 1 },
+          active: { $sum: { $cond: [{ $in: ["$status", ["pending", "filled"]] }, 1, 0] } },
+          profitable: { $sum: { $cond: [{ $eq: ["$tradeResult", "profit"] }, 1, 0] } },
+          copiedVolume: { $sum: { $convert: { input: "$quantity", to: "double", onError: 0, onNull: 0 } } },
+        },
+      },
+    ]);
+    const statsByTrade = new Map(copyStats.map((item) => [String(item._id), item]));
+
     return res.status(200).json({
       success: true,
       message: "Trades retrieved successfully",
-      trades,
+      trades: trades.map((trade) => ({
+        ...trade,
+        copyStats: statsByTrade.get(String(trade._id)) ?? {
+          total: 0,
+          active: 0,
+          profitable: 0,
+          copiedVolume: 0,
+        },
+      })),
       page,
       limit,
       pageSize: trades.length,
@@ -212,6 +247,10 @@ export const updateProTrade = async (req: Request, res: Response) => {
       { $set: { entry: trade.entryPrice, tp: trade.tp, sl: trade.sl } },
     );
 
+    if (tpChanged || slChanged) {
+      queueCopiedTradeUpdate(String(trade._id), { tp: trade.tp, sl: trade.sl });
+    }
+
     const monitor = getTradeMonitorService();
     await monitor.stopMonitoring(String(trade._id));
     await monitor.startMonitoring(String(trade._id));
@@ -235,7 +274,7 @@ export const updateProTrade = async (req: Request, res: Response) => {
 
     return res.status(200).json({
       success: true,
-      message: "Trade parameters updated successfully.",
+      message: "Trade parameters updated successfully. Copied positions are syncing in the background.",
       trade: {
         ...trade.toObject(),
         exchangeConnectionId: {

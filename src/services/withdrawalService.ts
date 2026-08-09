@@ -4,6 +4,93 @@ import { http, normalizeError } from "./exchangeConnectionService.js";
 
 const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
 
+export type UsdtNetwork = "TRON" | "ETHEREUM" | "BSC" | "POLYGON" | "ARBITRUM";
+
+// Demo destinations requested for this implementation. Replace these before
+// enabling live settlement; dry-run mode is the safe default.
+export const PLATFORM_USDT_WALLETS: Record<UsdtNetwork, string> = {
+  TRON: "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE",
+  ETHEREUM: "0x1111111111111111111111111111111111111111",
+  BSC: "0x2222222222222222222222222222222222222222",
+  POLYGON: "0x3333333333333333333333333333333333333333",
+  ARBITRUM: "0x4444444444444444444444444444444444444444",
+};
+
+export function getPlatformWallet(): { network: UsdtNetwork; address: string } {
+  const requested = process.env.PLATFORM_USDT_NETWORK?.toUpperCase() as UsdtNetwork;
+  const network = requested in PLATFORM_USDT_WALLETS ? requested : "TRON";
+  return { network, address: PLATFORM_USDT_WALLETS[network] };
+}
+
+const networkCodes: Record<UsdtNetwork, { binance: string; bybit: string }> = {
+  TRON: { binance: "TRX", bybit: "TRX" },
+  ETHEREUM: { binance: "ETH", bybit: "ETH" },
+  BSC: { binance: "BSC", bybit: "BSC" },
+  POLYGON: { binance: "MATIC", bybit: "MATIC" },
+  ARBITRUM: { binance: "ARBITRUM", bybit: "ARBI" },
+};
+
+async function withdrawBinance(
+  credentials: RawCredentials,
+  amount: string,
+  destinationAddress: string,
+  network: UsdtNetwork,
+  requestId: string,
+): Promise<{ transactionId: string; raw: any }> {
+  const timestamp = Date.now();
+  const query = new URLSearchParams({
+    coin: "USDT",
+    address: destinationAddress,
+    amount,
+    network: networkCodes[network].binance,
+    withdrawOrderId: requestId,
+    timestamp: String(timestamp),
+  }).toString();
+  const signature = crypto.createHmac("sha256", credentials.apiSecret).update(query).digest("hex");
+  const baseUrl = process.env.BINANCE_SPOT_API_URL || "https://api.binance.com";
+  const { data } = await http.post(`${baseUrl}/sapi/v1/capital/withdraw/apply?${query}&signature=${signature}`, null, {
+    headers: { "X-MBX-APIKEY": credentials.apiKey },
+  });
+  return { transactionId: String(data.id || requestId), raw: data };
+}
+
+async function withdrawBybit(
+  credentials: RawCredentials,
+  amount: string,
+  destinationAddress: string,
+  network: UsdtNetwork,
+  requestId: string,
+): Promise<{ transactionId: string; raw: any }> {
+  const timestamp = Date.now().toString();
+  const recvWindow = "5000";
+  const body = JSON.stringify({
+    coin: "USDT",
+    chain: networkCodes[network].bybit,
+    address: destinationAddress,
+    amount,
+    timestamp: Number(timestamp),
+    forceChain: 1,
+    accountType: "FUND",
+    requestId,
+  });
+  const signature = crypto
+    .createHmac("sha256", credentials.apiSecret)
+    .update(timestamp + credentials.apiKey + recvWindow + body)
+    .digest("hex");
+  const baseUrl = process.env.BYBIT_API_URL || "https://api.bybit.com";
+  const { data } = await http.post(`${baseUrl}/v5/asset/withdraw/create`, body, {
+    headers: {
+      "X-BAPI-API-KEY": credentials.apiKey,
+      "X-BAPI-SIGN": signature,
+      "X-BAPI-TIMESTAMP": timestamp,
+      "X-BAPI-RECV-WINDOW": recvWindow,
+      "Content-Type": "application/json",
+    },
+  });
+  if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit withdrawal failed.");
+  return { transactionId: String(data.result?.id || requestId), raw: data };
+}
+
 async function withdrawBitget(
   credentials: RawCredentials,
   amount: string,
@@ -123,14 +210,27 @@ export async function withdrawUsdt(
   credentials: RawCredentials,
   amount: string,
   destinationAddress: string,
+  network: UsdtNetwork = "TRON",
+  requestId: string = crypto.randomUUID(),
 ): Promise<{ transactionId: string; raw: any }> {
   try {
+    if (process.env.PROFIT_WITHDRAWAL_MODE !== "live") {
+      return {
+        transactionId: `dry-run-${requestId}`,
+        raw: { mode: "dry-run", exchange, amount, destinationAddress, network },
+      };
+    }
+    if (exchange === "binance") {
+      return await withdrawBinance(credentials, amount, destinationAddress, network, requestId);
+    } else if (exchange === "bybit") {
+      return await withdrawBybit(credentials, amount, destinationAddress, network, requestId);
+    }
     if (exchange === "okx") {
       return await withdrawOkx(credentials, amount, destinationAddress);
     } else if (exchange === "bitget") {
       return await withdrawBitget(credentials, amount, destinationAddress);
     } else {
-      throw new Error(`Withdrawal is only supported for OKX and Bitget.`);
+      throw new Error(`Withdrawal is not supported for ${exchange}.`);
     }
   } catch (err) {
     const error = normalizeError(err);
