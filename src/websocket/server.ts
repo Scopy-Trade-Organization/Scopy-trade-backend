@@ -12,6 +12,7 @@ import { IncomingMessage } from "http";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import { Trade } from "../models/tradeModel.js";
+import Admin from "../models/adminModel.js";
 import { getTradeMonitorService } from "../services/tradeMonitorService.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -19,6 +20,7 @@ import { getTradeMonitorService } from "../services/tradeMonitorService.js";
 interface WebSocketClient {
   ws: WebSocket;
   userId: string;
+  isAdmin: boolean;
   isAuthenticated: boolean;
   subscribedTrades: Set<string>;
 }
@@ -77,12 +79,15 @@ export class TradeWebSocketServer {
         return;
       }
 
-      const token = readCookie(req.headers.cookie, "user_token");
+      const userToken = readCookie(req.headers.cookie, "user_token");
+      const adminToken = readCookie(req.headers.cookie, "admin_token");
 
       // Authenticate via JWT
       let userId: string | null = null;
+      let isAdmin = false;
 
       try {
+        const token = userToken || adminToken;
         if (!token) throw new Error("Authentication cookie is missing.");
 
         const secret = process.env.JWT_SECRET;
@@ -92,6 +97,11 @@ export class TradeWebSocketServer {
         if (!decoded?.id) throw new Error("Invalid token payload.");
 
         userId = decoded.id;
+        if (adminToken && !userToken) {
+          const admin = await Admin.exists({ _id: userId });
+          if (!admin) throw new Error("Admin not found.");
+          isAdmin = true;
+        }
       } catch (err) {
         ws.send(
           JSON.stringify({
@@ -108,20 +118,22 @@ export class TradeWebSocketServer {
       }
 
       // Close existing connection for this user if any
-      const existing = this.clients.get(userId);
+      const clientKey = `${isAdmin ? "admin" : "user"}:${userId}`;
+      const existing = this.clients.get(clientKey);
       if (existing) {
         existing.ws.close(1000, "New connection established");
-        this.clients.delete(userId);
+        this.clients.delete(clientKey);
       }
 
       const client: WebSocketClient = {
         ws,
         userId,
+        isAdmin,
         isAuthenticated: true,
         subscribedTrades: new Set(),
       };
 
-      this.clients.set(userId, client);
+      this.clients.set(clientKey, client);
 
       // Send connection acknowledgment
       this.sendToClient(client, {
@@ -146,13 +158,13 @@ export class TradeWebSocketServer {
       });
 
       ws.on("close", () => {
-        this.clients.delete(userId!);
+        this.clients.delete(clientKey);
         console.log(`[WebSocketServer] Client disconnected: ${userId}`);
       });
 
       ws.on("error", (err: Error) => {
         console.error(`[WebSocketServer] Client error ${userId}:`, err);
-        this.clients.delete(userId!);
+        this.clients.delete(clientKey);
       });
 
       // Ping keepalive every 30 seconds
@@ -184,6 +196,8 @@ export class TradeWebSocketServer {
           status: data.status,
           filledPrice: data.filledPrice,
           filledQuantity: data.filledQuantity,
+          tp: data.tp,
+          sl: data.sl,
           timestamp: data.timestamp,
         },
       });
@@ -253,13 +267,17 @@ export class TradeWebSocketServer {
     }
 
     // Users may monitor their own trades and active public pro trades.
-    const trade = await Trade.findOne({
-      _id: tradeId,
-      $or: [
-        { userId: client.userId },
-        { tradeOrigin: "pro", status: { $in: ["pending", "filled"] } },
-      ],
-    }).lean();
+    const trade = await Trade.findOne(
+      client.isAdmin
+        ? { _id: tradeId }
+        : {
+            _id: tradeId,
+            $or: [
+              { userId: client.userId },
+              { tradeOrigin: "pro", status: { $in: ["pending", "filled"] } },
+            ],
+          },
+    ).lean();
 
     if (!trade) {
       this.sendToClient(client, {
@@ -315,10 +333,11 @@ export class TradeWebSocketServer {
   }
 
   private async sendActiveTrades(client: WebSocketClient): Promise<void> {
-    const trades = await Trade.find({
-      userId: client.userId,
-      status: { $in: ["pending", "filled"] },
-    })
+    const trades = await Trade.find(
+      client.isAdmin
+        ? { status: { $in: ["pending", "filled"] } }
+        : { userId: client.userId, status: { $in: ["pending", "filled"] } },
+    )
       .sort({ createdAt: -1 })
       .limit(50)
       .lean();

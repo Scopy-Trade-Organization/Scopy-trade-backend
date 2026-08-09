@@ -76,6 +76,14 @@ async function updateOneCopiedTrade(tradeId: string, parameters: ProtectionUpdat
     const monitor = getTradeMonitorService();
     await monitor.stopMonitoring(String(trade._id));
     await monitor.startMonitoring(String(trade._id));
+    monitor.emit("tradeUpdate", {
+      tradeId: String(trade._id),
+      exchangeOrderId: trade.exchangeOrderId,
+      status: trade.status,
+      tp: trade.tp,
+      sl: trade.sl,
+      timestamp: new Date(),
+    });
   } catch (error) {
     await Trade.updateOne(
       { _id: tradeId },

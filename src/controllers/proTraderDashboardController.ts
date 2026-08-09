@@ -254,6 +254,14 @@ export const updateProTrade = async (req: Request, res: Response) => {
     const monitor = getTradeMonitorService();
     await monitor.stopMonitoring(String(trade._id));
     await monitor.startMonitoring(String(trade._id));
+    monitor.emit("tradeUpdate", {
+      tradeId: String(trade._id),
+      exchangeOrderId: trade.exchangeOrderId,
+      status: trade.status,
+      tp: trade.tp,
+      sl: trade.sl,
+      timestamp: new Date(),
+    });
 
     await AuditLog.create({
       userId: req.user,
