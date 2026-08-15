@@ -33,6 +33,10 @@ const userSchema = new Schema(
       enum: ["CopyTrader", "Pro Trader"],
       default: "CopyTrader",
     },
+    sponsored: {
+      type: Boolean,
+      default: false,
+    },
     traderID: {
       type: String,
       unique: true,
@@ -58,8 +62,8 @@ const userSchema = new Schema(
     },
     status: {
       type: String,
-      enum: ["active", "suspended"],
-      default: "active",
+      enum: ["active", "suspended", "waitlist"],
+      default: "waitlist",
     },
     isVerified: {
       type: Boolean,

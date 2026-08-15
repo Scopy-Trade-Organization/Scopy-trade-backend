@@ -22,8 +22,15 @@ export const registerUser = async (
   res: Response,
 ) => {
   try {
-    const { firstName, lastName, email, password, role, confirmPassword } =
-      req.body;
+    const {
+      firstName,
+      lastName,
+      email,
+      password,
+      role,
+      confirmPassword,
+      sponsored,
+    } = req.body;
 
     // Validate user input
     if (
@@ -61,6 +68,18 @@ export const registerUser = async (
         status: "fail",
         message:
           "Password must be at least 8 characters and include an uppercase letter, number, and symbol",
+      });
+    }
+
+    if (sponsored && role !== "CopyTrader") {
+      return res.status(400).json({
+        status: "fail",
+        message: "Only CopyTraders can be sponsored",
+      });
+    } else if (sponsored !== undefined && typeof sponsored !== "boolean") {
+      return res.status(400).json({
+        status: "fail",
+        message: "Invalid value for sponsored field",
       });
     }
 
@@ -102,6 +121,7 @@ export const registerUser = async (
       firstName,
       lastName,
       role,
+      sponsored,
       traderID:
         role === "CopyTrader" ? generateCopyTraderID() : generateProTraderID(),
     });

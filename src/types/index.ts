@@ -10,6 +10,7 @@ export interface RegisterRequestBody {
   firstName: string;
   lastName: string;
   email: string;
+  sponsored?: boolean;
   password: string;
   confirmPassword: string;
   role: "CopyTrader" | "Pro Trader";
