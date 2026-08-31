@@ -1,8 +1,14 @@
 import crypto from "crypto";
 import { RawCredentials, ExchangeId } from "../types/index.js";
 import { http, normalizeError } from "./exchangeConnectionService.js";
+import { isBitgetDemo, isOkxDemo } from "./exchangeEnvironment.js";
 
 const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
+
+// A withdrawal moves real funds and must never be silently re-sent by the HTTP
+// layer: a network blip or 5xx after the exchange already accepted the request
+// would double-pay. Disable axios-retry per-request for every withdrawal call.
+const NO_RETRY = { "axios-retry": { retries: 0 } } as const;
 
 export type UsdtNetwork = "TRON" | "ETHEREUM" | "BSC" | "POLYGON" | "ARBITRUM";
 
@@ -50,6 +56,7 @@ async function withdrawBinance(
   const baseUrl = process.env.BINANCE_SPOT_API_URL || "https://api.binance.com";
   const { data } = await http.post(`${baseUrl}/sapi/v1/capital/withdraw/apply?${query}&signature=${signature}`, null, {
     headers: { "X-MBX-APIKEY": credentials.apiKey },
+    ...NO_RETRY,
   });
   return { transactionId: String(data.id || requestId), raw: data };
 }
@@ -86,6 +93,7 @@ async function withdrawBybit(
       "X-BAPI-RECV-WINDOW": recvWindow,
       "Content-Type": "application/json",
     },
+    ...NO_RETRY,
   });
   if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit withdrawal failed.");
   return { transactionId: String(data.result?.id || requestId), raw: data };
@@ -129,13 +137,14 @@ async function withdrawBitget(
     body,
     {
       headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
         "ACCESS-PASSPHRASE": passphrase,
         "Content-Type": "application/json",
       },
+      ...NO_RETRY,
     },
   );
 
@@ -190,8 +199,9 @@ async function withdrawOkx(
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": passphrase,
         "Content-Type": "application/json",
-        "x-simulated-trading": "1",
+        ...(isOkxDemo() ? { "x-simulated-trading": "1" } : {}),
       },
+      ...NO_RETRY,
     },
   );
 

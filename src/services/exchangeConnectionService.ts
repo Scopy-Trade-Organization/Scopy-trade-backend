@@ -11,7 +11,7 @@ import {
   BitgetAccountInfo,
 } from "../types/index.js";
 import axiosRetry from "axios-retry";
-import { getExchangeRestUrl } from "./exchangeEnvironment.js";
+import { getExchangeRestUrl, isBitgetDemo, isOkxDemo } from "./exchangeEnvironment.js";
 
 const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
 
@@ -249,7 +249,7 @@ const validateOkx: Validator<OkxAccountInfo> = async ({
         "OK-ACCESS-SIGN": signature,
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": passphrase,
-        "x-simulated-trading": "1",
+        ...(isOkxDemo() ? { "x-simulated-trading": "1" } : {}),
       },
       timeout: 8000,
     });
@@ -301,7 +301,7 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
 
     const { data } = await http.get<BitgetResponse>(BITGET_BASE_URL + path, {
       headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -312,11 +312,6 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
     });
     if (data.code !== "00000")
       throw new Error(data.msg || "Invalid Bitget API credentials.");
-
-    console.log(
-      "Bitget raw validation response:",
-      JSON.stringify(data, null, 2),
-    );
 
     const info = data.data as any;
     if (!info) throw new Error("Bitget returned an empty response.");

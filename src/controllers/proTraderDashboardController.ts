@@ -13,6 +13,7 @@ import { getTradeMonitorService } from "../services/tradeMonitorService.js";
 import { ExchangeId } from "../types/index.js";
 import User from "../models/userModel.js";
 import { TronWeb } from "tronweb";
+import { isValidTronAddress } from "../helpers/tronAddress.js";
 import { queueCopiedTradeUpdate } from "../services/copiedTradeUpdateService.js";
 
 export const getProTrades = async (req: Request, res: Response) => {
@@ -493,15 +494,13 @@ export const getAllSignals = async (req: Request, res: Response) => {
 
 export const saveWalletAddress = async (req: Request, res: Response) => {
   try {
-    console.log("saveWalletAddress req.body:", req.body);
     const { address } = req.body;
-    
-    console.log("saveWalletAddress address length:", address?.length);
 
-    if (!address || typeof address !== "string" || !address.startsWith("T") || address.length !== 34) {
+    if (!isValidTronAddress(address)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid TRC-20 wallet address. It must be a non-empty string, start with 'T', and be exactly 34 characters long.",
+        message:
+          "Invalid TRC-20 wallet address. Provide a valid Tron (TRC-20) address: 34 characters, starting with 'T', with a correct checksum.",
       });
     }
 
@@ -562,10 +561,27 @@ export const withdrawFunds = async (req: Request, res: Response) => {
   try {
     const { amount } = req.body;
 
-    if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
+    // Reject anything that is not a positive, finite number.
+    const numericAmount = Number(amount);
+    if (
+      amount === undefined ||
+      amount === null ||
+      amount === "" ||
+      !Number.isFinite(numericAmount) ||
+      numericAmount <= 0
+    ) {
       return res.status(400).json({
         success: false,
         message: "A valid amount is required",
+      });
+    }
+
+    // USDT (TRC-20) carries 6 decimals. Reject higher precision so the
+    // base-unit conversion below is always an exact integer.
+    if (!/^\d+(\.\d{1,6})?$/.test(String(amount).trim())) {
+      return res.status(400).json({
+        success: false,
+        message: "Amount must be a positive number with at most 6 decimal places (USDT precision).",
       });
     }
 
@@ -575,48 +591,87 @@ export const withdrawFunds = async (req: Request, res: Response) => {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    if (!user.withdrawalAddress) {
+    if (!isValidTronAddress(user.withdrawalAddress)) {
       return res.status(400).json({
         success: false,
-        message: "No withdrawal address found. Please save your TRC-20 wallet address first.",
+        message: "No valid withdrawal address on file. Please save your TRC-20 wallet address first.",
       });
     }
 
-    // TODO: Validate that the user has sufficient balance in the SCopyTrade system
-    // const hasSufficientBalance = ... 
-    // if (!hasSufficientBalance) return res.status(400).json({ message: "Insufficient balance" });
-
+    // Verify server configuration BEFORE debiting the user, so a
+    // misconfiguration can never strand a balance deduction.
     const privateKey = process.env.TRON_COMPANY_PRIVATE_KEY;
-    if (!privateKey) {
-      return res.status(500).json({ success: false, message: "Server configuration error: Missing Tron private key" });
-    }
-
     const usdtContractAddress = process.env.TRON_USDT_CONTRACT_ADDRESS;
-    if (!usdtContractAddress) {
-      return res.status(500).json({ success: false, message: "Server configuration error: Missing USDT contract address" });
+    if (!privateKey || !usdtContractAddress) {
+      console.error(
+        "Withdrawal blocked: missing TRON_COMPANY_PRIVATE_KEY or TRON_USDT_CONTRACT_ADDRESS.",
+      );
+      return res.status(500).json({
+        success: false,
+        message: "Withdrawal is temporarily unavailable. Please try again later.",
+      });
     }
 
-    const tronHost = process.env.TRON_FULL_HOST || "https://api.trongrid.io";
+    // Atomically authorize and debit the user's earnings balance. The $gte
+    // guard makes this safe under concurrent requests: a second request cannot
+    // overdraw because the conditional update only matches while the funds are
+    // still present. This is the authorization check — without it any Pro
+    // Trader could drain the company wallet.
+    const debited = await User.findOneAndUpdate(
+      { _id: req.user, proEarningsBalance: { $gte: numericAmount } },
+      { $inc: { proEarningsBalance: -numericAmount } },
+      { new: true },
+    );
+    if (!debited) {
+      return res.status(400).json({
+        success: false,
+        message: "Insufficient balance for this withdrawal.",
+      });
+    }
 
-    const tronWeb = new TronWeb({
-      fullHost: tronHost,
-      privateKey: privateKey,
-    });
+    let transactionId: string;
+    try {
+      const tronHost = process.env.TRON_FULL_HOST || "https://api.trongrid.io";
+      const tronWeb = new TronWeb({
+        fullHost: tronHost,
+        privateKey: privateKey,
+      });
 
-    const contract = await tronWeb.contract().at(usdtContractAddress);
-    
-    // Convert amount to USDT decimals (6)
-    const amountInSun = tronWeb.toBigNumber(amount).times(1_000_000).toString(10);
-    
-    const transactionId = await contract.transfer(user.withdrawalAddress, amountInSun).send();
+      const contract = await tronWeb.contract().at(usdtContractAddress);
+
+      // Convert to integer base units (6 decimals). The regex above guarantees
+      // at most 6 decimal places, so this is always a whole number.
+      const amountInBaseUnits = tronWeb
+        .toBigNumber(amount)
+        .times(1_000_000)
+        .toString(10);
+
+      transactionId = await contract
+        .transfer(user.withdrawalAddress, amountInBaseUnits)
+        .send({ feeLimit: 100_000_000 });
+    } catch (txError) {
+      // Broadcast failed — refund the debit so the user is made whole. Note we
+      // deliberately do NOT refund on downstream errors (e.g. audit logging),
+      // which would risk refunding a withdrawal that was actually broadcast.
+      await User.updateOne(
+        { _id: req.user },
+        { $inc: { proEarningsBalance: numericAmount } },
+      );
+      console.error("Error executing withdrawal, balance refunded:", txError);
+      return res.status(502).json({
+        success: false,
+        message: "Withdrawal could not be broadcast to the Tron network. Your balance was not charged.",
+      });
+    }
 
     await AuditLog.create({
       userId: req.user,
       action: "Withdrawal Executed",
       details: {
-        amount,
+        amount: numericAmount,
         destinationAddress: user.withdrawalAddress,
         transactionId,
+        remainingBalance: debited.proEarningsBalance,
       },
       ipAddress: req.ip,
       userAgent: req.headers["user-agent"],
@@ -631,7 +686,7 @@ export const withdrawFunds = async (req: Request, res: Response) => {
     console.error("Error executing withdrawal:", error);
     return res.status(500).json({
       success: false,
-      message: (error as Error).message || "Internal server error",
+      message: "Internal server error",
     });
   }
 };
