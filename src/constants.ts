@@ -2,7 +2,15 @@ import { ExchangeId } from "./types/index.js";
 
 // ─── Supported Trading Pairs ────────────────────────────────────────────────
 // Only these pairs are enabled for development and testing.
-export const SUPPORTED_PAIRS = ["BTCUSDT", "ETHUSDT", "DOGEUSDT"] as const;
+export const SUPPORTED_PAIRS = [
+  "BTCUSDT",
+  "ETHUSDT",
+  "SOLUSDT",
+  "XRPUSDT",
+  "DOGEUSDT",
+  "BNBUSDT",
+  "SUIUSDT",
+] as const;
 export type SupportedPair = (typeof SUPPORTED_PAIRS)[number];
 
 // ─── Supported Exchanges for Trading ────────────────────────────────────────

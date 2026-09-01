@@ -239,7 +239,7 @@ export async function initiateTrade(req: Request, res: Response) {
     }
 
     // ── 2b. Validate trading pair is supported ───────────────────────────────
-    const normalizedPair = signal.pair.toUpperCase().replace(/\//g, "");
+    const normalizedPair = signal.pair.toUpperCase().replace(/[/-]/g, "");
     if (!SUPPORTED_PAIRS.includes(normalizedPair as any)) {
       return res.status(422).json({
         success: false,
@@ -728,7 +728,7 @@ export async function previewTrade(req: Request, res: Response) {
     }
 
     // Pair validation
-    const normalizedPair = signal.pair.toUpperCase().replace(/\//g, "");
+    const normalizedPair = signal.pair.toUpperCase().replace(/[/-]/g, "");
     if (!SUPPORTED_PAIRS.includes(normalizedPair as any)) {
       return res.status(422).json({
         success: false,
