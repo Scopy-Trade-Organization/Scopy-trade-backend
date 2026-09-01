@@ -23,6 +23,7 @@ import { ExchangeId } from "../types/index.js";
 import {
   getExchangeRestUrl,
   getExchangeWebSocketUrl,
+  isOkxDemo,
 } from "./exchangeEnvironment.js";
 import { attachBinanceTpSl, getOrderStatus } from "./tradeService.js";
 
@@ -117,7 +118,7 @@ export class TradeMonitorService extends EventEmitter {
 
     const exchange = connection.exchange as ExchangeId;
 
-    if (exchange !== "binance" && exchange !== "bybit") {
+    if (exchange !== "bybit" && exchange !== "bitget" && exchange !== "okx") {
       const message = `Exchange ${exchange} is not supported for WebSocket monitoring.`;
       await Trade.updateOne(
         { _id: tradeId },
@@ -219,10 +220,12 @@ export class TradeMonitorService extends EventEmitter {
 
     // Connect WS if not already connected
     if (!wsConn!.isConnected && !wsConn!.ws) {
-      if (exchange === "binance") {
-        await this.connectBinance(wsConn!);
-      } else if (exchange === "bybit") {
+      if (exchange === "bybit") {
         await this.connectBybit(wsConn!);
+      } else if (exchange === "bitget") {
+        await this.connectBitget(wsConn!);
+      } else if (exchange === "okx") {
+        await this.connectOkx(wsConn!);
       }
     }
 
@@ -326,10 +329,12 @@ export class TradeMonitorService extends EventEmitter {
               !existing.wsConn.ws &&
               !existing.wsConn.reconnectTimer
             ) {
-              if (existing.wsConn.exchange === "binance") {
-                await this.connectBinance(existing.wsConn);
-              } else if (existing.wsConn.exchange === "bybit") {
+              if (existing.wsConn.exchange === "bybit") {
                 await this.connectBybit(existing.wsConn);
+              } else if (existing.wsConn.exchange === "bitget") {
+                await this.connectBitget(existing.wsConn);
+              } else if (existing.wsConn.exchange === "okx") {
+                await this.connectOkx(existing.wsConn);
               }
             }
             await this.reconcileEntryOrder(existing.wsConn, existing.trade);
@@ -1370,6 +1375,67 @@ export class TradeMonitorService extends EventEmitter {
     const algoIds = matchOrders(algoOrders, "algo");
     if (algoIds.length) return { ids: algoIds, transport: "algo" };
     return { ids: matchOrders(legacyOrders, "legacy"), transport: "legacy" };
+  }
+
+  private async connectOkx(wsConn: ExchangeWsConnection): Promise<void> {
+    const { apiKey, apiSecret, passphrase } = wsConn.credentials;
+    if (!passphrase) throw new Error("OKX requires a passphrase for monitoring.");
+    const url = isOkxDemo()
+      ? "wss://wspap.okx.com:8443/ws/v5/private"
+      : "wss://ws.okx.com:8443/ws/v5/private";
+    const ws = new WebSocket(url);
+    wsConn.ws = ws;
+    ws.on("open", () => {
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const sign = crypto.createHmac("sha256", apiSecret)
+        .update(`${timestamp}GET/users/self/verify`).digest("base64");
+      ws.send(JSON.stringify({ op: "login", args: [{ apiKey, passphrase, timestamp, sign }] }));
+      wsConn.keepaliveTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send("ping");
+      }, 20_000);
+    });
+    ws.on("message", async (raw: WebSocket.Data) => {
+      try {
+        const message = JSON.parse(raw.toString());
+        if (message.event === "login") {
+          if (message.code !== "0") throw new Error(message.msg || "OKX login failed.");
+          wsConn.isConnected = true;
+          wsConn.reconnectAttempts = 0;
+          void this.setConnectionMonitoringState(wsConn, "connected");
+          ws.send(JSON.stringify({ op: "subscribe", args: [{ channel: "orders", instType: "SWAP" }] }));
+          return;
+        }
+        if (message.arg?.channel === "orders" && Array.isArray(message.data)) {
+          for (const order of message.data) await this.handleOkxOrder(wsConn, order);
+        }
+      } catch (err) { console.error("[TradeMonitor][OKX] Message error:", err); }
+    });
+    ws.on("error", (err) => console.error("[TradeMonitor][OKX] WS error:", err));
+    ws.on("close", () => {
+      wsConn.isConnected = false; wsConn.ws = null;
+      if (wsConn.keepaliveTimer) { clearInterval(wsConn.keepaliveTimer); wsConn.keepaliveTimer = null; }
+      if (!this.isShuttingDown && wsConn.activeTrades.size) this.scheduleReconnect(wsConn, () => this.connectOkx(wsConn));
+    });
+  }
+
+  private async handleOkxOrder(wsConn: ExchangeWsConnection, order: any): Promise<void> {
+    const orderId = String(order.ordId || "");
+    const monitored = wsConn.activeTrades.get(orderId) ?? [...wsConn.activeTrades.values()].find((trade) =>
+      trade.pair.replace(/\//g, "").toUpperCase() === String(order.instId || "").replace(/-/g, "").toUpperCase(),
+    );
+    if (!monitored) return;
+    const state = String(order.state || "");
+    const price = String(order.avgPx || order.fillPx || order.px || "");
+    if (state === "filled" && orderId !== monitored.exchangeOrderId && Number(price) > 0) {
+      const closedVia = Math.abs(Number(price) - Number(monitored.tp)) < Math.abs(Number(price) - Number(monitored.sl)) ? "tp" : "sl";
+      const result = await processTradeClose(monitored.tradeId, price, closedVia);
+      this.emit("tradeClosed", result);
+      for (const [id, trade] of wsConn.activeTrades) if (trade.tradeId === monitored.tradeId) wsConn.activeTrades.delete(id);
+      return;
+    }
+    const status = state === "filled" ? "filled" : ["canceled", "mmp_canceled"].includes(state) ? "cancelled" : "pending";
+    await Trade.updateOne({ _id: monitored.tradeId, status: { $in: ["pending", "filled"] } }, { $set: { status, entryFillPrice: status === "filled" ? price : undefined, lastCheckedAt: new Date(), rawStatusResponse: order } });
+    this.emit("tradeUpdate", { tradeId: monitored.tradeId, exchangeOrderId: orderId, exchange: "okx", status, filledPrice: price || null, filledQuantity: order.accFillSz || null, timestamp: new Date(Number(order.uTime) || Date.now()) });
   }
 
   private async connectBitget(wsConn: ExchangeWsConnection): Promise<void> {
