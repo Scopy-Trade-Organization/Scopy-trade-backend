@@ -185,6 +185,9 @@ const tradeSchema = new Schema(
     },
     parameterSyncError: { type: String, default: null },
     parameterSyncedAt: { type: Date, default: null },
+    // Set when the source pro trade has been closed but this copied order could not be closed automatically.
+    sourceTradeClosedAt: { type: Date, default: null },
+    sourceTradeCloseMessage: { type: String, default: null },
   },
   { timestamps: true },
 );

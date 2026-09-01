@@ -64,6 +64,21 @@ export interface AmendTradeResult {
   raw: unknown;
 }
 
+export interface ManualCloseParams {
+  credentials: RawCredentials;
+  pair: string;
+  direction: "buy" | "sell";
+  quantity: string;
+  orderId: string;
+  status: "pending" | "filled";
+}
+
+export interface ManualCloseResult {
+  status: "cancelled" | "closed";
+  exitPrice: string | null;
+  raw: unknown;
+}
+
 // ─── Balance Types ────────────────────────────────────────────────────────────
 
 export interface AssetBalance {
@@ -1251,6 +1266,62 @@ export async function getCurrentPrice(
 ): Promise<CurrentPriceResult> {
   try {
     return await priceFetcher[exchange](pair);
+  } catch (err) {
+    throw normalizeError(err);
+  }
+}
+
+/** Cancels an unfilled entry or submits a reduce-only market exit for a live position. */
+export async function closeTradeOrder(
+  exchange: ExchangeId,
+  params: ManualCloseParams,
+): Promise<ManualCloseResult> {
+  try {
+    const symbol = normalizePairForExchange(exchange, params.pair);
+    const side = params.direction === "buy" ? "sell" : "buy";
+    const baseUrl = getExchangeRestUrl(exchange);
+    const { apiKey, apiSecret, passphrase } = params.credentials;
+
+    if (exchange === "bybit") {
+      const timestamp = await getBybitTimestamp(baseUrl);
+      const recvWindow = "5000";
+      const path = params.status === "pending" ? "/v5/order/cancel" : "/v5/order/create";
+      const body = JSON.stringify(params.status === "pending"
+        ? { category: "linear", symbol, orderId: params.orderId }
+        : { category: "linear", symbol, side: side === "buy" ? "Buy" : "Sell", orderType: "Market", qty: params.quantity, reduceOnly: true, positionIdx: 0 });
+      const signature = crypto.createHmac("sha256", apiSecret)
+        .update(timestamp + apiKey + recvWindow + body).digest("hex");
+      const { data } = await http.post(`${baseUrl}${path}`, body, {
+        headers: { "X-BAPI-API-KEY": apiKey, "X-BAPI-SIGN": signature, "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow, "Content-Type": "application/json" },
+      });
+      if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit manual close failed.");
+      const price = params.status === "filled" ? (await getCurrentPrice(exchange, params.pair)).price : null;
+      return { status: params.status === "pending" ? "cancelled" : "closed", exitPrice: price, raw: data };
+    }
+
+    if (!passphrase) throw new Error(`${exchange.toUpperCase()} requires a passphrase.`);
+    const timestamp = exchange === "okx" ? new Date().toISOString() : Date.now().toString();
+    const path = exchange === "okx"
+      ? (params.status === "pending" ? "/api/v5/trade/cancel-order" : "/api/v5/trade/order")
+      : (params.status === "pending" ? "/api/v2/mix/order/cancel-order" : "/api/v2/mix/order/place-order");
+    const body = JSON.stringify(exchange === "okx"
+      ? (params.status === "pending"
+        ? { instId: symbol, ordId: params.orderId }
+        : { instId: symbol, tdMode: "cross", side, ordType: "market", sz: params.quantity, reduceOnly: true, posSide: "net" })
+      : (params.status === "pending"
+        ? { symbol, productType: "USDT-FUTURES", orderId: params.orderId }
+        : { symbol, productType: "USDT-FUTURES", marginMode: "crossed", marginCoin: "USDT", size: params.quantity, side, tradeSide: "close", orderType: "market", force: "ioc" }));
+    const signature = crypto.createHmac("sha256", apiSecret)
+      .update(timestamp + "POST" + path + body).digest("base64");
+    const { data } = await http.post(`${baseUrl}${path}`, body, {
+      headers: exchange === "okx"
+        ? { "OK-ACCESS-KEY": apiKey, "OK-ACCESS-SIGN": signature, "OK-ACCESS-TIMESTAMP": timestamp, "OK-ACCESS-PASSPHRASE": passphrase, "Content-Type": "application/json", "x-simulated-trading": "1" }
+        : { ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}), "ACCESS-KEY": apiKey, "ACCESS-SIGN": signature, "ACCESS-TIMESTAMP": timestamp, "ACCESS-PASSPHRASE": passphrase, "Content-Type": "application/json" },
+    });
+    const failed = exchange === "okx" ? data.code !== "0" || data.data?.[0]?.sCode !== "0" : data.code !== "00000";
+    if (failed) throw new Error(data.data?.[0]?.sMsg || data.msg || `${exchange.toUpperCase()} manual close failed.`);
+    const price = params.status === "filled" ? (await getCurrentPrice(exchange, params.pair)).price : null;
+    return { status: params.status === "pending" ? "cancelled" : "closed", exitPrice: price, raw: data };
   } catch (err) {
     throw normalizeError(err);
   }

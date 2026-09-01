@@ -6,6 +6,7 @@ import { Trade } from "../models/tradeModel.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import {
   amendTradeOrder,
+  closeTradeOrder,
   getOrderStatus,
 } from "../services/tradeService.js";
 import { decryptCredentials } from "../services/exchangeConnectionService.js";
@@ -14,8 +15,9 @@ import { ExchangeId } from "../types/index.js";
 import User from "../models/userModel.js";
 import { TronWeb } from "tronweb";
 import { isValidTronAddress } from "../helpers/tronAddress.js";
-import { queueCopiedTradeUpdate } from "../services/copiedTradeUpdateService.js";
+import { queueCopiedTradeUpdate, triggerCopiedTradeClosures } from "../services/copiedTradeUpdateService.js";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
+import { processTradeClose } from "../services/profitSharingService.js";
 
 export const getProTrades = async (req: Request, res: Response) => {
   try {
@@ -304,6 +306,96 @@ export const updateProTrade = async (req: Request, res: Response) => {
           ? error.message
           : "Failed to update trade parameters.",
     });
+  }
+};
+
+export const closeProTrade = async (req: Request, res: Response) => {
+  try {
+    const { tradeId } = req.params;
+    const trade = await Trade.findOne({
+      _id: tradeId,
+      userId: req.user,
+      tradeOrigin: "pro",
+      status: { $in: ["pending", "filled"] },
+    });
+    if (!trade) {
+      return res.status(404).json({ success: false, message: "Active pro trade not found." });
+    }
+    if (!trade.exchangeOrderId) {
+      return res.status(409).json({ success: false, message: "This trade has no exchange order to close." });
+    }
+
+    const connection = await ExchangeConnection.findOne({
+      _id: trade.exchangeConnectionId,
+      userId: req.user,
+      isActive: true,
+    }).lean();
+    if (!connection?.encryptedApiKey || !connection.encryptedApiSecret) {
+      return res.status(409).json({ success: false, message: "The exchange connection for this trade is unavailable." });
+    }
+    const exchange = connection.exchange as ExchangeId;
+    const credentials = decryptCredentials({
+      exchange,
+      apiKey: connection.encryptedApiKey,
+      apiSecret: connection.encryptedApiSecret,
+      ...(connection.encryptedPassphrase ? { passphrase: connection.encryptedPassphrase } : {}),
+    });
+    const live = await getOrderStatus(exchange, credentials, trade.pair, trade.exchangeOrderId);
+    if (!['pending', 'filled'].includes(live.status)) {
+      return res.status(409).json({ success: false, message: `The exchange reports this order as ${live.status}; it can no longer be closed manually.` });
+    }
+    const closeStatus = live.status === "filled" ? "filled" : "pending";
+    const result = await closeTradeOrder(exchange, {
+      credentials,
+      pair: trade.pair,
+      direction: trade.direction as "buy" | "sell",
+      quantity: trade.quantity,
+      orderId: trade.exchangeOrderId,
+      status: closeStatus,
+    });
+
+    const monitor = getTradeMonitorService();
+    await monitor.stopMonitoring(String(trade._id));
+    if (result.status === "cancelled") {
+      trade.status = "cancelled";
+      trade.closedAt = new Date();
+      trade.closedVia = "manual";
+      trade.wsMonitoringActive = false;
+      trade.monitoringStatus = "disconnected";
+      await trade.save();
+    } else {
+      await processTradeClose(
+        String(trade._id),
+        result.exitPrice || live.filledPrice || trade.entryFillPrice || trade.entryPrice,
+        "manual",
+      );
+    }
+
+    // Deliberately do not await copy closures. The pro close has succeeded and the propagation has been triggered.
+    triggerCopiedTradeClosures(String(trade._id));
+    const updated = await Trade.findById(trade._id)
+      .populate("exchangeConnectionId", "exchange label")
+      .lean();
+    monitor.emit("tradeUpdate", { tradeId: String(trade._id), status: result.status, timestamp: new Date() });
+    await AuditLog.create({
+      userId: req.user,
+      action: "Pro Trade Closed Manually",
+      details: { tradeId: trade._id, exchange, copyCloseTriggered: true },
+      targetId: trade._id,
+      targetType: "Trade",
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+    return res.status(200).json({
+      success: true,
+      message: result.status === "closed"
+        ? "Trade closed. Copied trades are being closed in the background."
+        : "Pending trade cancelled. Copied trades are being closed in the background.",
+      trade: updated,
+    });
+  } catch (error) {
+    console.error("Error closing pro trade:", error);
+    return res.status(502).json({ success: false, message: error instanceof Error ? error.message : "Failed to close pro trade." });
   }
 };
 

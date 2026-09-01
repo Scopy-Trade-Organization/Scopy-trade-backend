@@ -9,7 +9,10 @@ export const SUPPORTED_PAIRS = [
   "XRPUSDT",
   "DOGEUSDT",
   "BNBUSDT",
+  "LINKUSDT",
   "SUIUSDT",
+  "AVAXUSDT",
+  "ADAUSDT",
 ] as const;
 export type SupportedPair = (typeof SUPPORTED_PAIRS)[number];
 

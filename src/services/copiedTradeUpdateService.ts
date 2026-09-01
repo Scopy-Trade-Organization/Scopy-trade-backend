@@ -1,9 +1,10 @@
 import { Trade } from "../models/tradeModel.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
-import { amendTradeOrder, getOrderStatus } from "./tradeService.js";
+import { amendTradeOrder, closeTradeOrder, getOrderStatus } from "./tradeService.js";
 import { decryptCredentials } from "./exchangeConnectionService.js";
 import { getTradeMonitorService } from "./tradeMonitorService.js";
 import { ExchangeId } from "../types/index.js";
+import { processTradeClose } from "./profitSharingService.js";
 
 interface ProtectionUpdate {
   tp: string;
@@ -133,5 +134,79 @@ export function queueCopiedTradeUpdate(
     void updateCopiedTrades(sourceTradeId, parameters).catch((error) => {
       console.error(`[copiedTradeUpdateService] Propagation failed for ${sourceTradeId}:`, error);
     });
+  });
+}
+
+async function closeOneCopiedTrade(tradeId: string): Promise<void> {
+  const trade = await Trade.findOne({
+    _id: tradeId,
+    tradeOrigin: "copy",
+    status: { $in: ["pending", "filled"] },
+  });
+  if (!trade?.exchangeOrderId) throw new Error("Copied trade has no exchange order to close.");
+
+  const connection = await ExchangeConnection.findOne({
+    _id: trade.exchangeConnectionId,
+    isActive: true,
+  }).lean();
+  if (!connection?.encryptedApiKey || !connection.encryptedApiSecret) {
+    throw new Error("The copy trader's exchange connection is unavailable.");
+  }
+  const exchange = connection.exchange as ExchangeId;
+  const credentials = decryptCredentials({
+    exchange,
+    apiKey: connection.encryptedApiKey,
+    apiSecret: connection.encryptedApiSecret,
+    ...(connection.encryptedPassphrase ? { passphrase: connection.encryptedPassphrase } : {}),
+  });
+  const closed = await closeTradeOrder(exchange, {
+    credentials,
+    pair: trade.pair,
+    direction: trade.direction as "buy" | "sell",
+    quantity: trade.quantity,
+    orderId: trade.exchangeOrderId,
+    status: trade.status as "pending" | "filled",
+  });
+
+  const monitor = getTradeMonitorService();
+  await monitor.stopMonitoring(String(trade._id));
+  if (closed.status === "cancelled") {
+    await Trade.updateOne(
+      { _id: trade._id },
+      { $set: { status: "cancelled", closedAt: new Date(), closedVia: "manual", sourceTradeClosedAt: null, sourceTradeCloseMessage: null } },
+    );
+  } else {
+    await processTradeClose(String(trade._id), closed.exitPrice || trade.entryFillPrice || trade.entryPrice, "manual");
+  }
+  monitor.emit("tradeUpdate", {
+    tradeId: String(trade._id),
+    status: closed.status,
+    sourceTradeClosedAt: null,
+    timestamp: new Date(),
+  });
+}
+
+/** Starts after a pro closes. It is intentionally fire-and-forget: no queue or worker is involved. */
+export function triggerCopiedTradeClosures(sourceTradeId: string): void {
+  void (async () => {
+    const sourceClosedAt = new Date();
+    await Trade.updateMany(
+      { sourceTradeId, tradeOrigin: "copy", status: { $in: ["pending", "filled"] } },
+      { $set: { sourceTradeClosedAt: sourceClosedAt, sourceTradeCloseMessage: "The pro trader has closed this trade. Close it manually if it remains open." } },
+    );
+    const copies = await Trade.find({
+      sourceTradeId,
+      tradeOrigin: "copy",
+      status: { $in: ["pending", "filled"] },
+    }).select("_id").lean();
+    await Promise.all(copies.map(async (copy) => {
+      try {
+        await closeOneCopiedTrade(String(copy._id));
+      } catch (error) {
+        console.error(`[copiedTradeUpdateService] Failed to close copied trade ${copy._id}:`, error);
+      }
+    }));
+  })().catch((error) => {
+    console.error(`[copiedTradeUpdateService] Failed to start copied-trade closures for ${sourceTradeId}:`, error);
   });
 }

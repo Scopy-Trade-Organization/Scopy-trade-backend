@@ -9,6 +9,7 @@ import {
   getWalletAddress,
   getProTrades,
   updateProTrade,
+  closeProTrade,
 } from "../controllers/proTraderDashboardController.js";
 import { initiateTrade } from "../controllers/tradeController.js";
 
@@ -31,6 +32,7 @@ proTraderDashboardRouter.post(
 );
 proTraderDashboardRouter.get("/trades", getProTrades);
 proTraderDashboardRouter.patch("/trades/:tradeId", updateProTrade);
+proTraderDashboardRouter.post("/trades/:tradeId/close", closeProTrade);
 
 proTraderDashboardRouter.post("/withdraw", withdrawFunds);
 
