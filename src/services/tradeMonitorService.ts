@@ -1047,6 +1047,7 @@ export class TradeMonitorService extends EventEmitter {
             monitored,
             monitored.initialStatus !== "filled",
           );
+          await this.reconcileBinanceProtection(wsConn, monitored);
         }
       } else if (
         result.status === "cancelled" ||
@@ -1210,6 +1211,78 @@ export class TradeMonitorService extends EventEmitter {
         `[TradeMonitor][Binance] Failed to attach TP/SL for ${monitored.tradeId}:`,
         err,
       );
+    }
+  }
+
+  /**
+   * A user-data websocket can be disconnected at the exact moment a Binance
+   * conditional order fills.  The entry-order snapshot alone cannot detect
+   * that case, so inspect each persisted TP/SL algo order during reconciliation.
+   */
+  private async reconcileBinanceProtection(
+    wsConn: ExchangeWsConnection,
+    monitored: MonitoredTrade,
+  ): Promise<void> {
+    const protectionIds = [...(monitored.protectionOrderIds ?? [])];
+    if (!protectionIds.length) return;
+
+    const baseUrl = getExchangeRestUrl("binance");
+    const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
+
+    for (const algoId of protectionIds) {
+      const query = new URLSearchParams({
+        algoId,
+        timestamp: String(timeData.serverTime),
+      }).toString();
+      const signature = crypto
+        .createHmac("sha256", wsConn.credentials.apiSecret)
+        .update(query)
+        .digest("hex");
+      const { data } = await http.get(`${baseUrl}/fapi/v1/algoOrder`, {
+        params: {
+          ...Object.fromEntries(new URLSearchParams(query)),
+          signature,
+        },
+        headers: { "X-MBX-APIKEY": wsConn.credentials.apiKey },
+      });
+
+      const algoStatus = String(data.algoStatus ?? data.status ?? "").toUpperCase();
+      if (algoStatus !== "FINISHED") continue;
+
+      let exitPrice = String(
+        data.actualPrice ?? data.avgPrice ?? data.activatePrice ?? "",
+      );
+      if ((!Number.isFinite(Number(exitPrice)) || Number(exitPrice) <= 0) && data.actualOrderId) {
+        const executedOrder = await getOrderStatus(
+          "binance",
+          wsConn.credentials,
+          monitored.pair,
+          String(data.actualOrderId),
+        );
+        exitPrice = executedOrder.filledPrice ?? "";
+      }
+      if (!Number.isFinite(Number(exitPrice)) || Number(exitPrice) <= 0) {
+        continue;
+      }
+
+      const closedVia = monitored.protectionExitTypes?.get(algoId) ?? "manual";
+      const siblingIds = protectionIds.filter((id) => id !== algoId);
+      await Promise.allSettled(
+        siblingIds.map((id) =>
+          this.cancelBinanceOrder(wsConn, monitored.pair.replace(/\//g, ""), id, "algo"),
+        ),
+      );
+      const result = await processTradeClose(monitored.tradeId, exitPrice, closedVia);
+      this.emit("tradeClosed", result);
+      for (const [trackedOrderId, trade] of wsConn.activeTrades) {
+        if (trade.tradeId === monitored.tradeId) {
+          wsConn.activeTrades.delete(trackedOrderId);
+        }
+      }
+      console.log(
+        `[TradeMonitor][Binance] Reconciled trade ${monitored.tradeId} closed via ${closedVia}`,
+      );
+      return;
     }
   }
 

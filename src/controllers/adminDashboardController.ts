@@ -4,6 +4,7 @@ import { Signal } from "../models/signalModel.js";
 import User from "../models/userModel.js";
 import { Trade } from "../models/tradeModel.js";
 import mongoose from "mongoose";
+import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
 
 export const getTrades = async (req: Request, res: Response) => {
   try {
@@ -50,12 +51,12 @@ export const getTrades = async (req: Request, res: Response) => {
 
     return res.status(200).json({
       success: true,
-      trades: trades.map((trade) => ({
+      trades: await withCurrentMarketPrices(trades.map((trade) => ({
         ...trade,
         copyStats: trade.tradeOrigin === "pro"
           ? statsByTrade.get(String(trade._id)) ?? { total: 0, active: 0, profitable: 0 }
           : undefined,
-      })),
+      }))),
       pagination: { total, page, limit, pages: Math.ceil(total / limit) },
     });
   } catch (error) {
@@ -86,7 +87,8 @@ export const getTrade = async (req: Request, res: Response) => {
           profitable: await Trade.countDocuments({ tradeOrigin: "copy", sourceTradeId: trade._id, tradeResult: "profit" }),
         }
       : null;
-    return res.status(200).json({ success: true, trade: { ...trade, copyStats } });
+    const [pricedTrade] = await withCurrentMarketPrices([{ ...trade, copyStats }]);
+    return res.status(200).json({ success: true, trade: pricedTrade });
   } catch (error) {
     console.error("Error fetching admin trade:", error);
     return res.status(500).json({ success: false, message: "Failed to fetch trade." });

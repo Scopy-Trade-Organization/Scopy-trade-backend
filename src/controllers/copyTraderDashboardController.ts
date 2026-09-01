@@ -1,6 +1,8 @@
 import { Request, Response } from "express";
 import { Signal } from "../models/signalModel.js";
 import { Trade } from "../models/tradeModel.js";
+import mongoose from "mongoose";
+import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
 
 export async function getActiveProTrades(req: Request, res: Response) {
   try {
@@ -11,6 +13,7 @@ export async function getActiveProTrades(req: Request, res: Response) {
     })
       .populate("userId", "firstName lastName traderID profilePhoto")
       .populate("signalId", "notes")
+      .populate("exchangeConnectionId", "exchange label")
       .sort({ createdAt: -1 })
       .lean();
 
@@ -43,11 +46,11 @@ export async function getActiveProTrades(req: Request, res: Response) {
 
     return res.status(200).json({
       success: true,
-      trades: trades.map((trade) => ({
+      trades: await withCurrentMarketPrices(trades.map((trade) => ({
         ...trade,
         copiers: countBySource.get(String(trade._id)) ?? 0,
         myTrade: myCopyBySource.get(String(trade._id)) ?? null,
-      })),
+      }))),
     });
   } catch (err) {
     console.error("[getActiveProTrades]", err);
@@ -72,20 +75,20 @@ export async function getProTradeById(req: Request, res: Response) {
     })
       .populate("userId", "firstName lastName traderID profilePhoto")
       .populate("signalId", "notes")
+      .populate("exchangeConnectionId", "exchange label")
       .lean();
 
     if (!trade) {
       return res.status(404).json({ success: false, message: "Active pro trade not found." });
     }
 
-    return res.status(200).json({ success: true, trade });
+    const [pricedTrade] = await withCurrentMarketPrices([trade]);
+    return res.status(200).json({ success: true, trade: pricedTrade });
   } catch (err) {
     console.error("[getProTradeById]", err);
     return res.status(500).json({ success: false, message: "Failed to fetch trade." });
   }
 }
-import mongoose from "mongoose";
-
 //GET  all active signals.
 export async function getActiveSignals(req: Request, res: Response) {
   try {

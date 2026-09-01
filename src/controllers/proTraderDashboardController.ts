@@ -15,6 +15,7 @@ import User from "../models/userModel.js";
 import { TronWeb } from "tronweb";
 import { isValidTronAddress } from "../helpers/tronAddress.js";
 import { queueCopiedTradeUpdate } from "../services/copiedTradeUpdateService.js";
+import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
 
 export const getProTrades = async (req: Request, res: Response) => {
   try {
@@ -60,7 +61,7 @@ export const getProTrades = async (req: Request, res: Response) => {
     return res.status(200).json({
       success: true,
       message: "Trades retrieved successfully",
-      trades: trades.map((trade) => ({
+      trades: await withCurrentMarketPrices(trades.map((trade) => ({
         ...trade,
         copyStats: statsByTrade.get(String(trade._id)) ?? {
           total: 0,
@@ -68,7 +69,7 @@ export const getProTrades = async (req: Request, res: Response) => {
           profitable: 0,
           copiedVolume: 0,
         },
-      })),
+      }))),
       page,
       limit,
       pageSize: trades.length,

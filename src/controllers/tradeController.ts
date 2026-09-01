@@ -22,6 +22,7 @@ import {
   MAX_RISK_PERCENT,
   DEFAULT_MAX_ENTRY_DEVIATION,
 } from "../constants.js";
+import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
 
 // ─── Fetch Exchange Balances ──────────────────────────────────────────────────
 export async function fetchExchangeBalances(req: Request, res: Response) {
@@ -554,7 +555,7 @@ export async function getUserTrades(req: Request, res: Response) {
 
     return res.status(200).json({
       success: true,
-      trades,
+      trades: await withCurrentMarketPrices(trades),
       pagination: {
         total,
         page: pageNum,
@@ -604,7 +605,8 @@ export async function getTradeById(req: Request, res: Response) {
       ]);
       copyStats = stats ?? { total: 0, active: 0, profitable: 0 };
     }
-    return res.status(200).json({ success: true, trade: { ...trade, copyStats } });
+    const [pricedTrade] = await withCurrentMarketPrices([{ ...trade, copyStats }]);
+    return res.status(200).json({ success: true, trade: pricedTrade });
   } catch (err) {
     console.error("[getTradeById]", err);
     return res.status(500).json({ message: "Failed to fetch trade." });
