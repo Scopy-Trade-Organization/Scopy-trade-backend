@@ -271,6 +271,23 @@ export async function initiateTrade(req: Request, res: Response) {
     }
 
     // ── 4. Guard against duplicate trade ─────────────────────────────────────
+    // Futures exchanges maintain a position per symbol on an account. Keeping
+    // one active local trade per pair/connection lets WebSocket and REST
+    // reconciliation unambiguously associate an exchange close with this trade.
+    const activePairTrade = await Trade.findOne({
+      exchangeConnectionId,
+      pair: signal.pair,
+      status: { $in: ["pending", "filled"] },
+    }).lean();
+
+    if (activePairTrade) {
+      return res.status(409).json({
+        success: false,
+        message: `An active ${signal.pair} trade already exists on this exchange connection. Close or cancel it before opening another ${signal.pair} trade.`,
+        trade: { _id: activePairTrade._id, status: activePairTrade.status },
+      });
+    }
+
     const existing = isProTrade
       ? null
       : await Trade.findOne({ sourceTradeId, exchangeConnectionId }).lean();

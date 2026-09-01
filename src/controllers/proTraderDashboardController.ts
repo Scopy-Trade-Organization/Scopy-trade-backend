@@ -364,11 +364,14 @@ export const closeProTrade = async (req: Request, res: Response) => {
       trade.monitoringStatus = "disconnected";
       await trade.save();
     } else {
-      await processTradeClose(
-        String(trade._id),
-        result.exitPrice || live.filledPrice || trade.entryFillPrice || trade.entryPrice,
-        "manual",
-      );
+      // Bybit can report a zero position when native TP/SL closed the entry
+      // before this request. No historical exit price is available from the
+      // position endpoint, so retain the entry price rather than recording a
+      // misleading current market price and charging an inaccurate PnL.
+      const exitPrice = result.alreadyClosed
+        ? trade.entryFillPrice || trade.entryPrice
+        : result.exitPrice || live.filledPrice || trade.entryFillPrice || trade.entryPrice;
+      await processTradeClose(String(trade._id), exitPrice, "manual");
     }
 
     // Deliberately do not await copy closures. The pro close has succeeded and the propagation has been triggered.
@@ -388,7 +391,9 @@ export const closeProTrade = async (req: Request, res: Response) => {
     });
     return res.status(200).json({
       success: true,
-      message: result.status === "closed"
+      message: result.alreadyClosed
+        ? "Bybit reports no open position for this trade. Its local status has been synchronized as closed."
+        : result.status === "closed"
         ? "Trade closed. Copied trades are being closed in the background."
         : "Pending trade cancelled. Copied trades are being closed in the background.",
       trade: updated,

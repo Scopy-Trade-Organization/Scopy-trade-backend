@@ -76,6 +76,8 @@ export interface ManualCloseParams {
 export interface ManualCloseResult {
   status: "cancelled" | "closed";
   exitPrice: string | null;
+  /** The exchange reported no position to reduce, so no exit order was submitted. */
+  alreadyClosed?: boolean;
   raw: unknown;
 }
 
@@ -1285,6 +1287,39 @@ export async function closeTradeOrder(
     if (exchange === "bybit") {
       const timestamp = await getBybitTimestamp(baseUrl);
       const recvWindow = "5000";
+
+      // A filled entry order is not evidence that its resulting position is
+      // still open: native TP/SL orders can close it independently. Bybit
+      // rejects a reduce-only order in that case with "current position is
+      // zero". Check the live position first so callers can reconcile their
+      // local trade instead of surfacing that exchange error.
+      if (params.status === "filled") {
+        const queryString = `category=linear&symbol=${encodeURIComponent(symbol)}`;
+        const positionSignature = crypto
+          .createHmac("sha256", apiSecret)
+          .update(timestamp + apiKey + recvWindow + queryString)
+          .digest("hex");
+        const { data: positionData } = await http.get(
+          `${baseUrl}/v5/position/list?${queryString}`,
+          {
+            headers: {
+              "X-BAPI-API-KEY": apiKey,
+              "X-BAPI-SIGN": positionSignature,
+              "X-BAPI-TIMESTAMP": timestamp,
+              "X-BAPI-RECV-WINDOW": recvWindow,
+            },
+          },
+        );
+        if (positionData.retCode !== 0) {
+          throw new Error(positionData.retMsg || "Failed to retrieve Bybit position.");
+        }
+        const hasOpenPosition = positionData.result?.list?.some(
+          (position: { size?: string }) => Number(position.size || "0") > 0,
+        );
+        if (!hasOpenPosition) {
+          return { status: "closed", exitPrice: null, alreadyClosed: true, raw: positionData };
+        }
+      }
       const path = params.status === "pending" ? "/v5/order/cancel" : "/v5/order/create";
       const body = JSON.stringify(params.status === "pending"
         ? { category: "linear", symbol, orderId: params.orderId }
