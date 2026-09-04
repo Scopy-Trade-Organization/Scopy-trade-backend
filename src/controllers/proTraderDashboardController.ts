@@ -639,6 +639,7 @@ export const getWalletAddress = async (req: Request, res: Response) => {
     return res.status(200).json({
       success: true,
       withdrawalAddress: user.withdrawalAddress || null,
+      proEarningsBalance: user.proEarningsBalance ?? 0,
       requirements: {
         format: "TRC-20 (Tron Network)",
         mustStartWith: "T",
@@ -776,6 +777,7 @@ export const withdrawFunds = async (req: Request, res: Response) => {
       success: true,
       message: "Withdrawal initiated successfully",
       transactionId,
+      remainingBalance: debited.proEarningsBalance,
     });
   } catch (error) {
     console.error("Error executing withdrawal:", error);
