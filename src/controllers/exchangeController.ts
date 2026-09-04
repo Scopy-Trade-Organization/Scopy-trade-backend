@@ -91,7 +91,7 @@ export const connectExchange = async (req: Request, res: Response) => {
 
       return res.status(422).json({
         success: false,
-        message: (validationError as Error).message,
+        message: "The exchange rejected the credentials or is temporarily unavailable.",
         hint: "Double-check your API key, secret, and permissions in your exchange settings.",
       });
     }
@@ -257,7 +257,7 @@ export const testConnection = async (req: Request, res: Response) => {
 
       return res.status(422).json({
         success: false,
-        message: (validationError as Error).message,
+        message: "The exchange rejected the credentials or is temporarily unavailable.",
         hint: "Your API keys may have expired or been revoked. Please reconnect.",
       });
     }
@@ -314,7 +314,7 @@ export const updateConnectionCredentials = async (
     } catch (err) {
       return res.status(422).json({
         success: false,
-        message: (err as Error).message,
+        message: "The exchange rejected the credentials or is temporarily unavailable.",
       });
     }
 

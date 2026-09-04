@@ -6,14 +6,15 @@ import {
   adminWhoami,
 } from "../controllers/adminAuthController.js";
 import { adminAuthenticate } from "../middleware/authenticationMiddleware.js";
+import { loginLimiter } from "../middleware/authRateLimit.js";
 
 const adminAuthRouter = Router();
 
 // POST /api/admin/auth/login
-adminAuthRouter.post("/login", adminLogin);
+adminAuthRouter.post("/login", loginLimiter, adminLogin);
 
 // POST /api/admin/auth/logout
-adminAuthRouter.post("/logout", adminLogout);
+adminAuthRouter.post("/logout", adminAuthenticate, adminLogout);
 
 // POST /api/admin/auth/refresh
 adminAuthRouter.post("/refresh", AdminRefreshToken);

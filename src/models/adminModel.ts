@@ -49,7 +49,9 @@ const adminSchema = new Schema(
     password: {
       type: String,
       minlength: 8,
+      select: false,
     },
+    sessionVersion: { type: Number, default: 0, select: false },
     profilePhoto: {
       publicId: { type: String },
       url: { type: String },

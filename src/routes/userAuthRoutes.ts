@@ -9,18 +9,19 @@ import {
   refreshToken,
 } from "../controllers/authControllers.js";
 import { userAuthenticate } from "../middleware/authenticationMiddleware.js";
+import { loginLimiter, registrationLimiter } from "../middleware/authRateLimit.js";
 
 const userAuthRouter = express.Router();
 
-userAuthRouter.post("/register", registerUser); // User Registration routes
+userAuthRouter.post("/register", registrationLimiter, registerUser); // User Registration routes
 
-userAuthRouter.post("/login", login); // User Login route
+userAuthRouter.post("/login", loginLimiter, login); // User Login route
 
 userAuthRouter.post("/refresh", refreshToken); // User Refresh Token route
 
 userAuthRouter.get("/me", userAuthenticate, whoami); // User Info route
 
-userAuthRouter.post("/logout", logout); // User Logout route
+userAuthRouter.post("/logout", userAuthenticate, logout); // User Logout route
 
 // Google OAuth
 // userAuthRouter.get("/google", handleGoogleLogin);

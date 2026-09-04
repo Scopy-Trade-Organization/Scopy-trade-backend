@@ -8,7 +8,7 @@ import {
   updateConnectionCredentials,
 } from "../controllers/exchangeController.js";
 import { userAuthenticate } from "../middleware/authenticationMiddleware.js";
-import { validateConnectBody } from "../middleware/validateExchange.js";
+import { validateConnectBody, validateCredentialUpdateBody } from "../middleware/validateExchange.js";
 import { connectionLimiter } from "../middleware/rateLimit.js";
 
 const exchangeRouter = Router();
@@ -36,6 +36,7 @@ exchangeRouter.delete("/connections/:connectionId", removeConnection);
 exchangeRouter.patch(
   "/connections/:connectionId",
   connectionLimiter,
+  validateCredentialUpdateBody,
   updateConnectionCredentials,
 );
 

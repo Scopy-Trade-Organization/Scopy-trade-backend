@@ -1,10 +1,10 @@
 import { Request, Response } from "express";
 import bcrypt from "bcrypt";
-import jwt from "jsonwebtoken";
 import Admin from "../models/adminModel.js";
 import AuditLog from "../models/auditLogModel.js";
 import { LoginRequestBody } from "../types/index.js";
-import { signAccessToken, signRefreshToken } from "../helpers/jwtHelper.js";
+import { signAccessToken, signRefreshToken, verifyToken } from "../helpers/jwtHelper.js";
+import { csrfCookieOptions, isSecureRequest, setCsrfToken } from "../middleware/csrfProtection.js";
 
 export const adminLogin = async (
   req: Request<{}, {}, LoginRequestBody>,
@@ -20,7 +20,7 @@ export const adminLogin = async (
       });
     }
 
-    const admin = await Admin.findOne({ email }).select("+password");
+    const admin = await Admin.findOne({ email }).select("+password +sessionVersion");
 
     if (!admin || !admin.password) {
       return res.status(401).json({
@@ -37,7 +37,7 @@ export const adminLogin = async (
       });
     }
 
-    const token = signAccessToken(admin._id.toString());
+    const token = signAccessToken(admin._id.toString(), "admin", admin.sessionVersion ?? 0);
     
     const adminObj = admin.toObject();
     delete adminObj.password;
@@ -49,7 +49,7 @@ export const adminLogin = async (
       userAgent: req.headers["user-agent"],
     });
 
-    const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
+    const isSecure = isSecureRequest(req);
 
     res.cookie("admin_token", token, {
       httpOnly: true,
@@ -57,14 +57,15 @@ export const adminLogin = async (
       sameSite: isSecure ? "none" : "lax",
       maxAge: 24 * 60 * 60 * 1000,
     });
+    setCsrfToken(req, res);
 
     if (rememberMe) {
-      const refreshToken = signRefreshToken(admin._id.toString());
+      const refreshToken = signRefreshToken(admin._id.toString(), "admin", admin.sessionVersion ?? 0);
 
       res.cookie("refresh_token", refreshToken, {
         httpOnly: true,
         secure: isSecure,
-        sameSite: "none",
+        sameSite: isSecure ? "none" : "lax",
         path: "/api/admin/auth/refresh", // very important
         maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
       });
@@ -80,20 +81,20 @@ export const adminLogin = async (
     return res.status(500).json({
       status: "error",
       message: "Login failed due to server error",
-      details: err.message,
-      stack: process.env.NODE_ENV === "development" ? err.stack : undefined,
     });
   }
 };
 
-export const adminLogout = (req: Request, res: Response) => {
-  const isProduction = process.env.COOKIE_SECURE === "true";
-
+export const adminLogout = async (req: Request, res: Response) => {
+  const isSecure = isSecureRequest(req);
+  if (req.admin) await Admin.updateOne({ _id: req.admin }, { $inc: { sessionVersion: 1 } });
   res.clearCookie("admin_token", {
     httpOnly: true,
-    secure: isProduction,
-    sameSite: isProduction ? "none" : "lax",
+    secure: isSecure,
+    sameSite: isSecure ? "none" : "lax",
   });
+  res.clearCookie("refresh_token", { httpOnly: true, secure: isSecure, sameSite: isSecure ? "none" : "lax", path: "/api/admin/auth/refresh" });
+  res.clearCookie("csrf_token", csrfCookieOptions(req));
 
   res.status(200).json({
     status: "success",
@@ -121,7 +122,6 @@ export const adminWhoami = async (req: Request, res: Response) => {
     return res.status(500).json({
       status: "error",
       message: "Failed to fetch admin info",
-      error: err.message,
     });
   }
 };
@@ -135,23 +135,13 @@ export const AdminRefreshToken = async (req: Request, res: Response) => {
         message: "Refresh token missing",
       });
     }
-    const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
-
-    const refreshSecret = process.env.JWT_SECRET;
-    if (!refreshSecret) {
-      throw new Error("JWT_SECRET is not defined");
-    }
-
-    const decoded = jwt.verify(refreshToken, refreshSecret) as {
-      id: string;
-      type: string;
-    };
-
-    if (!decoded || decoded.type !== "refresh") {
+    const isSecure = isSecureRequest(req);
+    const decoded = verifyToken(refreshToken, "admin", true);
+    if (!decoded) {
       res.clearCookie("refresh_token", {
         httpOnly: true,
         secure: isSecure,
-        sameSite: "none",
+        sameSite: isSecure ? "none" : "lax",
         path: "/api/admin/auth/refresh",
       });
       return res.status(401).json({
@@ -160,22 +150,23 @@ export const AdminRefreshToken = async (req: Request, res: Response) => {
       });
     }
 
-    const admin = await Admin.findById(decoded.id).select("-password");
-    if (!admin) {
+    const admin = await Admin.findById(decoded.sub).select("-password +sessionVersion");
+    if (!admin || admin.sessionVersion !== decoded.sv) {
       return res.status(401).json({
         status: "fail",
-        message: "Admin not found",
+        message: "Invalid or expired refresh token",
       });
     }
 
-    const newAccessToken = signAccessToken(admin._id.toString());
+    const newAccessToken = signAccessToken(admin._id.toString(), "admin", admin.sessionVersion ?? 0);
 
     res.cookie("admin_token", newAccessToken, {
       httpOnly: true,
       secure: isSecure,
-      sameSite: "none",
+      sameSite: isSecure ? "none" : "lax",
       maxAge: 24 * 60 * 60 * 1000,
     });
+    setCsrfToken(req, res);
 
     return res.status(200).json({
       status: "success",
@@ -187,7 +178,6 @@ export const AdminRefreshToken = async (req: Request, res: Response) => {
     return res.status(401).json({
       status: "error",
       message: "Failed to refresh access token",
-      details: err.message,
     });
   }
 };

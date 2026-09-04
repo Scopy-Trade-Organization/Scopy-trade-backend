@@ -15,6 +15,7 @@ import adminDashboardRouter from "./routes/adminDashboardRoutes.js";
 import tradeRouter from "./routes/tradeRoutes.js";
 import adminAuthRouter from "./routes/adminAuthRoutes.js";
 import { sanitize } from "./middleware/mongodbSantizer.js";
+import { csrfProtection } from "./middleware/csrfProtection.js";
 import proTraderDashboardRouter from "./routes/proTraderDashboardRoutes.js";
 import copyTraderDashboardRouter from "./routes/copyTraderDashboardRoutes.js";
 import { resumePendingProfitSettlements } from "./services/profitSharingService.js";
@@ -25,6 +26,8 @@ const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 70,
   message: "Too many requests from this IP, please try again later",
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
 });
 
 const allowedOrigins = [
@@ -62,40 +65,35 @@ async function gracefulShutdown() {
 process.on("SIGTERM", gracefulShutdown);
 process.on("SIGINT", gracefulShutdown);
 
-app.get("/ip", async (_, res) => {
-  const response = await fetch("https://api.ipify.org?format=json");
-  const data = await response.json();
-  res.json(data);
-});
-
 // Middleware
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error("CORS origin denied"));
+    },
     credentials: true,
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "X-CSRF-Token"],
   }),
 );
 
 app.set("trust proxy", 1);
 
 app.use("/api", passport.initialize());
-app.use("/api", express.json());
+app.use("/api", express.json({ limit: "100kb" }));
 app.use("/api", compression());
 app.use("/api", cookieParser());
-app.use("/api", express.urlencoded({ extended: true }));
-app.use("/api", helmet());
+app.use("/api", express.urlencoded({ extended: false, limit: "100kb" }));
+app.use("/api", helmet({ crossOriginResourcePolicy: { policy: "same-site" } }));
 app.use("/api", limiter);
 app.use((req, res, next) => {
   req.body = sanitize(req.body);
   req.params = sanitize(req.params);
-
-  for (const key in req.query) {
-    if (key.startsWith("$") || key.includes(".")) {
-      delete req.query[key];
-    }
-  }
+  sanitize(req.query);
   next();
 });
+app.use("/api", csrfProtection);
 
 // Define API routes
 app.use("/api/auth", authRouter);

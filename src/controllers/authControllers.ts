@@ -1,11 +1,11 @@
 import { Request, Response } from "express";
 import bcrypt from "bcrypt";
 import User from "../models/userModel.js";
-import jwt from "jsonwebtoken";
 import validator from "validator";
 import { LoginRequestBody, RegisterRequestBody } from "../types/index.js";
 import AuditLog from "../models/auditLogModel.js";
-import { signAccessToken, signRefreshToken } from "../helpers/jwtHelper.js";
+import { signAccessToken, signRefreshToken, verifyToken } from "../helpers/jwtHelper.js";
+import { csrfCookieOptions, isSecureRequest, setCsrfToken } from "../middleware/csrfProtection.js";
 // import passport from "passport";
 // import { UserJwtPayload } from "../config/passport.js"; // import the interface
 
@@ -136,7 +136,6 @@ export const registerUser = async (
     return res.status(500).json({
       status: "error",
       message: "Registration failed",
-      error: err.message,
     });
   }
 };
@@ -156,7 +155,7 @@ export const login = async (
       });
     }
 
-    const user = await User.findOne({ email }).select("+password");
+    const user = await User.findOne({ email }).select("+password +sessionVersion");
 
     // Check if user exists and has a password
     if (!user || !user.password) {
@@ -197,7 +196,7 @@ export const login = async (
     //   });
     // }
 
-    const accessToken = signAccessToken(user._id.toString());
+    const accessToken = signAccessToken(user._id.toString(), "user", user.sessionVersion ?? 0);
     user.password = null;
 
     await AuditLog.create({
@@ -208,7 +207,7 @@ export const login = async (
       userAgent: req.headers["user-agent"],
     });
 
-    const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
+    const isSecure = isSecureRequest(req);
 
     res.cookie("user_token", accessToken, {
       httpOnly: true,
@@ -216,14 +215,15 @@ export const login = async (
       sameSite: isSecure ? "none" : "lax", // "none" requires secure:true
       maxAge: 24 * 60 * 60 * 1000,
     });
+    setCsrfToken(req, res);
 
     if (rememberMe) {
-      const refreshToken = signRefreshToken(user._id.toString());
+      const refreshToken = signRefreshToken(user._id.toString(), "user", user.sessionVersion ?? 0);
 
       res.cookie("refresh_token", refreshToken, {
         httpOnly: true,
         secure: isSecure,
-        sameSite: "none",
+        sameSite: isSecure ? "none" : "lax",
         path: "/api/auth/refresh", // very important
         maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
       });
@@ -239,21 +239,17 @@ export const login = async (
     return res.status(500).json({
       status: "error",
       message: "Login failed due to server error",
-      details: err.message,
-      stack: process.env.NODE_ENV === "development" ? err.stack : undefined,
     });
   }
 };
 
-export const logout = (req: Request, res: Response) => {
-  const isProduction = process.env.COOKIE_SECURE === "true";
-
-  res.cookie("user_token", {
-    httpOnly: true,
-    secure: isProduction,
-    sameSite: isProduction ? "none" : "lax",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-  });
+export const logout = async (req: Request, res: Response) => {
+  const isSecure = isSecureRequest(req);
+  if (req.user) await User.updateOne({ _id: req.user }, { $inc: { sessionVersion: 1 } });
+  const options = { httpOnly: true, secure: isSecure, sameSite: isSecure ? "none" as const : "lax" as const };
+  res.clearCookie("user_token", options);
+  res.clearCookie("refresh_token", { ...options, path: "/api/auth/refresh" });
+  res.clearCookie("csrf_token", csrfCookieOptions(req));
 
   res.status(200).json({
     status: "success",
@@ -281,7 +277,6 @@ export const whoami = async (req: Request, res: Response) => {
     return res.status(500).json({
       status: "error",
       message: "Failed to fetch user info",
-      error: err.message,
     });
   }
 };
@@ -295,23 +290,13 @@ export const refreshToken = async (req: Request, res: Response) => {
         message: "Refresh token missing",
       });
     }
-    const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
-
-    const refreshSecret = process.env.JWT_SECRET;
-    if (!refreshSecret) {
-      throw new Error("JWT_SECRET is not defined");
-    }
-
-    const decoded = jwt.verify(refreshToken, refreshSecret) as {
-      id: string;
-      type: string;
-    };
-
-    if (!decoded || decoded.type !== "refresh") {
+    const isSecure = isSecureRequest(req);
+    const decoded = verifyToken(refreshToken, "user", true);
+    if (!decoded) {
       res.clearCookie("refresh_token", {
         httpOnly: true,
         secure: isSecure,
-        sameSite: "none",
+        sameSite: isSecure ? "none" : "lax",
         path: "/api/auth/refresh",
       });
       return res.status(401).json({
@@ -320,22 +305,23 @@ export const refreshToken = async (req: Request, res: Response) => {
       });
     }
 
-    const user = await User.findById(decoded.id).select("-password");
-    if (!user) {
+    const user = await User.findById(decoded.sub).select("-password +sessionVersion");
+    if (!user || user.sessionVersion !== decoded.sv) {
       return res.status(401).json({
         status: "fail",
-        message: "User not found",
+        message: "Invalid or expired refresh token",
       });
     }
 
-    const newAccessToken = signAccessToken(user._id.toString());
+    const newAccessToken = signAccessToken(user._id.toString(), "user", user.sessionVersion ?? 0);
 
     res.cookie("user_token", newAccessToken, {
       httpOnly: true,
       secure: isSecure,
-      sameSite: "lax",
+      sameSite: isSecure ? "none" : "lax",
       maxAge: 24 * 60 * 60 * 1000,
     });
+    setCsrfToken(req, res);
 
     return res.status(200).json({
       status: "success",
@@ -347,7 +333,6 @@ export const refreshToken = async (req: Request, res: Response) => {
     return res.status(401).json({
       status: "error",
       message: "Failed to refresh access token",
-      details: err.message,
     });
   }
 };

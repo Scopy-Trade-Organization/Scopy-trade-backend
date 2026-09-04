@@ -1,15 +1,7 @@
 import { Request, Response, NextFunction } from "express";
-import jwt, { JwtPayload } from "jsonwebtoken";
 import User from "../models/userModel.js";
 import Admin from "../models/adminModel.js";
-
-interface UserJwtPayload extends JwtPayload {
-  id: string;
-}
-
-interface AdminJwtPayload extends JwtPayload {
-  id: string;
-}
+import { verifyToken } from "../helpers/jwtHelper.js";
 
 // Protection Middleware
 export const userAuthenticate = async (
@@ -27,28 +19,18 @@ export const userAuthenticate = async (
       });
     }
 
-    const decoded = jwt.verify(
-      token,
-      process.env.JWT_SECRET as string,
-    ) as UserJwtPayload;
+    const decoded = verifyToken(token, "user");
 
-    const currentUser = await User.findById(decoded.id);
-    if (!currentUser) throw new Error("User not found");
+    const currentUser = await User.findById(decoded.sub).select("+sessionVersion");
+    if (!currentUser || currentUser.sessionVersion !== decoded.sv) throw new Error("Invalid session");
 
     req.user = currentUser._id;
     return next();
   } catch (err: any) {
     console.error("Protect error:", err);
-    const message =
-      err.name === "JsonWebTokenError"
-        ? "Invalid token"
-        : err.name === "TokenExpiredError"
-          ? "Session expired"
-          : err.message;
-
     return res.status(401).json({
       status: "fail",
-      message,
+      message: "Invalid or expired session",
     });
   }
 };
@@ -68,28 +50,18 @@ export const adminAuthenticate = async (
       });
     }
 
-    const decoded = jwt.verify(
-      token,
-      process.env.JWT_SECRET as string,
-    ) as AdminJwtPayload;
+    const decoded = verifyToken(token, "admin");
 
-    const currentUser = await Admin.findById(decoded.id);
-    if (!currentUser) throw new Error("Admin not found");
+    const currentUser = await Admin.findById(decoded.sub).select("+sessionVersion");
+    if (!currentUser || currentUser.sessionVersion !== decoded.sv) throw new Error("Invalid session");
 
     req.admin = currentUser._id;
     return next();
   } catch (err: any) {
     console.error("Protect error:", err);
-    const message =
-      err.name === "JsonWebTokenError"
-        ? "Invalid token"
-        : err.name === "TokenExpiredError"
-          ? "Session expired"
-          : err.message;
-
     return res.status(401).json({
       status: "fail",
-      message,
+      message: "Invalid or expired session",
     });
   }
 };

@@ -3,8 +3,6 @@ import app, { initializeTradeMonitoring, server } from "./app.js";
 import mongoose from "mongoose";
 import type { Request, Response } from "express";
 
-const dev = process.env.NODE_ENV !== "production";
-
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
 
@@ -27,11 +25,12 @@ app.get("/api", (req: Request, res: Response) => {
   res.json({ message: "Hello from Express API!" });
 });
 
-app.use((err: any, req: any, res: any, next: any) => {
-  console.error(err);
-  res.status(500).json({
+app.use((err: any, req: any, res: any, _next: any) => {
+  console.error("Unhandled request error", { method: req.method, path: req.originalUrl, name: err?.name });
+  const status = err?.type === "entity.too.large" ? 413 : 500;
+  res.status(status).json({
     status: "error",
-    message: err?.message ?? "Internal Server Error",
+    message: status === 413 ? "Request body is too large" : "Internal Server Error",
   });
 });
 

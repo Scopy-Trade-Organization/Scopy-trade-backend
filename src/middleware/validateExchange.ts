@@ -77,3 +77,23 @@ export const validateConnectBody = (
 
   next();
 };
+
+export const validateCredentialUpdateBody = (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void => {
+  const { apiKey, apiSecret, passphrase } = req.body as Partial<ConnectExchangeBody>;
+  if (
+    typeof apiKey !== "string" || apiKey.trim().length < 8 ||
+    typeof apiSecret !== "string" || apiSecret.trim().length < 8 ||
+    (passphrase !== undefined && typeof passphrase !== "string")
+  ) {
+    res.status(400).json({ success: false, message: "Invalid exchange credential payload." });
+    return;
+  }
+  req.body.apiKey = apiKey.trim();
+  req.body.apiSecret = apiSecret.trim();
+  if (typeof passphrase === "string") req.body.passphrase = passphrase.trim();
+  next();
+};

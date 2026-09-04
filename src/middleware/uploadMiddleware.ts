@@ -41,7 +41,7 @@ const fileFilter = (
 const produceStorage = multer.memoryStorage();
 export const uploadProduceImages = multer({
   storage: produceStorage,
-  limits: { fileSize: MAX_FILE_SIZE },
+  limits: { fileSize: MAX_FILE_SIZE, files: 3, fields: 10, fieldSize: 10 * 1024, parts: 13 },
   fileFilter,
 }).fields([
   { name: "image1", maxCount: 1 },
@@ -51,7 +51,7 @@ export const uploadProduceImages = multer({
 
 export const uploadProducerImages = multer({
   storage: produceStorage,
-  limits: { fileSize: MAX_FILE_SIZE },
+  limits: { fileSize: MAX_FILE_SIZE, files: 6, fields: 10, fieldSize: 10 * 1024, parts: 16 },
   fileFilter,
 }).fields([
   { name: "profilePhoto", maxCount: 1 },
@@ -64,7 +64,7 @@ export const uploadProducerImages = multer({
 
 export const uploadFiles = multer({
   storage: produceStorage,
-  limits: { fileSize: MAX_FILE_SIZE },
+  limits: { fileSize: MAX_FILE_SIZE, files: 5, fields: 10, fieldSize: 10 * 1024, parts: 15 },
   fileFilter,
 }).fields([{ name: "files", maxCount: 5 }]);
 
@@ -82,23 +82,34 @@ export const handleUploadErrors = (
         .json({ error: "File too large. Maximum size is 5 MB per file." });
       return;
     }
-    res.status(400).json({ error: `Upload error: ${err.message}` });
+    res.status(400).json({ error: "Upload could not be processed." });
     return;
   } else if (err) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ error: "Invalid upload." });
     return;
   }
   next();
 };
 
 // Helper function to upload a file buffer to Cloudinary
+function hasAllowedImageSignature(buffer: Buffer): boolean {
+  const jpeg = buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  const png = buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"));
+  const webp = buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP";
+  return jpeg || png || webp;
+}
+
 export const uploadToCloudinary = (
   fileBuffer: Buffer,
   folder: string,
 ): Promise<CloudinaryUploadResult> => {
   return new Promise((resolve, reject) => {
+    if (!hasAllowedImageSignature(fileBuffer)) {
+      reject(new Error("Invalid image content."));
+      return;
+    }
     const uploadStream = cloudinary.uploader.upload_stream(
-      { folder },
+      { folder, resource_type: "image", allowed_formats: ["jpg", "jpeg", "png", "webp"] },
       (error, result) => {
         if (error) return reject(error);
 

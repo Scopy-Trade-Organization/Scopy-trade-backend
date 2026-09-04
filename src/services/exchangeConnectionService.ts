@@ -28,17 +28,8 @@ axiosRetry(http, {
 
 function normalizeError(err: unknown): Error {
   if (axios.isAxiosError(err)) {
-    console.log("EXCHANGE ERROR:", {
-      status: err.response?.status,
-      data: err.response?.data,
-      headers: err.response?.headers,
-    });
-    return new Error(
-      JSON.stringify({
-        status: err.response?.status,
-        data: err.response?.data,
-      }),
-    );
+    console.error("Exchange credential validation failed", { status: err.response?.status });
+    return new Error("The exchange rejected the credentials or is temporarily unavailable.");
   }
   if (err instanceof Error) return err;
   return new Error("Unknown error occurred");

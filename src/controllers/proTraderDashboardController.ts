@@ -301,10 +301,7 @@ export const updateProTrade = async (req: Request, res: Response) => {
     console.error("Error updating pro trade:", error);
     return res.status(502).json({
       success: false,
-      message:
-        error instanceof Error
-          ? error.message
-          : "Failed to update trade parameters.",
+      message: "Failed to update trade parameters.",
     });
   }
 };
@@ -400,7 +397,7 @@ export const closeProTrade = async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error("Error closing pro trade:", error);
-    return res.status(502).json({ success: false, message: error instanceof Error ? error.message : "Failed to close pro trade." });
+    return res.status(502).json({ success: false, message: "Failed to close pro trade." });
   }
 };
 
