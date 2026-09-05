@@ -788,3 +788,50 @@ export const withdrawFunds = async (req: Request, res: Response) => {
   }
 };
 
+export const getWithdrawalHistory = async (req: Request, res: Response) => {
+  try {
+    const { page = 1 } = req.query;
+
+    const limit = 10;
+    const currentPage = Number(page);
+    const skip = currentPage > 0 ? (currentPage - 1) * limit : 0;
+
+    const filter = { userId: req.user, action: "Withdrawal Executed" };
+
+    const [logs, total] = await Promise.all([
+      AuditLog.find(filter).sort({ timestamp: -1 }).limit(limit).skip(skip),
+      AuditLog.countDocuments(filter),
+    ]);
+
+    // Every "Withdrawal Executed" log is only written after a successful
+    // on-chain broadcast (see withdrawFunds above) — failed attempts are
+    // never debited or logged, so there is nothing to show as PENDING or
+    // REJECTED here. Note this reflects broadcast success, not confirmed
+    // on-chain settlement (a known limitation of the current withdrawal
+    // flow, tracked separately).
+    const withdrawals = logs.map((log) => ({
+      id: String(log._id),
+      date: log.timestamp,
+      amount: log.details?.amount ?? null,
+      transactionId: log.details?.transactionId ?? null,
+      destinationAddress: log.details?.destinationAddress ?? null,
+      status: "COMPLETED" as const,
+    }));
+
+    return res.status(200).json({
+      success: true,
+      withdrawals,
+      page: currentPage,
+      limit,
+      pageSize: withdrawals.length,
+      pages: Math.ceil(total / limit),
+      total,
+    });
+  } catch (error) {
+    console.error("Error fetching withdrawal history:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+};
