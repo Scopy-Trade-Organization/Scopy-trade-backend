@@ -7,6 +7,7 @@ import {
   withdrawFunds,
   saveWalletAddress,
   getWalletAddress,
+  getWithdrawalHistory,
   getProTrades,
   updateProTrade,
   closeProTrade,
@@ -39,5 +40,6 @@ proTraderDashboardRouter.post("/trades/:tradeId/close", closeProTrade);
 
 proTraderDashboardRouter.post("/withdraw", withdrawFunds);
 proTraderDashboardRouter.post("/withdraw/request-otp", requestWithdrawalOtp);
+proTraderDashboardRouter.get("/withdraw/history", getWithdrawalHistory);
 
 export default proTraderDashboardRouter;
