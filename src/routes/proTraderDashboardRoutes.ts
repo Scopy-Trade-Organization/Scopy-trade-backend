@@ -10,6 +10,7 @@ import {
   getProTrades,
   updateProTrade,
   closeProTrade,
+  requestWithdrawalOtp,
 } from "../controllers/proTraderDashboardController.js";
 import { initiateTrade } from "../controllers/tradeController.js";
 
@@ -35,5 +36,6 @@ proTraderDashboardRouter.patch("/trades/:tradeId", updateProTrade);
 proTraderDashboardRouter.post("/trades/:tradeId/close", closeProTrade);
 
 proTraderDashboardRouter.post("/withdraw", withdrawFunds);
+proTraderDashboardRouter.post("/withdraw/request-otp", requestWithdrawalOtp);
 
 export default proTraderDashboardRouter;

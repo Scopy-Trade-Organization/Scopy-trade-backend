@@ -6,6 +6,8 @@ import { LoginRequestBody, RegisterRequestBody } from "../types/index.js";
 import AuditLog from "../models/auditLogModel.js";
 import { signAccessToken, signRefreshToken, verifyToken } from "../helpers/jwtHelper.js";
 import { csrfCookieOptions, isSecureRequest, setCsrfToken } from "../middleware/csrfProtection.js";
+import { consumeOtp, issueOtp } from "../services/otpService.js";
+import { queueEmail, sendOtpEmail, sendWelcomeEmail } from "../services/emailService.js";
 // import passport from "passport";
 // import { UserJwtPayload } from "../config/passport.js"; // import the interface
 
@@ -108,14 +110,19 @@ export const registerUser = async (
       }
 
       // User exists but not verified
-      return res.status(400).json({
-        status: "fail",
-        message: "User already exists but is not verified",
+      const code = await issueOtp({ email: existingUser.email, purpose: "signup", userId: existingUser._id });
+      await sendOtpEmail(existingUser.email, existingUser.firstName, code, "signup");
+      return res.status(200).json({
+        status: "success",
+        message: "A new verification code has been sent to your email.",
+        data: { email: existingUser.email },
       });
     }
 
-    // Create new user
-    await User.create({
+    const signupStatus = process.env.SIGNUP_DEFAULT_STATUS === "active" ? "active" : "waitlist";
+
+    // Create the account as unverified. It cannot be used until the emailed OTP is confirmed.
+    const user = await User.create({
       email,
       password: hashedPassword,
       firstName,
@@ -124,12 +131,17 @@ export const registerUser = async (
       sponsored,
       traderID:
         role === "CopyTrader" ? generateCopyTraderID() : generateProTraderID(),
+      status: signupStatus,
     });
+
+    const code = await issueOtp({ email: user.email, purpose: "signup", userId: user._id });
+    await sendOtpEmail(user.email, user.firstName, code, "signup");
 
     // Respond with success
     return res.status(201).json({
       status: "success",
-      message: "User registered successfully",
+      message: "Registration received. Check your email for the verification code.",
+      data: { email: user.email },
     });
   } catch (err: any) {
     console.error("Error registering user:", err);
@@ -179,6 +191,14 @@ export const login = async (
       return res.status(401).json({
         status: "fail",
         message: "Invalid credentials",
+      });
+    }
+
+    if (!user.isVerified) {
+      return res.status(403).json({
+        status: "fail",
+        code: "EMAIL_NOT_VERIFIED",
+        message: "Verify your email before signing in.",
       });
     }
 
@@ -240,6 +260,86 @@ export const login = async (
       status: "error",
       message: "Login failed due to server error",
     });
+  }
+};
+
+export const resendSignupOtp = async (req: Request, res: Response) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const user = await User.findOne({ email, isVerified: false });
+    if (user) {
+      const code = await issueOtp({ email: user.email, purpose: "signup", userId: user._id });
+      await sendOtpEmail(user.email, user.firstName, code, "signup");
+    }
+    return res.status(200).json({ status: "success", message: "If that registration exists, a new code has been sent." });
+  } catch (error) {
+    console.error("Error resending signup OTP:", error);
+    return res.status(500).json({ status: "error", message: "Unable to send a verification code." });
+  }
+};
+
+export const verifySignupOtp = async (req: Request, res: Response) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ status: "fail", message: "Invalid or expired verification code." });
+    if (user.isVerified) {
+      return res.status(200).json({ status: "success", message: "Email is already verified.", data: { status: user.status } });
+    }
+    if (!(await consumeOtp({ email, purpose: "signup", code: req.body.otp }))) {
+      return res.status(400).json({ status: "fail", message: "Invalid or expired verification code." });
+    }
+    user.isVerified = true;
+    await user.save();
+    queueEmail("welcome email failed", () => sendWelcomeEmail(user.email, user.firstName, user.status as "active" | "waitlist"));
+    return res.status(200).json({
+      status: "success",
+      message: "Email verified successfully.",
+      data: { status: user.status },
+    });
+  } catch (error) {
+    console.error("Error verifying signup OTP:", error);
+    return res.status(500).json({ status: "error", message: "Email verification failed." });
+  }
+};
+
+export const requestPasswordReset = async (req: Request, res: Response) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const user = await User.findOne({ email, isVerified: true });
+    if (user) {
+      const code = await issueOtp({ email: user.email, purpose: "password-reset", userId: user._id });
+      await sendOtpEmail(user.email, user.firstName, code, "password-reset");
+    }
+    return res.status(200).json({ status: "success", message: "If an account exists for that email, a reset code has been sent." });
+  } catch (error) {
+    console.error("Error requesting password reset:", error);
+    return res.status(500).json({ status: "error", message: "Unable to request a password reset." });
+  }
+};
+
+export const resetPassword = async (req: Request, res: Response) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const { otp, password, confirmPassword } = req.body;
+    if (!email || !otp || !password || !confirmPassword) {
+      return res.status(400).json({ status: "fail", message: "Email, code, and both password fields are required." });
+    }
+    if (password !== confirmPassword) return res.status(400).json({ status: "fail", message: "Passwords do not match." });
+    if (!validator.isStrongPassword(password, { minLength: 8, minUppercase: 1, minSymbols: 1, minNumbers: 1 })) {
+      return res.status(400).json({ status: "fail", message: "Password must be at least 8 characters and include an uppercase letter, number, and symbol." });
+    }
+    const user = await User.findOne({ email, isVerified: true }).select("+sessionVersion");
+    if (!user || !(await consumeOtp({ email, purpose: "password-reset", code: otp }))) {
+      return res.status(400).json({ status: "fail", message: "Invalid or expired verification code." });
+    }
+    user.password = await bcrypt.hash(password, 12);
+    user.sessionVersion = (user.sessionVersion ?? 0) + 1;
+    await user.save();
+    return res.status(200).json({ status: "success", message: "Password reset successfully." });
+  } catch (error) {
+    console.error("Error resetting password:", error);
+    return res.status(500).json({ status: "error", message: "Password reset failed." });
   }
 };
 

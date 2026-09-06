@@ -23,6 +23,7 @@ import {
   DEFAULT_MAX_ENTRY_DEVIATION,
 } from "../constants.js";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
+import { queueTradeEmail } from "../services/emailService.js";
 
 // ─── Fetch Exchange Balances ──────────────────────────────────────────────────
 export async function fetchExchangeBalances(req: Request, res: Response) {
@@ -481,6 +482,13 @@ export async function initiateTrade(req: Request, res: Response) {
           },
         },
       },
+    });
+
+    queueTradeEmail(userId, isProTrade ? "opened" : "copied", {
+      pair: trade.pair,
+      direction: trade.direction,
+      quantity: trade.quantity,
+      entryPrice: trade.entryPrice,
     });
 
     let monitoringWarning: string | null = null;

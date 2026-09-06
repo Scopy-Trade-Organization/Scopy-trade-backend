@@ -18,6 +18,8 @@ import { isValidTronAddress } from "../helpers/tronAddress.js";
 import { queueCopiedTradeUpdate, triggerCopiedTradeClosures } from "../services/copiedTradeUpdateService.js";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
 import { processTradeClose } from "../services/profitSharingService.js";
+import { consumeOtp, issueOtp } from "../services/otpService.js";
+import { queueWithdrawalSuccessEmail, sendOtpEmail } from "../services/emailService.js";
 
 export const getProTrades = async (req: Request, res: Response) => {
   try {
@@ -654,7 +656,7 @@ export const getWalletAddress = async (req: Request, res: Response) => {
 
 export const withdrawFunds = async (req: Request, res: Response) => {
   try {
-    const { amount } = req.body;
+    const { amount, otp } = req.body;
 
     // Reject anything that is not a positive, finite number.
     const numericAmount = Number(amount);
@@ -693,6 +695,10 @@ export const withdrawFunds = async (req: Request, res: Response) => {
       });
     }
 
+    if (!otp) {
+      return res.status(400).json({ success: false, message: "The emailed verification code is required." });
+    }
+
     // Verify server configuration BEFORE debiting the user, so a
     // misconfiguration can never strand a balance deduction.
     const privateKey = process.env.TRON_COMPANY_PRIVATE_KEY;
@@ -705,6 +711,17 @@ export const withdrawFunds = async (req: Request, res: Response) => {
         success: false,
         message: "Withdrawal is temporarily unavailable. Please try again later.",
       });
+    }
+
+
+    const otpValid = await consumeOtp({
+      email: user.email,
+      purpose: "withdrawal",
+      code: otp,
+      context: String(numericAmount),
+    });
+    if (!otpValid) {
+      return res.status(400).json({ success: false, message: "Invalid or expired verification code." });
     }
 
     // Atomically authorize and debit the user's earnings balance. The $gte
@@ -772,6 +789,8 @@ export const withdrawFunds = async (req: Request, res: Response) => {
       userAgent: req.headers["user-agent"],
     });
 
+    queueWithdrawalSuccessEmail(user._id, numericAmount, user.withdrawalAddress, transactionId);
+
     return res.status(200).json({
       success: true,
       message: "Withdrawal initiated successfully",
@@ -783,6 +802,34 @@ export const withdrawFunds = async (req: Request, res: Response) => {
       success: false,
       message: "Internal server error",
     });
+  }
+};
+
+export const requestWithdrawalOtp = async (req: Request, res: Response) => {
+  try {
+    const numericAmount = Number(req.body.amount);
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0 || !/^\d+(\.\d{1,6})?$/.test(String(req.body.amount).trim())) {
+      return res.status(400).json({ success: false, message: "Enter a positive USDT amount with at most 6 decimal places." });
+    }
+    const user = await User.findById(req.user);
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+    if (!isValidTronAddress(user.withdrawalAddress)) {
+      return res.status(400).json({ success: false, message: "Save a valid TRC-20 wallet address before withdrawing." });
+    }
+    if (Number(user.proEarningsBalance || 0) < numericAmount) {
+      return res.status(400).json({ success: false, message: "Insufficient balance for this withdrawal." });
+    }
+    const code = await issueOtp({
+      email: user.email,
+      purpose: "withdrawal",
+      userId: user._id,
+      context: String(numericAmount),
+    });
+    await sendOtpEmail(user.email, user.firstName, code, "withdrawal");
+    return res.status(200).json({ success: true, message: "A withdrawal verification code was sent to your email." });
+  } catch (error) {
+    console.error("Error requesting withdrawal OTP:", error);
+    return res.status(500).json({ success: false, message: "Unable to send a withdrawal verification code." });
   }
 };
 

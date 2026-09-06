@@ -7,6 +7,10 @@ import {
   logout,
   whoami,
   refreshToken,
+  resendSignupOtp,
+  verifySignupOtp,
+  requestPasswordReset,
+  resetPassword,
 } from "../controllers/authControllers.js";
 import { userAuthenticate } from "../middleware/authenticationMiddleware.js";
 import { loginLimiter, registrationLimiter } from "../middleware/authRateLimit.js";
@@ -14,6 +18,10 @@ import { loginLimiter, registrationLimiter } from "../middleware/authRateLimit.j
 const userAuthRouter = express.Router();
 
 userAuthRouter.post("/register", registrationLimiter, registerUser); // User Registration routes
+userAuthRouter.post("/verify-signup", loginLimiter, verifySignupOtp);
+userAuthRouter.post("/resend-signup-otp", registrationLimiter, resendSignupOtp);
+userAuthRouter.post("/forgot-password", registrationLimiter, requestPasswordReset);
+userAuthRouter.post("/reset-password", loginLimiter, resetPassword);
 
 userAuthRouter.post("/login", loginLimiter, login); // User Login route
 

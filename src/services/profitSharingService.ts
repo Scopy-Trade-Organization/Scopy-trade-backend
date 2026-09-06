@@ -10,6 +10,7 @@ import {
 import { decryptCredentials } from "./exchangeConnectionService.js";
 import { withdrawUsdt, getPlatformWallet } from "./withdrawalService.js";
 import { ExchangeId } from "../types/index.js";
+import { queueTradeEmail } from "./emailService.js";
 
 export interface TradeCloseResult {
   tradeId: string;
@@ -109,6 +110,16 @@ export async function processTradeClose(
   }
 
   if (feeApplies) queueProfitSettlement(tradeId);
+
+  queueTradeEmail(closed.userId, "closed", {
+    pair: closed.pair,
+    direction: closed.direction,
+    quantity: closed.quantity,
+    entryPrice: closed.entryFillPrice || closed.entryPrice,
+    exitPrice: closed.exitPrice ?? null,
+    realizedPnl: closed.realizedPnl ?? null,
+    tradeResult: closed.tradeResult ?? null,
+  });
 
   return {
     tradeId,

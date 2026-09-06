@@ -5,6 +5,7 @@ import User from "../models/userModel.js";
 import { Trade } from "../models/tradeModel.js";
 import mongoose from "mongoose";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
+import { queueAccountStatusEmail } from "../services/emailService.js";
 
 export const getTrades = async (req: Request, res: Response) => {
   try {
@@ -202,7 +203,9 @@ export const suspendUser = async (req: Request, res: Response) => {
         message: "User not found",
       });
     }
+    const { reason } = req.body;
     user.status = "suspended";
+    user.suspendReason = typeof reason === "string" ? reason.trim().slice(0, 500) : null;
     await user.save();
 
     await AuditLog.create({
@@ -213,6 +216,8 @@ export const suspendUser = async (req: Request, res: Response) => {
       targetId: id,
       userAgent: req.headers["user-agent"],
     });
+
+    queueAccountStatusEmail(user.email, user.firstName, "suspended", user.suspendReason ?? undefined);
 
     return res.status(200).json({
       success: true,
@@ -239,6 +244,7 @@ export const activateUser = async (req: Request, res: Response) => {
       });
     }
     user.status = "active";
+    user.suspendReason = null;
     await user.save();
 
     await AuditLog.create({
@@ -249,6 +255,8 @@ export const activateUser = async (req: Request, res: Response) => {
       targetId: id,
       userAgent: req.headers["user-agent"],
     });
+
+    queueAccountStatusEmail(user.email, user.firstName, "active");
 
     return res.status(200).json({
       success: true,

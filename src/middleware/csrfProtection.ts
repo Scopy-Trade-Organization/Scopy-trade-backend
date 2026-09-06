@@ -28,7 +28,17 @@ export function setCsrfToken(req: Request, res: Response): void {
 
 /** Protects cookie-authenticated state changes with a double-submit token. */
 export function csrfProtection(req: Request, res: Response, next: NextFunction): void {
-  if (SAFE_METHODS.has(req.method) || req.path === "/api/auth/login" || req.path === "/api/auth/register" || req.path === "/api/admin/auth/login") {
+  const publicPostPaths = new Set([
+    "/api/auth/login",
+    "/api/auth/register",
+    "/api/auth/verify-signup",
+    "/api/auth/resend-signup-otp",
+    "/api/auth/forgot-password",
+    "/api/auth/reset-password",
+    "/api/admin/auth/login",
+  ]);
+  const routePath = `${req.baseUrl}${req.path}`;
+  if (SAFE_METHODS.has(req.method) || publicPostPaths.has(routePath)) {
     next();
     return;
   }
