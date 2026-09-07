@@ -10,9 +10,7 @@ test("accepts a well-formed TRON address", () => {
   assert.equal(isValidTronAddress(USDT_TRC20_CONTRACT), true);
 });
 
-test("accepts the platform receiving wallet baked into the code", () => {
-  // Doubles as a guard that the hard-coded PLATFORM_USDT_WALLETS.TRON value is
-  // itself a valid address.
+test("accepts a second valid TRON wallet address", () => {
   assert.equal(isValidTronAddress(PLATFORM_WALLET), true);
 });
 

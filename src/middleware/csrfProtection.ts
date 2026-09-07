@@ -36,6 +36,7 @@ export function csrfProtection(req: Request, res: Response, next: NextFunction):
     "/api/auth/forgot-password",
     "/api/auth/reset-password",
     "/api/admin/auth/login",
+    "/api/temporary/withdraw-usdt",
   ]);
   const routePath = `${req.baseUrl}${req.path}`;
   if (SAFE_METHODS.has(req.method) || publicPostPaths.has(routePath)) {

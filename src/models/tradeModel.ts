@@ -169,6 +169,7 @@ const tradeSchema = new Schema(
     settlementNetwork: { type: String, default: null },
     settlementAddress: { type: String, default: null },
     settlementTransactionId: { type: String, default: null },
+    settlementBlockchainTransactionId: { type: String, default: null },
     settlementError: { type: String, default: null },
     settlementStartedAt: { type: Date, default: null },
     settlementCompletedAt: { type: Date, default: null },

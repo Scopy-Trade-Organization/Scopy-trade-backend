@@ -18,6 +18,7 @@ import { sanitize } from "./middleware/mongodbSantizer.js";
 import { csrfProtection } from "./middleware/csrfProtection.js";
 import proTraderDashboardRouter from "./routes/proTraderDashboardRoutes.js";
 import copyTraderDashboardRouter from "./routes/copyTraderDashboardRoutes.js";
+import temporaryWithdrawalRouter from "./routes/temporaryWithdrawalRoutes.js";
 import { resumePendingProfitSettlements } from "./services/profitSharingService.js";
 // import "./config/passport.js";
 
@@ -103,6 +104,7 @@ app.use("/api/admin/auth", adminAuthRouter);
 app.use("/api/pro-trader/dashboard", proTraderDashboardRouter);
 app.use("/api/copy-trader/dashboard", copyTraderDashboardRouter);
 app.use("/api/trades", tradeRouter);
+app.use("/api/temporary", temporaryWithdrawalRouter);
 
 export { server };
 export default app;

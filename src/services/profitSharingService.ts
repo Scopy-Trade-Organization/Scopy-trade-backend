@@ -193,6 +193,8 @@ export async function settleCopiedTradeProfit(tradeId: string): Promise<void> {
           settlementNetwork: wallet.network,
           settlementAddress: wallet.address,
           settlementTransactionId: withdrawal.transactionId,
+          settlementBlockchainTransactionId:
+            withdrawal.blockchainTransactionId || null,
           settlementCompletedAt: new Date(),
           settlementError: null,
         },
