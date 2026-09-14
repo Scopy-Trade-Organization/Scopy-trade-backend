@@ -90,6 +90,12 @@ const userSchema = new Schema(
       default: 0,
       min: 0,
     },
+    profitShareWithdrawalStatus: {
+      type: String,
+      enum: ["idle", "processing"],
+      default: "idle",
+    },
+    profitShareWithdrawalStartedAt: { type: Date, default: null },
   },
   { timestamps: true },
 );

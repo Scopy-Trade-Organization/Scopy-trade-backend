@@ -81,6 +81,20 @@ export function getPlatformWallet(): { network: UsdtNetwork; address: string } {
   return { network: "TRON", address };
 }
 
+/** Destination dedicated to user-approved cumulative profit-share collection. */
+export function getSystemWallet(): { network: UsdtNetwork; address: string } {
+  const network = (process.env.SYSTEM_WALLET_NETWORK || "TRON").toUpperCase();
+  if (network !== "TRON") {
+    throw new Error("SYSTEM_WALLET_NETWORK must be TRON for profit-share withdrawals.");
+  }
+  const address = process.env.SYSTEM_WALLET_ADDRESS?.trim();
+  if (!address) throw new Error("SYSTEM_WALLET_ADDRESS is required.");
+  if (!isValidTronAddress(address)) {
+    throw new Error("SYSTEM_WALLET_ADDRESS must be a valid TRON Base58Check address.");
+  }
+  return { network: "TRON", address };
+}
+
 const networkCodes: Record<
   UsdtNetwork,
   { binance: string; bybit: string; bitget: string; okx: string }

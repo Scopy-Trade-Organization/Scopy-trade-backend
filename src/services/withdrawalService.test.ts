@@ -1,7 +1,7 @@
 import { test, mock, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { http } from "./exchangeConnectionService.js";
-import { getPlatformWallet, withdrawUsdt } from "./withdrawalService.js";
+import { getPlatformWallet, getSystemWallet, withdrawUsdt } from "./withdrawalService.js";
 import type { RawCredentials } from "../types/index.js";
 
 const CREDS: RawCredentials = {
@@ -20,6 +20,8 @@ const ENV_KEYS = [
   "PLATFORM_USDT_NETWORK",
   "PLATFORM_USDT_WALLET_ADDRESS",
   "PLATFORM_USDT_TESTNET_WALLET_ADDRESS",
+  "SYSTEM_WALLET_ADDRESS",
+  "SYSTEM_WALLET_NETWORK",
   "EXCHANGE_MODE",
   "BYBIT_TEST_API_URL",
   "BYBIT_API_URL",
@@ -208,6 +210,23 @@ test("reads and validates the platform TRON wallet from environment configuratio
     network: "TRON",
     address: VALID_TRON_ADDRESS,
   });
+});
+
+test("reads the dedicated profit-share system wallet", () => {
+  process.env.SYSTEM_WALLET_ADDRESS = VALID_TRON_ADDRESS;
+  process.env.SYSTEM_WALLET_NETWORK = "TRON";
+  assert.deepEqual(getSystemWallet(), {
+    network: "TRON",
+    address: VALID_TRON_ADDRESS,
+  });
+});
+
+test("rejects missing or non-TRON profit-share system wallet configuration", () => {
+  delete process.env.SYSTEM_WALLET_ADDRESS;
+  assert.throws(() => getSystemWallet(), /SYSTEM_WALLET_ADDRESS is required/);
+  process.env.SYSTEM_WALLET_ADDRESS = VALID_TRON_ADDRESS;
+  process.env.SYSTEM_WALLET_NETWORK = "ETHEREUM";
+  assert.throws(() => getSystemWallet(), /SYSTEM_WALLET_NETWORK must be TRON/);
 });
 
 test("uses a separate TRON recipient address in testnet mode", () => {

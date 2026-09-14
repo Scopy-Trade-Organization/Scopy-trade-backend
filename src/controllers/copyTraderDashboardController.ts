@@ -3,6 +3,11 @@ import { Signal } from "../models/signalModel.js";
 import { Trade } from "../models/tradeModel.js";
 import mongoose from "mongoose";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
+import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
+import {
+  approveProfitShareWithdrawal,
+  getProfitShareSummary,
+} from "../services/profitSharingService.js";
 
 export async function getActiveProTrades(req: Request, res: Response) {
   try {
@@ -87,6 +92,58 @@ export async function getProTradeById(req: Request, res: Response) {
   } catch (err) {
     console.error("[getProTradeById]", err);
     return res.status(500).json({ success: false, message: "Failed to fetch trade." });
+  }
+}
+
+async function profitSharePayload(userId: mongoose.Types.ObjectId) {
+  const [summary, connections] = await Promise.all([
+    getProfitShareSummary(userId),
+    ExchangeConnection.find({ userId, isActive: true })
+      .select("exchange label")
+      .sort({ connectedAt: 1 })
+      .lean(),
+  ]);
+  return {
+    ...summary,
+    connections: connections.map((connection) => ({
+      connectionId: String(connection._id),
+      exchange: connection.exchange,
+      label: connection.label ?? "",
+    })),
+  };
+}
+
+export async function getProfitShare(req: Request, res: Response) {
+  try {
+    const userId = req.user as mongoose.Types.ObjectId;
+    return res.status(200).json({
+      success: true,
+      profitShare: await profitSharePayload(userId),
+    });
+  } catch (error) {
+    console.error("[getProfitShare]", error);
+    return res.status(500).json({ success: false, message: "Failed to load profit share." });
+  }
+}
+
+export async function approveProfitShare(req: Request, res: Response) {
+  try {
+    const userId = req.user as mongoose.Types.ObjectId;
+    const exchangeConnectionId = String(req.body.exchangeConnectionId || "");
+    if (!mongoose.isValidObjectId(exchangeConnectionId)) {
+      return res.status(400).json({ success: false, message: "Select a valid exchange connection." });
+    }
+    const result = await approveProfitShareWithdrawal(userId, exchangeConnectionId);
+    return res.status(200).json({
+      success: true,
+      message: `${Number(result.amount).toFixed(2)} USDT profit share was submitted successfully.`,
+      transactionId: result.transactionId,
+      profitShare: await profitSharePayload(userId),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Profit-share withdrawal failed.";
+    console.error("[approveProfitShare]", message);
+    return res.status(422).json({ success: false, message });
   }
 }
 //GET  all active signals.

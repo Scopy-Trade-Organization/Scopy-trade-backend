@@ -5,10 +5,11 @@ import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import {
   PLATFORM_FEE_PERCENT,
   PLATFORM_SHARE_PERCENT,
+  PROFIT_SHARE_WITHDRAWAL_THRESHOLD,
   PRO_TRADER_SHARE_PERCENT,
 } from "../constants.js";
 import { decryptCredentials } from "./exchangeConnectionService.js";
-import { withdrawUsdt, getPlatformWallet } from "./withdrawalService.js";
+import { withdrawUsdt, getSystemWallet } from "./withdrawalService.js";
 import { ExchangeId } from "../types/index.js";
 import { queueTradeEmail } from "./emailService.js";
 
@@ -40,8 +41,9 @@ function classifyResult(pnl: number): "profit" | "loss" | "breakeven" {
 }
 
 /**
- * Persists the close exactly once, then schedules fee settlement without
- * blocking the exchange-monitor callback.
+ * Persists the close exactly once. Profitable copy-trade fees remain pending
+ * until the user's accrued 20% share reaches the collection threshold and the
+ * user explicitly approves a withdrawal.
  */
 export async function processTradeClose(
   tradeId: string,
@@ -109,8 +111,6 @@ export async function processTradeClose(
     };
   }
 
-  if (feeApplies) queueProfitSettlement(tradeId);
-
   queueTradeEmail(closed.userId, "closed", {
     pair: closed.pair,
     direction: closed.direction,
@@ -130,43 +130,166 @@ export async function processTradeClose(
   };
 }
 
-export function queueProfitSettlement(tradeId: string): void {
-  setImmediate(() => {
-    void settleCopiedTradeProfit(tradeId).catch((error) => {
-      console.error(`[profitSharingService] Settlement failed for ${tradeId}:`, error);
-    });
-  });
+const OUTSTANDING_FEE_STATUSES = ["pending", "failed", "processing"] as const;
+
+export interface ProfitShareSummary {
+  pendingAmount: string;
+  threshold: string;
+  withdrawalRequired: boolean;
+  processing: boolean;
 }
 
-/** Withdraws the full 20% first, then atomically credits 5% to the source pro. */
-export async function settleCopiedTradeProfit(tradeId: string): Promise<void> {
-  const staleBefore = new Date(Date.now() - 10 * 60 * 1000);
-  const trade = await Trade.findOneAndUpdate(
+export async function getProfitShareSummary(
+  userId: mongoose.Types.ObjectId,
+): Promise<ProfitShareSummary> {
+  const [totals] = await Trade.aggregate<{ amount: number; processing: number }>([
     {
-      _id: tradeId,
-      tradeOrigin: "copy",
-      tradeResult: "profit",
+      $match: {
+        userId,
+        tradeOrigin: "copy",
+        tradeResult: "profit",
+        feeStatus: { $in: [...OUTSTANDING_FEE_STATUSES] },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        amount: {
+          $sum: {
+            $convert: { input: "$platformFee", to: "double", onError: 0, onNull: 0 },
+          },
+        },
+        processing: {
+          $sum: { $cond: [{ $eq: ["$feeStatus", "processing"] }, 1, 0] },
+        },
+      },
+    },
+  ]);
+  const amount = totals?.amount ?? 0;
+  return {
+    pendingAmount: amount.toFixed(6),
+    threshold: PROFIT_SHARE_WITHDRAWAL_THRESHOLD.toFixed(2),
+    withdrawalRequired: amount + 1e-9 >= PROFIT_SHARE_WITHDRAWAL_THRESHOLD,
+    processing: (totals?.processing ?? 0) > 0,
+  };
+}
+
+async function creditProTraderShare(trade: {
+  _id: mongoose.Types.ObjectId;
+  sourceTradeId?: mongoose.Types.ObjectId | null;
+  proTraderShare?: string | null;
+}): Promise<void> {
+  const source = trade.sourceTradeId
+    ? await Trade.findById(trade.sourceTradeId).select("userId").lean()
+    : null;
+  if (!source) return;
+
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const claimed = await Trade.updateOne(
+        { _id: trade._id, feeStatus: "collected", proTraderCreditStatus: "pending" },
+        { $set: { proTraderCreditStatus: "credited", proTraderCreditedAt: new Date() } },
+        { session },
+      );
+      if (claimed.modifiedCount === 1) {
+        await User.updateOne(
+          { _id: source.userId },
+          { $inc: { proEarningsBalance: Number(trade.proTraderShare || 0) } },
+          { session },
+        );
+      }
+    });
+  } finally {
+    await session.endSession();
+  }
+}
+
+/** Collects all currently accrued fees after explicit copy-trader approval. */
+export async function approveProfitShareWithdrawal(
+  userId: mongoose.Types.ObjectId,
+  exchangeConnectionId: string,
+): Promise<{ amount: string; transactionId: string }> {
+  const staleBefore = new Date(Date.now() - 10 * 60 * 1000);
+  const lockedUser = await User.findOneAndUpdate(
+    {
+      _id: userId,
       $or: [
-        { feeStatus: { $in: ["pending", "failed"] } },
-        { feeStatus: "processing", settlementStartedAt: { $lt: staleBefore } },
+        { profitShareWithdrawalStatus: { $ne: "processing" } },
+        { profitShareWithdrawalStartedAt: { $lt: staleBefore } },
       ],
     },
     {
       $set: {
-        feeStatus: "processing",
-        settlementStartedAt: new Date(),
-        settlementError: null,
+        profitShareWithdrawalStatus: "processing",
+        profitShareWithdrawalStartedAt: new Date(),
       },
     },
     { new: true },
   ).lean();
-  if (!trade) return;
+  if (!lockedUser) throw new Error("A profit-share withdrawal is already processing.");
 
+  let batchId: string | null = null;
+  let claimedIds: mongoose.Types.ObjectId[] = [];
   try {
-    const connection = await ExchangeConnection.findById(trade.exchangeConnectionId).lean();
-    if (!connection?.encryptedApiKey || !connection.encryptedApiSecret) {
-      throw new Error("The copy trader's exchange connection is unavailable.");
+    const retryableBatch = await Trade.findOne({
+      userId,
+      tradeOrigin: "copy",
+      tradeResult: "profit",
+      feeStatus: "failed",
+      settlementBatchId: { $ne: null },
+    }).select("settlementBatchId").sort({ settlementStartedAt: 1 }).lean();
+
+    batchId = retryableBatch?.settlementBatchId || new mongoose.Types.ObjectId().toString();
+    const pending = await Trade.find(
+      retryableBatch?.settlementBatchId
+        ? {
+            userId,
+            tradeOrigin: "copy",
+            tradeResult: "profit",
+            feeStatus: "failed",
+            settlementBatchId: retryableBatch.settlementBatchId,
+          }
+        : {
+            userId,
+            tradeOrigin: "copy",
+            tradeResult: "profit",
+            feeStatus: { $in: ["pending", "failed"] },
+            $or: [{ settlementBatchId: null }, { settlementBatchId: { $exists: false } }],
+          },
+    )
+      .select("_id platformFee sourceTradeId proTraderShare")
+      .sort({ closedAt: 1 })
+      .lean();
+    const amount = pending.reduce((sum, trade) => sum + Number(trade.platformFee || 0), 0);
+    if (amount + 1e-9 < PROFIT_SHARE_WITHDRAWAL_THRESHOLD) {
+      throw new Error(
+        `Profit share must reach ${PROFIT_SHARE_WITHDRAWAL_THRESHOLD.toFixed(2)} USDT before withdrawal.`,
+      );
     }
+
+    claimedIds = pending.map((trade) => trade._id);
+    const connection = await ExchangeConnection.findOne({
+      _id: exchangeConnectionId,
+      userId,
+      isActive: true,
+    }).lean();
+    if (!connection?.encryptedApiKey || !connection.encryptedApiSecret) {
+      throw new Error("Select a valid active exchange connection.");
+    }
+
+    await Trade.updateMany(
+      { _id: { $in: claimedIds }, feeStatus: { $in: ["pending", "failed"] } },
+      {
+        $set: {
+          feeStatus: "processing",
+          settlementBatchId: batchId,
+          settlementStartedAt: new Date(),
+          settlementError: null,
+        },
+      },
+    );
+
     const credentials = decryptCredentials({
       exchange: connection.exchange as ExchangeId,
       apiKey: connection.encryptedApiKey,
@@ -175,83 +298,98 @@ export async function settleCopiedTradeProfit(tradeId: string): Promise<void> {
         ? { passphrase: connection.encryptedPassphrase }
         : {}),
     });
-    const wallet = getPlatformWallet();
+    const wallet = getSystemWallet();
     const withdrawal = await withdrawUsdt(
       connection.exchange as ExchangeId,
       credentials,
-      trade.platformFee || "0",
+      amount.toFixed(6),
       wallet.address,
       wallet.network,
-      `copy-profit-${tradeId}`,
+      `profit-share-${batchId}`,
     );
 
-    await Trade.updateOne(
-      { _id: tradeId, feeStatus: "processing" },
+    await Trade.updateMany(
+      { settlementBatchId: batchId, feeStatus: "processing" },
       {
         $set: {
           feeStatus: "collected",
           settlementNetwork: wallet.network,
           settlementAddress: wallet.address,
           settlementTransactionId: withdrawal.transactionId,
-          settlementBlockchainTransactionId:
-            withdrawal.blockchainTransactionId || null,
+          settlementBlockchainTransactionId: withdrawal.blockchainTransactionId || null,
           settlementCompletedAt: new Date(),
           settlementError: null,
         },
       },
     );
 
-    const source = trade.sourceTradeId
-      ? await Trade.findById(trade.sourceTradeId).select("userId").lean()
-      : null;
-    if (!source) throw new Error("The source pro trade was not found for commission credit.");
-
-    const session = await mongoose.startSession();
-    try {
-      await session.withTransaction(async () => {
-        const claimed = await Trade.updateOne(
-          { _id: tradeId, proTraderCreditStatus: "pending" },
-          {
-            $set: {
-              proTraderCreditStatus: "credited",
-              proTraderCreditedAt: new Date(),
-            },
-          },
-          { session },
-        );
-        if (claimed.modifiedCount === 1) {
-          await User.updateOne(
-            { _id: source.userId },
-            { $inc: { proEarningsBalance: Number(trade.proTraderShare || 0) } },
-            { session },
-          );
-        }
-      });
-    } finally {
-      await session.endSession();
+    for (const trade of pending) {
+      await creditProTraderShare(trade).catch((error) =>
+        console.error(`[profitSharingService] Pro credit failed for ${trade._id}:`, error),
+      );
     }
+    return { amount: amount.toFixed(6), transactionId: withdrawal.transactionId };
   } catch (error) {
-    await Trade.updateOne(
-      { _id: tradeId, feeStatus: "processing" },
-      {
-        $set: {
-          feeStatus: "failed",
-          settlementError: error instanceof Error ? error.message : String(error),
+    if (claimedIds.length && batchId) {
+      await Trade.updateMany(
+        { settlementBatchId: batchId, feeStatus: "processing" },
+        {
+          $set: {
+            feeStatus: "failed",
+            settlementError: error instanceof Error ? error.message : String(error),
+          },
         },
-      },
-    );
+      );
+    }
     throw error;
+  } finally {
+    await User.updateOne(
+      { _id: userId },
+      { $set: { profitShareWithdrawalStatus: "idle", profitShareWithdrawalStartedAt: null } },
+    );
   }
 }
 
-export async function resumePendingProfitSettlements(): Promise<void> {
+/** Startup recovery credits pros only; withdrawals always require user approval. */
+export async function resumePendingProfitCredits(): Promise<void> {
+  const staleBefore = new Date(Date.now() - 10 * 60 * 1000);
+  await Promise.all([
+    Trade.updateMany(
+      {
+        tradeOrigin: "copy",
+        tradeResult: "profit",
+        feeStatus: "processing",
+        settlementBatchId: { $ne: null },
+        settlementStartedAt: { $lt: staleBefore },
+      },
+      {
+        $set: {
+          feeStatus: "failed",
+          settlementError: "A previous approved withdrawal was interrupted. Please approve it again.",
+        },
+      },
+    ),
+    User.updateMany(
+      {
+        role: "CopyTrader",
+        profitShareWithdrawalStatus: "processing",
+        profitShareWithdrawalStartedAt: { $lt: staleBefore },
+      },
+      { $set: { profitShareWithdrawalStatus: "idle", profitShareWithdrawalStartedAt: null } },
+    ),
+  ]);
+
   const trades = await Trade.find({
     tradeOrigin: "copy",
-    tradeResult: "profit",
-    feeStatus: { $in: ["pending", "failed"] },
+    feeStatus: "collected",
+    proTraderCreditStatus: "pending",
   })
-    .select("_id")
+    .select("_id sourceTradeId proTraderShare")
     .limit(100)
     .lean();
-  for (const trade of trades) queueProfitSettlement(String(trade._id));
+  for (const trade of trades) {
+    await creditProTraderShare(trade).catch((error) =>
+      console.error(`[profitSharingService] Pro credit recovery failed for ${trade._id}:`, error),
+    );
+  }
 }

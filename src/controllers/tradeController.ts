@@ -24,6 +24,7 @@ import {
 } from "../constants.js";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
 import { queueTradeEmail } from "../services/emailService.js";
+import { getProfitShareSummary } from "../services/profitSharingService.js";
 
 // ─── Fetch Exchange Balances ──────────────────────────────────────────────────
 export async function fetchExchangeBalances(req: Request, res: Response) {
@@ -224,6 +225,18 @@ export async function initiateTrade(req: Request, res: Response) {
             sl: sourceTrade.sl,
           }
         : null;
+    }
+
+    if (!isProTrade) {
+      const profitShare = await getProfitShareSummary(userId);
+      if (profitShare.withdrawalRequired) {
+        return res.status(402).json({
+          success: false,
+          code: "PROFIT_SHARE_DUE",
+          message: `Approve the ${Number(profitShare.pendingAmount).toFixed(2)} USDT platform profit-share withdrawal before copying another trade.`,
+          profitShare,
+        });
+      }
     }
 
     if (!signal) {

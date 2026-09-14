@@ -172,6 +172,7 @@ const tradeSchema = new Schema(
     settlementBlockchainTransactionId: { type: String, default: null },
     settlementError: { type: String, default: null },
     settlementStartedAt: { type: Date, default: null },
+    settlementBatchId: { type: String, default: null, index: true },
     settlementCompletedAt: { type: Date, default: null },
     proTraderCreditStatus: {
       type: String,
