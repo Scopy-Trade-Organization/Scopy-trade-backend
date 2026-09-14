@@ -75,7 +75,7 @@ type MonitoringStatus =
 const MAX_RECONNECT_DELAY_MS = 60000;
 const BINANCE_LISTENKEY_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
 const BITGET_PING_INTERVAL_MS = 30000;
-const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000;
+const RECONCILIATION_INTERVAL_MS = 60 * 1000;
 
 // ─── Trade Monitor Service ──────────────────────────────────────────────────
 

@@ -702,7 +702,8 @@ async function getBitgetOrderStatus(
 
   interface BitgetStatusResponse {
     code: string;
-    data: { status: string; priceAvg: string };
+    msg?: string;
+    data: { state?: string; status?: string; priceAvg: string };
   }
 
   const { data } = await http.get<BitgetStatusResponse>(
@@ -719,18 +720,29 @@ async function getBitgetOrderStatus(
     },
   );
 
+  if (data.code !== "00000") {
+    throw new Error(
+      `Bitget order status rejected (${data.code}): ${data.msg || "Unknown exchange error"}`,
+    );
+  }
+
   const order = data.data;
   if (!order) throw new Error("Order not found on Bitget.");
 
   const statusMap: Record<string, OrderStatusResult["status"]> = {
+    filled: "filled",
     full_fill: "filled",
+    partially_filled: "pending",
     partial_fill: "pending",
     cancelled: "cancelled",
+    canceled: "cancelled",
     live: "pending",
+    new: "pending",
   };
+  const rawStatus = String(order.state || order.status || "").toLowerCase();
 
   return {
-    status: statusMap[order.status] ?? "pending",
+    status: statusMap[rawStatus] ?? "pending",
     filledPrice: order.priceAvg || null,
     raw: data,
   };

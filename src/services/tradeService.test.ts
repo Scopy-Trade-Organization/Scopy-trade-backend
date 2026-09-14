@@ -1,7 +1,7 @@
 import { afterEach, mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { http } from "./exchangeConnectionService.js";
-import { placeOrder } from "./tradeService.js";
+import { getOrderStatus, placeOrder } from "./tradeService.js";
 import type { RawCredentials } from "../types/index.js";
 
 const credentials: RawCredentials = {
@@ -94,4 +94,49 @@ test("Bitget orders below the contract minimum are rejected locally", async () =
     () => placeOrder("bitget", { ...params, quantity: "0.0009" }),
     /below Bitget Futures minimum/,
   );
+});
+
+test("Bitget filled futures orders are read from the state field", async () => {
+  process.env.BITGET_DEMO_MODE = "true";
+  let capturedHeaders: Record<string, string> = {};
+  mock.method(http as any, "get", async (_url: string, config: any) => {
+    capturedHeaders = config.headers;
+    return {
+      data: {
+        code: "00000",
+        msg: "success",
+        data: { state: "filled", priceAvg: "50123.5" },
+      },
+    };
+  });
+
+  const result = await getOrderStatus(
+    "bitget",
+    credentials,
+    "BTCUSDT",
+    "123",
+  );
+
+  assert.equal(result.status, "filled");
+  assert.equal(result.filledPrice, "50123.5");
+  assert.equal(capturedHeaders.paptrading, "1");
+});
+
+test("Bitget canceled futures orders are not left pending", async () => {
+  mock.method(http as any, "get", async () => ({
+    data: {
+      code: "00000",
+      msg: "success",
+      data: { state: "canceled", priceAvg: "" },
+    },
+  }));
+
+  const result = await getOrderStatus(
+    "bitget",
+    credentials,
+    "BTCUSDT",
+    "123",
+  );
+
+  assert.equal(result.status, "cancelled");
 });
