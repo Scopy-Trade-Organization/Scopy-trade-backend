@@ -4,10 +4,22 @@ import User from "../models/userModel.js";
 import validator from "validator";
 import { LoginRequestBody, RegisterRequestBody } from "../types/index.js";
 import AuditLog from "../models/auditLogModel.js";
-import { signAccessToken, signRefreshToken, verifyToken } from "../helpers/jwtHelper.js";
-import { csrfCookieOptions, isSecureRequest, setCsrfToken } from "../middleware/csrfProtection.js";
+import {
+  signAccessToken,
+  signRefreshToken,
+  verifyToken,
+} from "../helpers/jwtHelper.js";
+import {
+  csrfCookieOptions,
+  isSecureRequest,
+  setCsrfToken,
+} from "../middleware/csrfProtection.js";
 import { consumeOtp, issueOtp } from "../services/otpService.js";
-import { queueEmail, sendOtpEmail, sendWelcomeEmail } from "../services/emailService.js";
+import {
+  queueEmail,
+  sendOtpEmail,
+  sendWelcomeEmail,
+} from "../services/emailService.js";
 // import passport from "passport";
 // import { UserJwtPayload } from "../config/passport.js"; // import the interface
 
@@ -110,8 +122,17 @@ export const registerUser = async (
       }
 
       // User exists but not verified
-      const code = await issueOtp({ email: existingUser.email, purpose: "signup", userId: existingUser._id });
-      await sendOtpEmail(existingUser.email, existingUser.firstName, code, "signup");
+      const code = await issueOtp({
+        email: existingUser.email,
+        purpose: "signup",
+        userId: existingUser._id,
+      });
+      await sendOtpEmail(
+        existingUser.email,
+        existingUser.firstName,
+        code,
+        "signup",
+      );
       return res.status(200).json({
         status: "success",
         message: "A new verification code has been sent to your email.",
@@ -119,7 +140,8 @@ export const registerUser = async (
       });
     }
 
-    const signupStatus = process.env.SIGNUP_DEFAULT_STATUS === "active" ? "active" : "waitlist";
+    const signupStatus =
+      process.env.SIGNUP_DEFAULT_STATUS === "active" ? "active" : "waitlist";
 
     // Create the account as unverified. It cannot be used until the emailed OTP is confirmed.
     const user = await User.create({
@@ -134,13 +156,18 @@ export const registerUser = async (
       status: signupStatus,
     });
 
-    const code = await issueOtp({ email: user.email, purpose: "signup", userId: user._id });
+    const code = await issueOtp({
+      email: user.email,
+      purpose: "signup",
+      userId: user._id,
+    });
     await sendOtpEmail(user.email, user.firstName, code, "signup");
 
     // Respond with success
     return res.status(201).json({
       status: "success",
-      message: "Registration received. Check your email for the verification code.",
+      message:
+        "Registration received. Check your email for the verification code.",
       data: { email: user.email },
     });
   } catch (err: any) {
@@ -167,7 +194,9 @@ export const login = async (
       });
     }
 
-    const user = await User.findOne({ email }).select("+password +sessionVersion");
+    const user = await User.findOne({ email }).select(
+      "+password +sessionVersion",
+    );
 
     // Check if user exists and has a password
     if (!user || !user.password) {
@@ -216,7 +245,11 @@ export const login = async (
     //   });
     // }
 
-    const accessToken = signAccessToken(user._id.toString(), "user", user.sessionVersion ?? 0);
+    const accessToken = signAccessToken(
+      user._id.toString(),
+      "user",
+      user.sessionVersion ?? 0,
+    );
     user.password = null;
 
     await AuditLog.create({
@@ -238,7 +271,11 @@ export const login = async (
     setCsrfToken(req, res);
 
     if (rememberMe) {
-      const refreshToken = signRefreshToken(user._id.toString(), "user", user.sessionVersion ?? 0);
+      const refreshToken = signRefreshToken(
+        user._id.toString(),
+        "user",
+        user.sessionVersion ?? 0,
+      );
 
       res.cookie("refresh_token", refreshToken, {
         httpOnly: true,
@@ -265,33 +302,75 @@ export const login = async (
 
 export const resendSignupOtp = async (req: Request, res: Response) => {
   try {
-    const email = String(req.body.email || "").trim().toLowerCase();
+    const email = String(req.body.email || "")
+      .trim()
+      .toLowerCase();
     const user = await User.findOne({ email, isVerified: false });
     if (user) {
-      const code = await issueOtp({ email: user.email, purpose: "signup", userId: user._id });
+      const code = await issueOtp({
+        email: user.email,
+        purpose: "signup",
+        userId: user._id,
+      });
       await sendOtpEmail(user.email, user.firstName, code, "signup");
     }
-    return res.status(200).json({ status: "success", message: "If that registration exists, a new code has been sent." });
+    return res
+      .status(200)
+      .json({
+        status: "success",
+        message: "If that registration exists, a new code has been sent.",
+      });
   } catch (error) {
     console.error("Error resending signup OTP:", error);
-    return res.status(500).json({ status: "error", message: "Unable to send a verification code." });
+    return res
+      .status(500)
+      .json({
+        status: "error",
+        message: "Unable to send a verification code.",
+      });
   }
 };
 
 export const verifySignupOtp = async (req: Request, res: Response) => {
   try {
-    const email = String(req.body.email || "").trim().toLowerCase();
+    const email = String(req.body.email || "")
+      .trim()
+      .toLowerCase();
+
     const user = await User.findOne({ email });
-    if (!user) return res.status(400).json({ status: "fail", message: "Invalid or expired verification code." });
+
+    if (!user)
+      return res.status(400).json({
+        status: "fail",
+        message: "Invalid or expired verification code.",
+      });
+
     if (user.isVerified) {
-      return res.status(200).json({ status: "success", message: "Email is already verified.", data: { status: user.status } });
+      return res.status(200).json({
+        status: "success",
+        message: "Email is already verified.",
+        data: { status: user.status },
+      });
     }
+
     if (!(await consumeOtp({ email, purpose: "signup", code: req.body.otp }))) {
-      return res.status(400).json({ status: "fail", message: "Invalid or expired verification code." });
+      return res.status(400).json({
+        status: "fail",
+        message: "Invalid or expired verification code.",
+      });
     }
+
     user.isVerified = true;
     await user.save();
-    queueEmail("welcome email failed", () => sendWelcomeEmail(user.email, user.firstName, user.status as "active" | "waitlist"));
+
+    queueEmail("welcome email failed", () =>
+      sendWelcomeEmail(
+        user.email,
+        user.firstName,
+        user.status as "active" | "waitlist",
+      ),
+    );
+
     return res.status(200).json({
       status: "success",
       message: "Email verified successfully.",
@@ -299,54 +378,115 @@ export const verifySignupOtp = async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error("Error verifying signup OTP:", error);
-    return res.status(500).json({ status: "error", message: "Email verification failed." });
+    return res
+      .status(500)
+      .json({ status: "error", message: "Email verification failed." });
   }
 };
 
 export const requestPasswordReset = async (req: Request, res: Response) => {
   try {
-    const email = String(req.body.email || "").trim().toLowerCase();
+    const email = String(req.body.email || "")
+      .trim()
+      .toLowerCase();
     const user = await User.findOne({ email, isVerified: true });
     if (user) {
-      const code = await issueOtp({ email: user.email, purpose: "password-reset", userId: user._id });
+      const code = await issueOtp({
+        email: user.email,
+        purpose: "password-reset",
+        userId: user._id,
+      });
       await sendOtpEmail(user.email, user.firstName, code, "password-reset");
     }
-    return res.status(200).json({ status: "success", message: "If an account exists for that email, a reset code has been sent." });
+    return res
+      .status(200)
+      .json({
+        status: "success",
+        message:
+          "If an account exists for that email, a reset code has been sent.",
+      });
   } catch (error) {
     console.error("Error requesting password reset:", error);
-    return res.status(500).json({ status: "error", message: "Unable to request a password reset." });
+    return res
+      .status(500)
+      .json({
+        status: "error",
+        message: "Unable to request a password reset.",
+      });
   }
 };
 
 export const resetPassword = async (req: Request, res: Response) => {
   try {
-    const email = String(req.body.email || "").trim().toLowerCase();
+    const email = String(req.body.email || "")
+      .trim()
+      .toLowerCase();
     const { otp, password, confirmPassword } = req.body;
     if (!email || !otp || !password || !confirmPassword) {
-      return res.status(400).json({ status: "fail", message: "Email, code, and both password fields are required." });
+      return res
+        .status(400)
+        .json({
+          status: "fail",
+          message: "Email, code, and both password fields are required.",
+        });
     }
-    if (password !== confirmPassword) return res.status(400).json({ status: "fail", message: "Passwords do not match." });
-    if (!validator.isStrongPassword(password, { minLength: 8, minUppercase: 1, minSymbols: 1, minNumbers: 1 })) {
-      return res.status(400).json({ status: "fail", message: "Password must be at least 8 characters and include an uppercase letter, number, and symbol." });
+    if (password !== confirmPassword)
+      return res
+        .status(400)
+        .json({ status: "fail", message: "Passwords do not match." });
+    if (
+      !validator.isStrongPassword(password, {
+        minLength: 8,
+        minUppercase: 1,
+        minSymbols: 1,
+        minNumbers: 1,
+      })
+    ) {
+      return res
+        .status(400)
+        .json({
+          status: "fail",
+          message:
+            "Password must be at least 8 characters and include an uppercase letter, number, and symbol.",
+        });
     }
-    const user = await User.findOne({ email, isVerified: true }).select("+sessionVersion");
-    if (!user || !(await consumeOtp({ email, purpose: "password-reset", code: otp }))) {
-      return res.status(400).json({ status: "fail", message: "Invalid or expired verification code." });
+    const user = await User.findOne({ email, isVerified: true }).select(
+      "+sessionVersion",
+    );
+    if (
+      !user ||
+      !(await consumeOtp({ email, purpose: "password-reset", code: otp }))
+    ) {
+      return res
+        .status(400)
+        .json({
+          status: "fail",
+          message: "Invalid or expired verification code.",
+        });
     }
     user.password = await bcrypt.hash(password, 12);
     user.sessionVersion = (user.sessionVersion ?? 0) + 1;
     await user.save();
-    return res.status(200).json({ status: "success", message: "Password reset successfully." });
+    return res
+      .status(200)
+      .json({ status: "success", message: "Password reset successfully." });
   } catch (error) {
     console.error("Error resetting password:", error);
-    return res.status(500).json({ status: "error", message: "Password reset failed." });
+    return res
+      .status(500)
+      .json({ status: "error", message: "Password reset failed." });
   }
 };
 
 export const logout = async (req: Request, res: Response) => {
   const isSecure = isSecureRequest(req);
-  if (req.user) await User.updateOne({ _id: req.user }, { $inc: { sessionVersion: 1 } });
-  const options = { httpOnly: true, secure: isSecure, sameSite: isSecure ? "none" as const : "lax" as const };
+  if (req.user)
+    await User.updateOne({ _id: req.user }, { $inc: { sessionVersion: 1 } });
+  const options = {
+    httpOnly: true,
+    secure: isSecure,
+    sameSite: isSecure ? ("none" as const) : ("lax" as const),
+  };
   res.clearCookie("user_token", options);
   res.clearCookie("refresh_token", { ...options, path: "/api/auth/refresh" });
   res.clearCookie("csrf_token", csrfCookieOptions(req));
@@ -405,7 +545,9 @@ export const refreshToken = async (req: Request, res: Response) => {
       });
     }
 
-    const user = await User.findById(decoded.sub).select("-password +sessionVersion");
+    const user = await User.findById(decoded.sub).select(
+      "-password +sessionVersion",
+    );
     if (!user || user.sessionVersion !== decoded.sv) {
       return res.status(401).json({
         status: "fail",
@@ -413,7 +555,11 @@ export const refreshToken = async (req: Request, res: Response) => {
       });
     }
 
-    const newAccessToken = signAccessToken(user._id.toString(), "user", user.sessionVersion ?? 0);
+    const newAccessToken = signAccessToken(
+      user._id.toString(),
+      "user",
+      user.sessionVersion ?? 0,
+    );
 
     res.cookie("user_token", newAccessToken, {
       httpOnly: true,

@@ -134,10 +134,78 @@ async function prepareFuturesOrder(
   exchange: ExchangeId,
   p: PlaceOrderParams,
 ): Promise<PlaceOrderParams> {
-  if (exchange !== "binance" && exchange !== "bybit") return p;
+  if (exchange !== "binance" && exchange !== "bybit" && exchange !== "bitget") return p;
 
   const baseUrl = getExchangeRestUrl(exchange);
   const symbol = normalizePairForExchange(exchange, p.pair);
+
+  if (exchange === "bitget") {
+    interface BitgetContractResponse {
+      code: string;
+      msg: string;
+      data: Array<{
+        symbol: string;
+        minTradeNum: string;
+        minTradeUSDT: string;
+        priceEndStep: string;
+        pricePlace: string;
+        sizeMultiplier: string;
+        symbolStatus: string;
+      }>;
+    }
+
+    const { data } = await http.get<BitgetContractResponse>(
+      `${baseUrl}/api/v2/mix/market/contracts`,
+      {
+        params: { productType: "USDT-FUTURES", symbol },
+        headers: {
+          ...(process.env.BITGET_DEMO_MODE === "true"
+            ? { paptrading: "1" }
+            : {}),
+        },
+      },
+    );
+    if (data.code !== "00000") {
+      throw new Error(data.msg || "Bitget contract lookup failed.");
+    }
+
+    const instrument = data.data?.find((item) => item.symbol === symbol);
+    if (!instrument) {
+      throw new Error(`Bitget Futures does not support ${symbol}.`);
+    }
+    if (instrument.symbolStatus !== "normal") {
+      throw new Error(
+        `Bitget Futures does not currently allow opening ${symbol} orders (${instrument.symbolStatus}).`,
+      );
+    }
+
+    const pricePlaces = Number(instrument.pricePlace);
+    const priceEndStep = Number(instrument.priceEndStep);
+    const sizeMultiplier = instrument.sizeMultiplier;
+    if (
+      !Number.isInteger(pricePlaces) ||
+      pricePlaces < 0 ||
+      !Number.isFinite(priceEndStep) ||
+      priceEndStep <= 0 ||
+      !sizeMultiplier
+    ) {
+      throw new Error(`Bitget returned incomplete Futures rules for ${symbol}.`);
+    }
+
+    const priceStep = (priceEndStep * 10 ** -pricePlaces).toFixed(pricePlaces);
+    const quantity = alignToStep(p.quantity, sizeMultiplier, true);
+    const entryPrice = alignToStep(p.entryPrice, priceStep);
+    const tp = alignToStep(p.tp, priceStep);
+    const sl = alignToStep(p.sl, priceStep);
+    if (
+      Number(quantity) < Number(instrument.minTradeNum || 0) ||
+      Number(quantity) * Number(entryPrice) < Number(instrument.minTradeUSDT || 0)
+    ) {
+      throw new Error(`Calculated quantity is below Bitget Futures minimum for ${symbol}.`);
+    }
+
+    return { ...p, quantity, entryPrice, tp, sl };
+  }
 
   if (exchange === "binance") {
     const { data } = await http.get(`${baseUrl}/fapi/v1/exchangeInfo`);
@@ -393,6 +461,7 @@ async function placeBitgetOrder(
     tradeSide: "open",
     orderType: "limit",
     force: "gtc",
+    ...(p.clientOrderId ? { clientOid: p.clientOrderId } : {}),
     presetStopSurplusPrice: p.tp,
     presetStopLossPrice: p.sl,
   });
@@ -409,23 +478,50 @@ async function placeBitgetOrder(
     data: { orderId: string };
   }
 
-  const { data } = await http.post<BitgetOrderResponse>(
-    BITGET_BASE_URL + path,
-    body,
-    {
-      headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
-        "ACCESS-KEY": apiKey,
-        "ACCESS-SIGN": signature,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": passphrase,
-        "Content-Type": "application/json",
+  let data: BitgetOrderResponse;
+  try {
+    ({ data } = await http.post<BitgetOrderResponse>(
+      BITGET_BASE_URL + path,
+      body,
+      {
+        headers: {
+          ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+          "ACCESS-KEY": apiKey,
+          "ACCESS-SIGN": signature,
+          "ACCESS-TIMESTAMP": timestamp,
+          "ACCESS-PASSPHRASE": passphrase,
+          "Content-Type": "application/json",
+        },
       },
-    },
-  );
+    ));
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      const response = error.response?.data as
+        | { code?: unknown; msg?: unknown }
+        | undefined;
+      const code =
+        typeof response?.code === "string" ? response.code : undefined;
+      const message =
+        typeof response?.msg === "string" && response.msg.trim()
+          ? response.msg.trim()
+          : "The request was rejected by Bitget.";
+      console.error("[Bitget] Order request failed", {
+        status: error.response?.status,
+        code,
+        message,
+      });
+      throw new Error(
+        `Bitget order rejected${code ? ` (${code})` : ""}: ${message}`,
+      );
+    }
+    throw error;
+  }
 
-  if (data.code !== "00000")
-    throw new Error(data.msg || "Bitget order failed.");
+  if (data.code !== "00000") {
+    throw new Error(
+      `Bitget order rejected (${data.code}): ${data.msg || "Unknown Bitget error."}`,
+    );
+  }
 
   const orderId = data.data.orderId;
 
