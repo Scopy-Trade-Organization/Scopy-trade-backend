@@ -307,6 +307,11 @@ export async function approveProfitShareWithdrawal(
       wallet.network,
       `profit-share-${batchId}`,
     );
+    if (withdrawal.status === "dry-run") {
+      throw new Error(
+        "Profit-share withdrawal is in dry-run mode. Set PROFIT_WITHDRAWAL_MODE=live before collecting fees.",
+      );
+    }
 
     await Trade.updateMany(
       { settlementBatchId: batchId, feeStatus: "processing" },
