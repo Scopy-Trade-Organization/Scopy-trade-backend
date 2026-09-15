@@ -178,8 +178,8 @@ export async function simulateSuccessfulTradeClose(
     }
 
     const [connections, copierUsers] = await Promise.all([
-      ExchangeConnection.find({ _id: { $in: connectionIds }, isActive: true })
-        .select("_id userId")
+      ExchangeConnection.find({ _id: { $in: connectionIds } })
+        .select("_id userId exchange label isActive")
         .lean(),
       User.find({
         _id: { $in: copiers.map((copy: any) => copy.userId) },
@@ -188,21 +188,51 @@ export async function simulateSuccessfulTradeClose(
         .select("_id")
         .lean(),
     ]);
-    const owners = new Map(
-      connections.map((connection) => [
-        String(connection._id),
-        String(connection.userId),
-      ]),
+    const connectionById = new Map(
+      connections.map((connection) => [String(connection._id), connection]),
     );
     const copyUserIds = new Set(copierUsers.map((user) => String(user._id)));
-    const validOwnership =
-      owners.get(String(proTrade.exchangeConnectionId)) === String(proUserId) &&
-      copiers.every(
-        (copy: any) =>
-          copyUserIds.has(String(copy.userId)) &&
-          owners.get(String(copy.exchangeConnectionId)) === String(copy.userId),
+    const requestedPairs = [
+      {
+        traderType: "pro",
+        traderId: String(proUserId),
+        exchangeConnectionId: String(proTrade.exchangeConnectionId),
+        traderHasRequiredRole: true,
+      },
+      ...copiers.map((copy: any, index: number) => ({
+        traderType: `copier-${index + 1}`,
+        traderId: String(copy.userId),
+        exchangeConnectionId: String(copy.exchangeConnectionId),
+        traderHasRequiredRole: copyUserIds.has(String(copy.userId)),
+      })),
+    ];
+    const pairDiagnostics = requestedPairs.map((pair) => {
+      const connection = connectionById.get(pair.exchangeConnectionId);
+      const actualOwnerId = connection ? String(connection.userId) : null;
+      const issues: string[] = [];
+      if (!pair.traderHasRequiredRole) issues.push("trader is missing or is not a CopyTrader");
+      if (!connection) issues.push("exchange connection does not exist");
+      else {
+        if (!connection.isActive) issues.push("exchange connection is inactive");
+        if (actualOwnerId !== pair.traderId) issues.push("exchange connection belongs to another trader");
+      }
+      return {
+        ...pair,
+        connectionFound: Boolean(connection),
+        connectionActive: connection?.isActive ?? null,
+        exchange: connection?.exchange ?? null,
+        connectionLabel: connection?.label ?? null,
+        actualOwnerId,
+        issues,
+        valid: issues.length === 0,
+      };
+    });
+    const invalidPairs = pairDiagnostics.filter((pair) => !pair.valid);
+    if (invalidPairs.length > 0) {
+      console.error(
+        "[temporary trade close] Invalid trader/exchange connection pair(s):",
+        invalidPairs,
       );
-    if (!validOwnership) {
       return res.status(422).json({
         success: false,
         message:
