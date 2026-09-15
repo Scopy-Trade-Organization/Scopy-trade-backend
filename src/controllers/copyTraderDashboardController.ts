@@ -133,11 +133,21 @@ export async function approveProfitShare(req: Request, res: Response) {
     if (!mongoose.isValidObjectId(exchangeConnectionId)) {
       return res.status(400).json({ success: false, message: "Select a valid exchange connection." });
     }
-    const result = await approveProfitShareWithdrawal(userId, exchangeConnectionId);
+    const requestIdHeader = req.get("Idempotency-Key");
+    const requestId = String(requestIdHeader || req.body.requestId || "").trim();
+    if (requestId && !/^[A-Za-z0-9_-]{1,64}$/.test(requestId)) {
+      return res.status(400).json({ success: false, message: "Idempotency-Key must contain 1-64 letters, numbers, underscores, or hyphens." });
+    }
+    const result = await approveProfitShareWithdrawal(
+      userId,
+      exchangeConnectionId,
+      requestId ? { requestId } : {},
+    );
     return res.status(200).json({
       success: true,
       message: `${Number(result.amount).toFixed(2)} USDT profit share was submitted successfully.`,
       transactionId: result.transactionId,
+      idempotent: result.idempotent,
       profitShare: await profitSharePayload(userId),
     });
   } catch (error) {

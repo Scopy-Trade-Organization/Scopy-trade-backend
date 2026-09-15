@@ -1,7 +1,7 @@
 import { test, mock, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { http } from "./exchangeConnectionService.js";
-import { getPlatformWallet, getSystemWallet, withdrawUsdt } from "./withdrawalService.js";
+import { getPlatformWallet, getSystemWallet, getWithdrawalPreflight, withdrawUsdt } from "./withdrawalService.js";
 import type { RawCredentials } from "../types/index.js";
 
 const CREDS: RawCredentials = {
@@ -27,6 +27,7 @@ const ENV_KEYS = [
   "BYBIT_API_URL",
   "WITHDRAWAL_STATUS_POLL_INTERVAL_MS",
   "WITHDRAWAL_STATUS_POLL_MAX_ATTEMPTS",
+  "OKX_USDT_TRON_WITHDRAWAL_FEE",
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
@@ -128,8 +129,11 @@ test("bitget live withdrawal omits the paptrading header when demo mode is off",
 
 test("okx live withdrawal defaults to the simulated-trading header", async () => {
   process.env.PROFIT_WITHDRAWAL_MODE = "live";
+  process.env.OKX_USDT_TRON_WITHDRAWAL_FEE = "1";
+  useImmediatePolling();
   delete process.env.OKX_DEMO_MODE;
   const calls = mockPost({ code: "0", data: [{ wdId: "WD1" }] });
+  mockGet({ code: "0", data: [{ wdId: "WD1", state: "2", txId: "OKXTX1" }] });
   const res = await withdrawUsdt("okx", CREDS, "10", VALID_TRON_ADDRESS, "TRON", "req-4");
   assert.equal(res.transactionId, "WD1");
   assert.equal(calls[0]!.config.headers["x-simulated-trading"], "1");
@@ -138,15 +142,20 @@ test("okx live withdrawal defaults to the simulated-trading header", async () =>
 
 test("okx live withdrawal omits the simulated-trading header when explicitly disabled", async () => {
   process.env.PROFIT_WITHDRAWAL_MODE = "live";
+  process.env.OKX_USDT_TRON_WITHDRAWAL_FEE = "1";
+  useImmediatePolling();
   process.env.OKX_DEMO_MODE = "false";
   const calls = mockPost({ code: "0", data: [{ wdId: "WD2" }] });
+  mockGet({ code: "0", data: [{ wdId: "WD2", state: "2" }] });
   await withdrawUsdt("okx", CREDS, "10", VALID_TRON_ADDRESS, "TRON", "req-5");
   assert.equal(calls[0]!.config.headers["x-simulated-trading"], undefined);
 });
 
 test("binance live withdrawal posts to the withdraw endpoint with retries disabled", async () => {
   process.env.PROFIT_WITHDRAWAL_MODE = "live";
+  useImmediatePolling();
   const calls = mockPost({ id: "BID99" });
+  mockGet([{ id: "BID99", withdrawOrderId: "req-6", status: 6, txId: "BTX99" }]);
   const res = await withdrawUsdt("binance", CREDS, "25", VALID_TRON_ADDRESS, "TRON", "req-6");
   assert.equal(res.transactionId, "BID99");
   assert.ok(calls[0]!.url.includes("/sapi/v1/capital/withdraw/apply"));
@@ -290,6 +299,7 @@ test("throws and tags the exchange when the API returns a failure code", async (
 
 test("normalizes and tags thrown transport errors", async () => {
   process.env.PROFIT_WITHDRAWAL_MODE = "live";
+  process.env.OKX_USDT_TRON_WITHDRAWAL_FEE = "1";
   mock.method(http as any, "post", async () => {
     throw new Error("network down");
   });
@@ -344,6 +354,31 @@ test("times out instead of treating a pending Bybit withdrawal as successful", a
         "TRON",
         "reqpending1",
       ),
-    /Timed out waiting for Bybit withdrawal PENDING1/,
+    (error: any) => {
+      assert.match(error.message, /Timed out waiting for Bybit withdrawal PENDING1/);
+      assert.equal(error.withdrawalPending, true);
+      assert.equal(error.transactionId, "PENDING1");
+      return true;
+    },
   );
+});
+
+test("reads Bitget UTA available USDT for withdrawal preflight", async () => {
+  process.env.EXCHANGE_MODE = "live";
+  const calls = mockGet({
+    code: "00000",
+    data: { assets: [{ coin: "USDT", available: "42.50" }] },
+  });
+  const result = await getWithdrawalPreflight("bitget", CREDS);
+  assert.deepEqual(result, { accountType: "UTA", availableUsdt: "42.50" });
+  assert.ok(calls[0]!.url.endsWith("/api/v3/account/assets"));
+  assert.match(calls[0]!.config.headers["ACCESS-SIGN"], /^[A-Za-z0-9+/=]+$/);
+});
+
+test("reads OKX funding balance rather than trading balance for withdrawal preflight", async () => {
+  process.env.OKX_DEMO_MODE = "false";
+  const calls = mockGet({ code: "0", data: [{ ccy: "USDT", availBal: "17.25" }] });
+  const result = await getWithdrawalPreflight("okx", CREDS);
+  assert.deepEqual(result, { accountType: "FUNDING", availableUsdt: "17.25" });
+  assert.ok(calls[0]!.url.includes("/api/v5/asset/balances?ccy=USDT"));
 });

@@ -48,6 +48,10 @@ export const getProTrades = async (req: Request, res: Response) => {
       active: number;
       profitable: number;
       copiedVolume: number;
+      copierRealizedPnl: number;
+      settlementAmount: number;
+      proTraderShare: number;
+      creditedProTraderShare: number;
     }>([
       { $match: { tradeOrigin: "copy", sourceTradeId: { $in: tradeIds } } },
       {
@@ -57,6 +61,18 @@ export const getProTrades = async (req: Request, res: Response) => {
           active: { $sum: { $cond: [{ $in: ["$status", ["pending", "filled"]] }, 1, 0] } },
           profitable: { $sum: { $cond: [{ $eq: ["$tradeResult", "profit"] }, 1, 0] } },
           copiedVolume: { $sum: { $convert: { input: "$quantity", to: "double", onError: 0, onNull: 0 } } },
+          copierRealizedPnl: { $sum: { $convert: { input: "$realizedPnl", to: "double", onError: 0, onNull: 0 } } },
+          settlementAmount: { $sum: { $convert: { input: "$platformFee", to: "double", onError: 0, onNull: 0 } } },
+          proTraderShare: { $sum: { $convert: { input: "$proTraderShare", to: "double", onError: 0, onNull: 0 } } },
+          creditedProTraderShare: {
+            $sum: {
+              $cond: [
+                { $eq: ["$proTraderCreditStatus", "credited"] },
+                { $convert: { input: "$proTraderShare", to: "double", onError: 0, onNull: 0 } },
+                0,
+              ],
+            },
+          },
         },
       },
     ]);
@@ -72,6 +88,10 @@ export const getProTrades = async (req: Request, res: Response) => {
           active: 0,
           profitable: 0,
           copiedVolume: 0,
+          copierRealizedPnl: 0,
+          settlementAmount: 0,
+          proTraderShare: 0,
+          creditedProTraderShare: 0,
         },
       }))),
       page,
@@ -85,6 +105,46 @@ export const getProTrades = async (req: Request, res: Response) => {
       success: false,
       message: "Failed to fetch trades",
     });
+  }
+};
+
+export const getProTradeCopiers = async (req: Request, res: Response) => {
+  try {
+    const { tradeId } = req.params;
+    if (!mongoose.isValidObjectId(tradeId)) {
+      return res.status(400).json({ success: false, message: "Invalid trade ID." });
+    }
+    const source = await Trade.findOne({
+      _id: tradeId,
+      userId: req.user,
+      tradeOrigin: "pro",
+    }).select("_id pair status tradeResult").lean();
+    if (!source) return res.status(404).json({ success: false, message: "Pro trade not found." });
+
+    const copies = await Trade.find({ sourceTradeId: source._id, tradeOrigin: "copy" })
+      .select("userId status tradeResult quantity entryFillPrice entryPrice exitPrice realizedPnl platformFee proTraderShare proTraderCreditStatus closedAt")
+      .populate("userId", "firstName lastName traderID profilePhoto")
+      .sort({ createdAt: 1 })
+      .lean();
+    return res.status(200).json({
+      success: true,
+      trade: source,
+      copiers: copies,
+      totals: {
+        count: copies.length,
+        profitable: copies.filter((copy) => copy.tradeResult === "profit").length,
+        copierRealizedPnl: copies.reduce((sum, copy) => sum + Number(copy.realizedPnl || 0), 0).toFixed(6),
+        settlementAmount: copies.reduce((sum, copy) => sum + Number(copy.platformFee || 0), 0).toFixed(6),
+        proTraderShare: copies.reduce((sum, copy) => sum + Number(copy.proTraderShare || 0), 0).toFixed(6),
+        creditedProTraderShare: copies.reduce(
+          (sum, copy) => sum + (copy.proTraderCreditStatus === "credited" ? Number(copy.proTraderShare || 0) : 0),
+          0,
+        ).toFixed(6),
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching pro trade copiers:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch copied-trade outcomes." });
   }
 };
 

@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import crypto from "crypto";
 import { Trade } from "../models/tradeModel.js";
 import User from "../models/userModel.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
@@ -8,10 +9,11 @@ import {
   PROFIT_SHARE_WITHDRAWAL_THRESHOLD,
   PRO_TRADER_SHARE_PERCENT,
 } from "../constants.js";
-import { decryptCredentials } from "./exchangeConnectionService.js";
-import { withdrawUsdt, getSystemWallet } from "./withdrawalService.js";
+import { decryptCredentials, validateCredentials } from "./exchangeConnectionService.js";
+import { withdrawUsdt, getSystemWallet, getWithdrawalPreflight } from "./withdrawalService.js";
 import { ExchangeId } from "../types/index.js";
 import { queueTradeEmail } from "./emailService.js";
+import { Settlement } from "../models/settlementModel.js";
 
 export interface TradeCloseResult {
   tradeId: string;
@@ -209,7 +211,8 @@ async function creditProTraderShare(trade: {
 export async function approveProfitShareWithdrawal(
   userId: mongoose.Types.ObjectId,
   exchangeConnectionId: string,
-): Promise<{ amount: string; transactionId: string }> {
+  options: { requestId?: string; simulateSuccess?: boolean } = {},
+): Promise<{ amount: string; transactionId: string; status: "COMPLETED"; idempotent: boolean }> {
   const staleBefore = new Date(Date.now() - 10 * 60 * 1000);
   const lockedUser = await User.findOneAndUpdate(
     {
@@ -231,7 +234,21 @@ export async function approveProfitShareWithdrawal(
 
   let batchId: string | null = null;
   let claimedIds: mongoose.Types.ObjectId[] = [];
+  const requestId = options.requestId || crypto.randomUUID();
   try {
+    const replay = await Settlement.findOne({ userId, requestId }).lean();
+    if (replay?.status === "COMPLETED" && replay.withdrawalId) {
+      return {
+        amount: replay.amount,
+        transactionId: replay.withdrawalId,
+        status: "COMPLETED",
+        idempotent: true,
+      };
+    }
+    if (replay) {
+      throw new Error(`Settlement ${requestId} is currently ${replay.status}.`);
+    }
+
     const retryableBatch = await Trade.findOne({
       userId,
       tradeOrigin: "copy",
@@ -278,6 +295,46 @@ export async function approveProfitShareWithdrawal(
       throw new Error("Select a valid active exchange connection.");
     }
 
+    const exchange = connection.exchange as ExchangeId;
+    const credentials = decryptCredentials({
+      exchange,
+      apiKey: connection.encryptedApiKey,
+      apiSecret: connection.encryptedApiSecret,
+      ...(connection.encryptedPassphrase
+        ? { passphrase: connection.encryptedPassphrase }
+        : {}),
+    });
+    // These two signed calls prove the stored credentials can authenticate,
+    // identify the account, and retrieve its current spendable USDT.
+    const [, preflight] = await Promise.all([
+      validateCredentials(exchange, credentials),
+      getWithdrawalPreflight(exchange, credentials),
+    ]);
+    const availableUsdt = Number(preflight.availableUsdt);
+    if (!Number.isFinite(availableUsdt) || availableUsdt + 1e-9 < amount) {
+      throw new Error(
+        `Insufficient available USDT. Required ${amount.toFixed(6)}, available ${Math.max(0, availableUsdt).toFixed(6)}.`,
+      );
+    }
+    const accountType = preflight.accountType;
+    const wallet = getSystemWallet();
+
+    await Settlement.create({
+      userId,
+      exchangeConnectionId: connection._id,
+      requestId,
+      batchId,
+      tradeIds: claimedIds,
+      amount: amount.toFixed(6),
+      exchange,
+      network: wallet.network,
+      destinationAddress: wallet.address,
+      status: "PROCESSING",
+      simulated: options.simulateSuccess === true,
+      accountType,
+      availableUsdt: availableUsdt.toFixed(6),
+    });
+
     await Trade.updateMany(
       { _id: { $in: claimedIds }, feeStatus: { $in: ["pending", "failed"] } },
       {
@@ -290,28 +347,42 @@ export async function approveProfitShareWithdrawal(
       },
     );
 
-    const credentials = decryptCredentials({
-      exchange: connection.exchange as ExchangeId,
-      apiKey: connection.encryptedApiKey,
-      apiSecret: connection.encryptedApiSecret,
-      ...(connection.encryptedPassphrase
-        ? { passphrase: connection.encryptedPassphrase }
-        : {}),
-    });
-    const wallet = getSystemWallet();
-    const withdrawal = await withdrawUsdt(
-      connection.exchange as ExchangeId,
-      credentials,
-      amount.toFixed(6),
-      wallet.address,
-      wallet.network,
-      `profit-share-${batchId}`,
-    );
-    if (withdrawal.status === "dry-run") {
+    const withdrawal = options.simulateSuccess
+      ? {
+          transactionId: `simulated-${requestId}`,
+          blockchainTransactionId: `simulated-chain-${requestId}`,
+          status: "success" as const,
+          raw: { simulated: true },
+        }
+      : await withdrawUsdt(
+          exchange,
+          credentials,
+          amount.toFixed(6),
+          wallet.address,
+          wallet.network,
+          `profit-share-${batchId}`,
+        );
+    if (withdrawal.status !== "success") {
       throw new Error(
-        "Profit-share withdrawal is in dry-run mode. Set PROFIT_WITHDRAWAL_MODE=live before collecting fees.",
+        withdrawal.status === "dry-run"
+          ? "Profit-share withdrawal is in dry-run mode. Set PROFIT_WITHDRAWAL_MODE=live before collecting fees."
+          : "The exchange accepted the withdrawal but has not confirmed completion.",
       );
     }
+
+    await Settlement.updateOne(
+      { userId, requestId, status: "PROCESSING" },
+      {
+        $set: {
+          status: "COMPLETED",
+          withdrawalId: withdrawal.transactionId,
+          blockchainTransactionId: withdrawal.blockchainTransactionId || null,
+          submittedAt: new Date(),
+          completedAt: new Date(),
+          error: null,
+        },
+      },
+    );
 
     await Trade.updateMany(
       { settlementBatchId: batchId, feeStatus: "processing" },
@@ -333,9 +404,15 @@ export async function approveProfitShareWithdrawal(
         console.error(`[profitSharingService] Pro credit failed for ${trade._id}:`, error),
       );
     }
-    return { amount: amount.toFixed(6), transactionId: withdrawal.transactionId };
+    return {
+      amount: amount.toFixed(6),
+      transactionId: withdrawal.transactionId,
+      status: "COMPLETED",
+      idempotent: false,
+    };
   } catch (error) {
-    if (claimedIds.length && batchId) {
+    const withdrawalPending = Boolean((error as any)?.withdrawalPending);
+    if (claimedIds.length && batchId && !withdrawalPending) {
       await Trade.updateMany(
         { settlementBatchId: batchId, feeStatus: "processing" },
         {
@@ -346,6 +423,19 @@ export async function approveProfitShareWithdrawal(
         },
       );
     }
+    await Settlement.updateOne(
+      { userId, requestId, status: "PROCESSING" },
+      {
+        $set: {
+          status: withdrawalPending ? "SUBMITTED" : "FAILED",
+          ...((error as any)?.transactionId
+            ? { withdrawalId: String((error as any).transactionId), submittedAt: new Date() }
+            : {}),
+          error: error instanceof Error ? error.message : String(error),
+          ...(withdrawalPending ? {} : { failedAt: new Date() }),
+        },
+      },
+    );
     throw error;
   } finally {
     await User.updateOne(
@@ -358,13 +448,20 @@ export async function approveProfitShareWithdrawal(
 /** Startup recovery credits pros only; withdrawals always require user approval. */
 export async function resumePendingProfitCredits(): Promise<void> {
   const staleBefore = new Date(Date.now() - 10 * 60 * 1000);
+  // A submitted withdrawal has crossed the non-idempotent exchange boundary.
+  // Never make those trades retryable automatically; an operator can inspect
+  // the durable settlement and exchange withdrawal ID instead.
+  const submittedBatchIds = await Settlement.distinct("batchId", { status: "SUBMITTED" });
   await Promise.all([
     Trade.updateMany(
       {
         tradeOrigin: "copy",
         tradeResult: "profit",
         feeStatus: "processing",
-        settlementBatchId: { $ne: null },
+        settlementBatchId: {
+          $ne: null,
+          ...(submittedBatchIds.length ? { $nin: submittedBatchIds } : {}),
+        },
         settlementStartedAt: { $lt: staleBefore },
       },
       {

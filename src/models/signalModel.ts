@@ -41,8 +41,21 @@ const signalSchema = new Schema(
       enum: ["active", "expired"],
       default: "active",
     },
+    // Populated only by the temporary close simulator. Makes replaying the
+    // same test request safe without affecting production signal creation.
+    temporaryRequestId: { type: String, default: null },
+    temporarySimulationStatus: {
+      type: String,
+      enum: ["processing", "completed", "failed", null],
+      default: null,
+    },
   },
   { timestamps: true },
+);
+
+signalSchema.index(
+  { trader: 1, temporaryRequestId: 1 },
+  { unique: true, partialFilterExpression: { temporaryRequestId: { $type: "string" } } },
 );
 
 export type ISignal = InferSchemaType<typeof signalSchema>;

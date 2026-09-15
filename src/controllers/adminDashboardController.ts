@@ -6,6 +6,7 @@ import { Trade } from "../models/tradeModel.js";
 import mongoose from "mongoose";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
 import { queueAccountStatusEmail } from "../services/emailService.js";
+import { Settlement } from "../models/settlementModel.js";
 
 export const getTrades = async (req: Request, res: Response) => {
   try {
@@ -36,7 +37,7 @@ export const getTrades = async (req: Request, res: Response) => {
       .filter((trade) => trade.tradeOrigin === "pro")
       .map((trade) => trade._id);
     const stats = proTradeIds.length
-      ? await Trade.aggregate<{ _id: mongoose.Types.ObjectId; total: number; active: number; profitable: number }>([
+      ? await Trade.aggregate<{ _id: mongoose.Types.ObjectId; total: number; active: number; profitable: number; copierRealizedPnl: number; settlementAmount: number; proTraderShare: number }>([
           { $match: { tradeOrigin: "copy", sourceTradeId: { $in: proTradeIds } } },
           {
             $group: {
@@ -44,6 +45,9 @@ export const getTrades = async (req: Request, res: Response) => {
               total: { $sum: 1 },
               active: { $sum: { $cond: [{ $in: ["$status", ["pending", "filled"]] }, 1, 0] } },
               profitable: { $sum: { $cond: [{ $eq: ["$tradeResult", "profit"] }, 1, 0] } },
+              copierRealizedPnl: { $sum: { $convert: { input: "$realizedPnl", to: "double", onError: 0, onNull: 0 } } },
+              settlementAmount: { $sum: { $convert: { input: "$platformFee", to: "double", onError: 0, onNull: 0 } } },
+              proTraderShare: { $sum: { $convert: { input: "$proTraderShare", to: "double", onError: 0, onNull: 0 } } },
             },
           },
         ])
@@ -93,6 +97,35 @@ export const getTrade = async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Error fetching admin trade:", error);
     return res.status(500).json({ success: false, message: "Failed to fetch trade." });
+  }
+};
+
+export const getSettlements = async (req: Request, res: Response) => {
+  try {
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+    const filter: Record<string, unknown> = {};
+    if (["PROCESSING", "SUBMITTED", "COMPLETED", "FAILED"].includes(String(req.query.status || ""))) {
+      filter.status = req.query.status;
+    }
+    const [settlements, total] = await Promise.all([
+      Settlement.find(filter)
+        .populate("userId", "firstName lastName traderID")
+        .populate("exchangeConnectionId", "exchange label")
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Settlement.countDocuments(filter),
+    ]);
+    return res.status(200).json({
+      success: true,
+      settlements,
+      pagination: { total, page, limit, pages: Math.ceil(total / limit) },
+    });
+  } catch (error) {
+    console.error("Error fetching settlements:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch settlements." });
   }
 };
 

@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { RawCredentials, ExchangeId } from "../types/index.js";
-import { http, normalizeError } from "./exchangeConnectionService.js";
+import { http, normalizeError, getBybitTimestamp } from "./exchangeConnectionService.js";
 import {
   getExchangeRestUrl,
   isBitgetDemo,
@@ -46,9 +46,103 @@ export interface WithdrawalResult {
   raw: any;
 }
 
+export interface WithdrawalPreflight {
+  accountType: string;
+  availableUsdt: string;
+}
+
+/** Reads the balance of the exact account from which each withdrawal API debits. */
+export async function getWithdrawalPreflight(
+  exchange: ExchangeId,
+  credentials: RawCredentials,
+): Promise<WithdrawalPreflight> {
+  try {
+    if (exchange === "binance") {
+      const timestamp = Date.now();
+      const query = `timestamp=${timestamp}`;
+      const signature = crypto.createHmac("sha256", credentials.apiSecret).update(query).digest("hex");
+      const baseUrl = process.env.BINANCE_SPOT_API_URL || "https://api.binance.com";
+      const { data } = await http.get(`${baseUrl}/api/v3/account?${query}&signature=${signature}`, {
+        headers: { "X-MBX-APIKEY": credentials.apiKey },
+      });
+      const usdt = data.balances?.find((item: any) => item.asset === "USDT");
+      return { accountType: String(data.accountType || "SPOT"), availableUsdt: String(usdt?.free || "0") };
+    }
+    if (exchange === "bybit") {
+      const baseUrl = getExchangeRestUrl("bybit");
+      const timestamp = await getBybitTimestamp(baseUrl);
+      const recvWindow = "5000";
+      const query = "coinName=USDT";
+      const signature = crypto.createHmac("sha256", credentials.apiSecret)
+        .update(timestamp + credentials.apiKey + recvWindow + query).digest("hex");
+      const { data } = await http.get(`${baseUrl}/v5/account/withdrawal?${query}`, {
+        headers: {
+          "X-BAPI-API-KEY": credentials.apiKey,
+          "X-BAPI-SIGN": signature,
+          "X-BAPI-TIMESTAMP": timestamp,
+          "X-BAPI-RECV-WINDOW": recvWindow,
+        },
+      });
+      if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit withdrawal balance lookup failed.");
+      return {
+        accountType: "UNIFIED",
+        availableUsdt: String(data.result?.availableWithdrawalMap?.USDT || "0"),
+      };
+    }
+    if (exchange === "okx") {
+      if (!credentials.passphrase) throw new Error("OKX requires a passphrase.");
+      const timestamp = new Date().toISOString();
+      const path = "/api/v5/asset/balances?ccy=USDT";
+      const signature = crypto.createHmac("sha256", credentials.apiSecret)
+        .update(timestamp + "GET" + path).digest("base64");
+      const { data } = await http.get(`https://www.okx.com${path}`, {
+        headers: {
+          "OK-ACCESS-KEY": credentials.apiKey,
+          "OK-ACCESS-SIGN": signature,
+          "OK-ACCESS-TIMESTAMP": timestamp,
+          "OK-ACCESS-PASSPHRASE": credentials.passphrase,
+          ...(isOkxDemo() ? { "x-simulated-trading": "1" } : {}),
+        },
+      });
+      if (data.code !== "0") throw new Error(data.msg || "OKX funding balance lookup failed.");
+      return { accountType: "FUNDING", availableUsdt: String(data.data?.[0]?.availBal || "0") };
+    }
+    if (!credentials.passphrase) throw new Error("Bitget requires a passphrase.");
+    const timestamp = Date.now().toString();
+    const path = "/api/v3/account/assets";
+    const signature = crypto.createHmac("sha256", credentials.apiSecret)
+      .update(timestamp + "GET" + path).digest("base64");
+    const { data } = await http.get(`${getBitgetBaseUrl()}${path}`, {
+      headers: {
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
+        "ACCESS-KEY": credentials.apiKey,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": credentials.passphrase,
+      },
+    });
+    if (data.code !== "00000") throw new Error(data.msg || "Bitget UTA balance lookup failed.");
+    const usdt = data.data?.assets?.find((item: any) => String(item.coin).toUpperCase() === "USDT");
+    return { accountType: "UTA", availableUsdt: String(usdt?.available || "0") };
+  } catch (error) {
+    const normalized = normalizeError(error);
+    (normalized as any).exchange = exchange;
+    throw normalized;
+  }
+}
+
 function normalizeRequestId(requestId: string): string {
   if (/^[A-Za-z0-9]{1,32}$/.test(requestId)) return requestId;
   return crypto.createHash("sha256").update(requestId).digest("hex").slice(0, 32);
+}
+
+function rethrowAfterSubmission(error: unknown, transactionId: string): never {
+  const normalized = error instanceof Error ? error : new Error(String(error));
+  if (!/failed with status| withdrawal .* failed\.?$/i.test(normalized.message)) {
+    (normalized as any).withdrawalPending = true;
+    (normalized as any).transactionId = transactionId;
+  }
+  throw normalized;
 }
 
 export type UsdtNetwork =
@@ -129,11 +223,52 @@ async function withdrawBinance(
     headers: { "X-MBX-APIKEY": credentials.apiKey },
     ...NO_RETRY,
   });
+  const transactionId = String(data.id || "");
+  if (!transactionId) throw new Error("Binance did not return a withdrawal ID.");
+  let confirmation: { status: number; txId?: string };
+  try {
+    confirmation = await pollBinanceWithdrawal(credentials, baseUrl, transactionId, requestId);
+  } catch (error) {
+    rethrowAfterSubmission(error, transactionId);
+  }
   return {
-    transactionId: String(data.id || requestId),
-    status: "submitted",
-    raw: data,
+    transactionId,
+    status: "success",
+    ...(confirmation.txId ? { blockchainTransactionId: confirmation.txId } : {}),
+    raw: { submission: data, confirmation },
   };
+}
+
+async function pollBinanceWithdrawal(
+  credentials: RawCredentials,
+  baseUrl: string,
+  transactionId: string,
+  requestId: string,
+): Promise<{ status: number; txId?: string }> {
+  const { intervalMs, maxAttempts } = pollingConfig();
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (attempt > 0) await wait(intervalMs);
+    const timestamp = Date.now();
+    const query = new URLSearchParams({
+      coin: "USDT",
+      withdrawOrderId: requestId,
+      timestamp: String(timestamp),
+    }).toString();
+    const signature = crypto.createHmac("sha256", credentials.apiSecret).update(query).digest("hex");
+    const { data } = await http.get(`${baseUrl}/sapi/v1/capital/withdraw/history?${query}&signature=${signature}`, {
+      headers: { "X-MBX-APIKEY": credentials.apiKey },
+    });
+    const record = (Array.isArray(data) ? data : []).find(
+      (item: any) => String(item.id || "") === transactionId || String(item.withdrawOrderId || "") === requestId,
+    );
+    if (!record) continue;
+    const status = Number(record.status);
+    if (status === 6) return { status, ...(record.txId ? { txId: String(record.txId) } : {}) };
+    if ([1, 3, 5].includes(status)) {
+      throw new Error(`Binance withdrawal ${transactionId} failed with status ${status}.`);
+    }
+  }
+  throw new Error(`Timed out waiting for Binance withdrawal ${transactionId} to complete.`);
 }
 
 async function withdrawBybit(
@@ -173,11 +308,12 @@ async function withdrawBybit(
   if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit withdrawal failed.");
   const transactionId = String(data.result?.id || "");
   if (!transactionId) throw new Error("Bybit did not return a withdrawal ID.");
-  const confirmation = await pollBybitWithdrawal(
-    credentials,
-    baseUrl,
-    transactionId,
-  );
+  let confirmation: { status: string; txID?: string };
+  try {
+    confirmation = await pollBybitWithdrawal(credentials, baseUrl, transactionId);
+  } catch (error) {
+    rethrowAfterSubmission(error, transactionId);
+  }
   return {
     transactionId,
     status: "success",
@@ -318,11 +454,12 @@ async function withdrawBitget(
 
   const transactionId = data.data?.orderId;
   if (!transactionId) throw new Error("Bitget did not return a withdrawal ID.");
-  const confirmation = await pollBitgetWithdrawal(
-    credentials,
-    transactionId,
-    Date.now(),
-  );
+  let confirmation: BitgetWithdrawalRecord;
+  try {
+    confirmation = await pollBitgetWithdrawal(credentials, transactionId, Date.now());
+  } catch (error) {
+    rethrowAfterSubmission(error, transactionId);
+  }
   return {
     transactionId,
     status: "success",
@@ -420,6 +557,10 @@ async function withdrawOkx(
   const timestamp = new Date().toISOString();
   const method = "POST";
   const path = "/api/v5/asset/withdrawal";
+  const fee = process.env.OKX_USDT_TRON_WITHDRAWAL_FEE?.trim();
+  if (!fee || !/^\d+(\.\d+)?$/.test(fee) || Number(fee) < 0) {
+    throw new Error("OKX_USDT_TRON_WITHDRAWAL_FEE must be configured before OKX withdrawals.");
+  }
   const body = JSON.stringify({
     ccy: "USDT",
     amt: amount,
@@ -427,6 +568,7 @@ async function withdrawOkx(
     toAddr: destinationAddress,
     chain: networkCodes[network].okx,
     clientId: requestId,
+    fee,
   });
 
   const signPayload = timestamp + method + path + body;
@@ -464,7 +606,54 @@ async function withdrawOkx(
   }
 
   const wdId = data.data?.[0]?.wdId || "unknown";
-  return { transactionId: wdId, status: "submitted", raw: data };
+  if (wdId === "unknown") throw new Error("OKX did not return a withdrawal ID.");
+  let confirmation: { state: string; txId?: string };
+  try {
+    confirmation = await pollOkxWithdrawal(credentials, wdId);
+  } catch (error) {
+    rethrowAfterSubmission(error, wdId);
+  }
+  return {
+    transactionId: wdId,
+    status: "success",
+    ...(confirmation.txId ? { blockchainTransactionId: confirmation.txId } : {}),
+    raw: { submission: data, confirmation },
+  };
+}
+
+async function pollOkxWithdrawal(
+  credentials: RawCredentials,
+  withdrawalId: string,
+): Promise<{ state: string; txId?: string }> {
+  const { apiKey, apiSecret, passphrase } = credentials;
+  if (!passphrase) throw new Error("OKX requires a passphrase.");
+  const { intervalMs, maxAttempts } = pollingConfig();
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (attempt > 0) await wait(intervalMs);
+    const timestamp = new Date().toISOString();
+    const query = new URLSearchParams({ wdId: withdrawalId }).toString();
+    const path = `/api/v5/asset/withdrawal-history?${query}`;
+    const signature = crypto.createHmac("sha256", apiSecret)
+      .update(timestamp + "GET" + path).digest("base64");
+    const { data } = await http.get(`https://www.okx.com${path}`, {
+      headers: {
+        "OK-ACCESS-KEY": apiKey,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": passphrase,
+        ...(isOkxDemo() ? { "x-simulated-trading": "1" } : {}),
+      },
+    });
+    if (data.code !== "0") throw new Error(data.msg || "Unable to query OKX withdrawal status.");
+    const record = data.data?.[0];
+    if (!record) continue;
+    const state = String(record.state);
+    if (state === "2") return { state, ...(record.txId ? { txId: String(record.txId) } : {}) };
+    if (["-1", "-2", "-3"].includes(state)) {
+      throw new Error(`OKX withdrawal ${withdrawalId} failed with status ${state}.`);
+    }
+  }
+  throw new Error(`Timed out waiting for OKX withdrawal ${withdrawalId} to complete.`);
 }
 
 // ─── Public Withdrawal API ────────────────────────────────────────────────────

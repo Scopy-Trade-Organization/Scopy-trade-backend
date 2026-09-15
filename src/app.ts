@@ -75,7 +75,7 @@ app.use(
     },
     credentials: true,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "X-CSRF-Token"],
+    allowedHeaders: ["Content-Type", "X-CSRF-Token", "Idempotency-Key"],
   }),
 );
 
