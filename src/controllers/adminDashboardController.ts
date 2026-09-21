@@ -168,7 +168,9 @@ export const getAllSignals = async (req: Request, res: Response) => {
 
 export const fetchAllUsers = async (req: Request, res: Response) => {
   try {
-    const { page = 1, role, status } = req.query;
+    const { role, status } = req.query;
+    const currentPage = Math.max(Number(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 100);
 
     if (role) {
       const validRoles = ["CopyTrader", "ProTrader"];
@@ -181,7 +183,7 @@ export const fetchAllUsers = async (req: Request, res: Response) => {
     }
 
     if (status) {
-      const validStatuses = ["active", "suspended"];
+      const validStatuses = ["active", "suspended", "waitlist"];
       if (!validStatuses.includes(String(status))) {
         return res.status(400).json({
           success: false,
@@ -190,34 +192,180 @@ export const fetchAllUsers = async (req: Request, res: Response) => {
       }
     }
 
-    const filter: any = {};
+    const filter: Record<string, unknown> = {};
     if (role) {
       filter.role = role;
     }
     if (status) {
       filter.status = status;
     }
+    const search = String(req.query.search || "").trim();
+    if (search) {
+      const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const searchPattern = new RegExp(escapedSearch, "i");
+      filter.$or = [
+        { firstName: searchPattern },
+        { lastName: searchPattern },
+        { email: searchPattern },
+        { traderID: searchPattern },
+      ];
+    }
 
-    const limit = 10;
-    const currentPage = Number(page);
     const skip = (currentPage - 1) * limit;
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
 
-    const users = await User.find(filter)
-      .select("-password")
-      .limit(limit)
-      .skip(skip)
-      .sort({ createdAt: -1 });
+    const [users, total, totalUsers, activeUserIds, newUsers, suspendedUsers] =
+      await Promise.all([
+        User.find(filter)
+          .select("-password -sessionVersion")
+          .limit(limit)
+          .skip(skip)
+          .sort({ createdAt: -1 })
+          .lean(),
+        User.countDocuments(filter),
+        User.countDocuments(),
+        Trade.distinct("userId", { status: { $in: ["pending", "filled"] } }),
+        User.countDocuments({ createdAt: { $gte: monthStart } }),
+        User.countDocuments({ status: "suspended" }),
+      ]);
+
+    const userIds = users.map((user) => user._id);
+    const tradeActivity = userIds.length
+      ? await Trade.aggregate<{
+          _id: mongoose.Types.ObjectId;
+          activeTradeCount: number;
+          totalTradeCount: number;
+          closedTradeCount: number;
+          lastActivityAt: Date;
+        }>([
+          { $match: { userId: { $in: userIds } } },
+          {
+            $group: {
+              _id: "$userId",
+              activeTradeCount: {
+                $sum: {
+                  $cond: [{ $in: ["$status", ["pending", "filled"]] }, 1, 0],
+                },
+              },
+              totalTradeCount: { $sum: 1 },
+              closedTradeCount: {
+                $sum: { $cond: [{ $eq: ["$status", "closed"] }, 1, 0] },
+              },
+              lastActivityAt: { $max: "$updatedAt" },
+            },
+          },
+        ])
+      : [];
+    const activityByUser = new Map(
+      tradeActivity.map((activity) => [String(activity._id), activity]),
+    );
+    const enrichedUsers = users.map((user) => {
+      const activity = activityByUser.get(String(user._id));
+      return {
+        ...user,
+        activeTradeCount: activity?.activeTradeCount ?? 0,
+        totalTradeCount: activity?.totalTradeCount ?? 0,
+        closedTradeCount: activity?.closedTradeCount ?? 0,
+        lastActivityAt: activity?.lastActivityAt ?? null,
+      };
+    });
 
     return res.status(200).json({
       success: true,
       message: "Users retrieved successfully",
-      users,
+      users: enrichedUsers,
       page: currentPage,
       limit,
-      pages: Math.ceil((await User.countDocuments(filter)) / limit),
+      total,
+      pages: Math.ceil(total / limit),
+      stats: {
+        totalUsers,
+        activeUsers: activeUserIds.length,
+        newUsers,
+        suspendedUsers,
+      },
     });
   } catch (error) {
     console.error("Error fetching users:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+};
+
+export const getUserDetails = async (req: Request, res: Response) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid user ID" });
+    }
+
+    const user = await User.findById(id)
+      .select("-password -sessionVersion")
+      .lean();
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const userId = new mongoose.Types.ObjectId(id);
+    const [tradeStats] = await Trade.aggregate<{
+      _id: null;
+      totalTrades: number;
+      activeTrades: number;
+      closedTrades: number;
+      profitableTrades: number;
+      losingTrades: number;
+      lastActivityAt: Date;
+    }>([
+      { $match: { userId } },
+      {
+        $group: {
+          _id: null,
+          totalTrades: { $sum: 1 },
+          activeTrades: {
+            $sum: {
+              $cond: [{ $in: ["$status", ["pending", "filled"]] }, 1, 0],
+            },
+          },
+          closedTrades: {
+            $sum: { $cond: [{ $eq: ["$status", "closed"] }, 1, 0] },
+          },
+          profitableTrades: {
+            $sum: { $cond: [{ $eq: ["$tradeResult", "profit"] }, 1, 0] },
+          },
+          losingTrades: {
+            $sum: { $cond: [{ $eq: ["$tradeResult", "loss"] }, 1, 0] },
+          },
+          lastActivityAt: { $max: "$updatedAt" },
+        },
+      },
+    ]);
+    const recentTrades = await Trade.find({ userId })
+      .select("pair direction status tradeOrigin tradeResult createdAt updatedAt closedAt")
+      .sort({ updatedAt: -1 })
+      .limit(5)
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        user,
+        tradeStats: tradeStats ?? {
+          totalTrades: 0,
+          activeTrades: 0,
+          closedTrades: 0,
+          profitableTrades: 0,
+          losingTrades: 0,
+          lastActivityAt: null,
+        },
+        recentTrades,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching user details:", error);
     return res.status(500).json({
       success: false,
       message: "Internal server error",
