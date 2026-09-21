@@ -1,22 +1,85 @@
 import { Request, Response } from "express";
 import AuditLog from "../models/auditLogModel.js";
-import { Signal } from "../models/signalModel.js";
 import User from "../models/userModel.js";
 import { Trade } from "../models/tradeModel.js";
 import mongoose from "mongoose";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
 import { queueAccountStatusEmail } from "../services/emailService.js";
 import { Settlement } from "../models/settlementModel.js";
+import { SUPPORTED_PAIRS } from "../constants.js";
+
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+async function matchingUserIds(search: string) {
+  const terms = search.split(/\s+/).filter(Boolean).slice(0, 5);
+  const users = await User.find({
+    $and: terms.map((term) => {
+      const pattern = new RegExp(escapeRegex(term), "i");
+      return {
+        $or: [
+          { firstName: pattern },
+          { lastName: pattern },
+          { email: pattern },
+          { traderID: pattern },
+        ],
+      };
+    }),
+  }).select("_id").lean();
+  return users.map((user) => user._id);
+}
 
 export const getTrades = async (req: Request, res: Response) => {
   try {
     const page = Math.max(Number(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
     const status = String(req.query.status || "all");
+    if (!["all", "active", "history", "pending", "filled", "closed", "cancelled", "failed"].includes(status)) {
+      return res.status(400).json({ success: false, message: "Invalid trade status." });
+    }
     const filter: Record<string, unknown> = {};
     if (status === "active") filter.status = { $in: ["pending", "filled"] };
     else if (status === "history") filter.status = { $in: ["closed", "cancelled", "failed"] };
     else if (status !== "all") filter.status = status;
+
+    const pair = String(req.query.pair || "").toUpperCase();
+    if (pair) {
+      if (!SUPPORTED_PAIRS.includes(pair as (typeof SUPPORTED_PAIRS)[number])) {
+        return res.status(400).json({ success: false, message: "Invalid trading pair." });
+      }
+      filter.pair = pair;
+    }
+    const direction = String(req.query.direction || "");
+    if (direction) {
+      if (!["buy", "sell"].includes(direction)) {
+        return res.status(400).json({ success: false, message: "Invalid trade direction." });
+      }
+      filter.direction = direction;
+    }
+    const tradeOrigin = String(req.query.tradeOrigin || "");
+    if (tradeOrigin) {
+      if (!["pro", "copy"].includes(tradeOrigin)) {
+        return res.status(400).json({ success: false, message: "Invalid trade type." });
+      }
+      filter.tradeOrigin = tradeOrigin;
+    }
+    const result = String(req.query.result || "");
+    if (result) {
+      if (!["profit", "loss", "breakeven"].includes(result)) {
+        return res.status(400).json({ success: false, message: "Invalid trade result." });
+      }
+      filter.tradeResult = result;
+    }
+    const search = String(req.query.search || "").trim().slice(0, 100);
+    if (search) {
+      const ownerIds = await matchingUserIds(search);
+      const pattern = new RegExp(escapeRegex(search), "i");
+      const searchFilters: Record<string, unknown>[] = [
+        { tradeId: pattern },
+        { userId: { $in: ownerIds } },
+      ];
+      if (mongoose.isValidObjectId(search)) searchFilters.push({ _id: search });
+      filter.$or = searchFilters;
+    }
 
     const [trades, total] = await Promise.all([
       Trade.find(filter)
@@ -129,40 +192,120 @@ export const getSettlements = async (req: Request, res: Response) => {
   }
 };
 
-export const getAllSignals = async (req: Request, res: Response) => {
+export const getEarnings = async (req: Request, res: Response) => {
   try {
-    const { page = 1, status } = req.query;
-
-    const limit = 10;
-    const currentPage = Number(page);
-    const skip = (currentPage - 1) * limit;
-
-    const filter: any = {};
-
-    if (status) {
-      filter.status = status;
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+    const category = String(req.query.category || "actual");
+    if (!["actual", "prospective"].includes(category)) {
+      return res.status(400).json({ success: false, message: "Invalid earnings category." });
     }
 
-    const signals = await Signal.find(filter)
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .skip(skip);
+    const baseFilter: Record<string, unknown> = {
+      tradeOrigin: "copy",
+      tradeResult: "profit",
+      feeStatus: { $in: ["pending", "processing", "collected", "failed"] },
+    };
+    const pair = String(req.query.pair || "").toUpperCase();
+    if (pair) {
+      if (!SUPPORTED_PAIRS.includes(pair as (typeof SUPPORTED_PAIRS)[number])) {
+        return res.status(400).json({ success: false, message: "Invalid trading pair." });
+      }
+      baseFilter.pair = pair;
+    }
+    const direction = String(req.query.direction || "");
+    if (direction) {
+      if (!["buy", "sell"].includes(direction)) {
+        return res.status(400).json({ success: false, message: "Invalid trade direction." });
+      }
+      baseFilter.direction = direction;
+    }
 
+    const closedAt: Record<string, Date> = {};
+    const dateFrom = String(req.query.dateFrom || "");
+    const dateTo = String(req.query.dateTo || "");
+    if (dateFrom) {
+      const parsed = new Date(`${dateFrom}T00:00:00.000Z`);
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ success: false, message: "Invalid start date." });
+      }
+      closedAt.$gte = parsed;
+    }
+    if (dateTo) {
+      const parsed = new Date(`${dateTo}T23:59:59.999Z`);
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ success: false, message: "Invalid end date." });
+      }
+      closedAt.$lte = parsed;
+    }
+    if (Object.keys(closedAt).length) baseFilter.closedAt = closedAt;
+
+    const search = String(req.query.search || "").trim().slice(0, 100);
+    if (search) {
+      const ownerIds = await matchingUserIds(search);
+      const sourceIds = await Trade.find({ tradeOrigin: "pro", userId: { $in: ownerIds } }).distinct("_id");
+      const pattern = new RegExp(escapeRegex(search), "i");
+      const searchFilters: Record<string, unknown>[] = [
+        { tradeId: pattern },
+        { userId: { $in: ownerIds } },
+        { sourceTradeId: { $in: sourceIds } },
+      ];
+      if (mongoose.isValidObjectId(search)) searchFilters.push({ _id: search });
+      baseFilter.$or = searchFilters;
+    }
+
+    const tableFilter: Record<string, unknown> = { ...baseFilter };
+    if (category === "actual") {
+      tableFilter.feeStatus = "collected";
+    } else {
+      const requestedStatus = String(req.query.feeStatus || "");
+      if (requestedStatus && !["pending", "processing", "failed"].includes(requestedStatus)) {
+        return res.status(400).json({ success: false, message: "Invalid collection status." });
+      }
+      tableFilter.feeStatus = requestedStatus || { $in: ["pending", "processing", "failed"] };
+    }
+
+    const [earnings, total, totals] = await Promise.all([
+      Trade.find(tableFilter)
+        .select("tradeId userId sourceTradeId pair direction platformFee feeStatus closedAt settlementCompletedAt settlementTransactionId")
+        .populate("userId", "firstName lastName traderID email")
+        .populate({
+          path: "sourceTradeId",
+          select: "tradeId userId",
+          populate: { path: "userId", select: "firstName lastName traderID" },
+        })
+        .sort({ closedAt: -1, createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Trade.countDocuments(tableFilter),
+      Trade.aggregate<{ _id: string; amount: number; count: number }>([
+        { $match: baseFilter },
+        {
+          $group: {
+            _id: { $cond: [{ $eq: ["$feeStatus", "collected"] }, "actual", "prospective"] },
+            amount: { $sum: { $convert: { input: "$platformFee", to: "double", onError: 0, onNull: 0 } } },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+    ]);
+    const actual = totals.find((item) => item._id === "actual");
+    const prospective = totals.find((item) => item._id === "prospective");
     return res.status(200).json({
       success: true,
-      message: "Signals retrieved successfully",
-      signals,
-      page: currentPage,
-      limit,
-      pageSize: signals.length,
-      pages: Math.ceil((await Signal.countDocuments()) / limit),
+      earnings,
+      summary: {
+        actualAmount: actual?.amount ?? 0,
+        prospectiveAmount: prospective?.amount ?? 0,
+        actualCount: actual?.count ?? 0,
+        prospectiveCount: prospective?.count ?? 0,
+      },
+      pagination: { total, page, limit, pages: Math.ceil(total / limit) },
     });
   } catch (error) {
-    console.error("Error fetching signals:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    });
+    console.error("Error fetching admin earnings:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch platform earnings." });
   }
 };
 

@@ -20,6 +20,7 @@ import proTraderDashboardRouter from "./routes/proTraderDashboardRoutes.js";
 import copyTraderDashboardRouter from "./routes/copyTraderDashboardRoutes.js";
 import temporaryWithdrawalRouter from "./routes/temporaryWithdrawalRoutes.js";
 import { resumePendingProfitCredits } from "./services/profitSharingService.js";
+import { backfillMissingTradeIds } from "./models/tradeModel.js";
 // import "./config/passport.js";
 
 // Rate limiting configuration
@@ -46,6 +47,7 @@ const wsServer = new TradeWebSocketServer(server);
 const tradeMonitor = getTradeMonitorService();
 
 export async function initializeTradeMonitoring(): Promise<void> {
+  await backfillMissingTradeIds();
   await tradeMonitor.resumeActiveMonitoring();
   tradeMonitor.startBackgroundReconciliation();
   await resumePendingProfitCredits();

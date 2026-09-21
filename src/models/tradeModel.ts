@@ -1,7 +1,17 @@
 import { Schema, model, InferSchemaType, HydratedDocument } from "mongoose";
+import { randomUUID } from "node:crypto";
+
+export const createTradeId = () =>
+  `SCT-${randomUUID().replace(/-/g, "").slice(0, 12).toUpperCase()}`;
 
 const tradeSchema = new Schema(
   {
+    tradeId: {
+      type: String,
+      default: createTradeId,
+      unique: true,
+      sparse: true,
+    },
     userId: {
       type: Schema.Types.ObjectId,
       ref: "User",
@@ -211,3 +221,25 @@ export type ITrade = InferSchemaType<typeof tradeSchema>;
 export type TradeDocument = HydratedDocument<ITrade>;
 
 export const Trade = model<TradeDocument>("Trade", tradeSchema);
+
+export async function backfillMissingTradeIds(): Promise<void> {
+  while (true) {
+    const trades = await Trade.find({
+      $or: [
+        { tradeId: { $exists: false } },
+        { tradeId: null },
+        { tradeId: "" },
+      ],
+    }).select("_id").limit(500).lean();
+    if (!trades.length) return;
+    await Trade.bulkWrite(
+      trades.map((trade) => ({
+        updateOne: {
+          filter: { _id: trade._id, $or: [{ tradeId: { $exists: false } }, { tradeId: null }, { tradeId: "" }] },
+          update: { $set: { tradeId: createTradeId() } },
+        },
+      })),
+      { ordered: false },
+    );
+  }
+}
