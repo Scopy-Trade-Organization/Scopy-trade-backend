@@ -19,7 +19,7 @@ const proTraderDashboardRouter = Router();
 
 // authentication and role-based access control middleware
 proTraderDashboardRouter.use(userAuthenticate);
-proTraderDashboardRouter.use(requireRole(["Pro Trader"]));
+proTraderDashboardRouter.use(requireRole(["ProTrader"]));
 
 proTraderDashboardRouter.post("/wallet", saveWalletAddress);
 proTraderDashboardRouter.get("/wallet", getWalletAddress);

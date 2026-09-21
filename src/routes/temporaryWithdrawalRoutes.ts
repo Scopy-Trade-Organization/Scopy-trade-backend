@@ -11,7 +11,7 @@ temporaryWithdrawalRouter.use((_req, res, next) => {
   return next();
 });
 temporaryWithdrawalRouter.use(userAuthenticate);
-temporaryWithdrawalRouter.post("/trade-close", requireRole(["Pro Trader"]), simulateSuccessfulTradeClose);
+temporaryWithdrawalRouter.post("/trade-close", requireRole(["ProTrader"]), simulateSuccessfulTradeClose);
 temporaryWithdrawalRouter.post("/withdraw-usdt", requireRole(["CopyTrader"]), simulateProfitShareWithdrawal);
 
 export default temporaryWithdrawalRouter;

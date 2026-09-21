@@ -30,7 +30,7 @@ const userSchema = new Schema(
     },
     role: {
       type: String,
-      enum: ["CopyTrader", "Pro Trader"],
+      enum: ["CopyTrader", "ProTrader"],
       default: "CopyTrader",
     },
     sponsored: {

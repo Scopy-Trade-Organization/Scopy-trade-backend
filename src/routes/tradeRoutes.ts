@@ -23,19 +23,19 @@ tradeRouter.post("/preview", requireRole(["CopyTrader"]), previewTrade);
 tradeRouter.post("/", requireRole(["CopyTrader"]), initiateTrade);
 
 // GET User Trades
-tradeRouter.get("/", requireRole(["CopyTrader", "Pro Trader"]), getUserTrades);
+tradeRouter.get("/", requireRole(["CopyTrader", "ProTrader"]), getUserTrades);
 
 // GET User exchange balances for all connected accounts
 tradeRouter.get(
   "/balances",
-  requireRole(["CopyTrader", "Pro Trader"]),
+  requireRole(["CopyTrader", "ProTrader"]),
   fetchExchangeBalances,
 );
 
 // Returns a single trade with populated signal and exchange connection info.
 tradeRouter.get(
   "/:tradeId",
-  requireRole(["CopyTrader", "Pro Trader"]),
+  requireRole(["CopyTrader", "ProTrader"]),
   getTradeById,
 );
 

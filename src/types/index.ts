@@ -13,7 +13,7 @@ export interface RegisterRequestBody {
   sponsored?: boolean;
   password: string;
   confirmPassword: string;
-  role: "CopyTrader" | "Pro Trader";
+  role: "CopyTrader" | "ProTrader";
 }
 
 // ─── Supported Exchanges ───────────────────────────────────────────────────────

@@ -171,7 +171,7 @@ export const fetchAllUsers = async (req: Request, res: Response) => {
     const { page = 1, role, status } = req.query;
 
     if (role) {
-      const validRoles = ["CopyTrader", "Pro Trader"];
+      const validRoles = ["CopyTrader", "ProTrader"];
       if (!validRoles.includes(String(role))) {
         return res.status(400).json({
           success: false,
