@@ -35,7 +35,9 @@ export function csrfProtection(req: Request, res: Response, next: NextFunction):
     "/api/auth/resend-signup-otp",
     "/api/auth/forgot-password",
     "/api/auth/reset-password",
+    "/api/auth/refresh",
     "/api/admin/auth/login",
+    "/api/admin/auth/refresh",
   ]);
   const routePath = `${req.baseUrl}${req.path}`;
   if (SAFE_METHODS.has(req.method) || publicPostPaths.has(routePath)) {
