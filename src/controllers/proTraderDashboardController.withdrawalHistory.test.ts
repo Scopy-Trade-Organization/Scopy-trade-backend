@@ -36,7 +36,7 @@ function createUser(overrides: Partial<{ email: string; traderID: string }> = {}
     lastName: "Trader",
     email: overrides.email ?? `trader-${Date.now()}-${Math.random()}@example.com`,
     traderID: overrides.traderID ?? `TID-${Date.now()}-${Math.random()}`,
-    role: "Pro Trader",
+    role: "ProTrader",
   });
 }
 
@@ -49,11 +49,11 @@ function createReqRes(userId: string, query: Record<string, unknown> = {}) {
   const res = {
     status(code: number) {
       statusCode = code;
-      return res;
+      return this;
     },
     json(payload: unknown) {
       body = payload;
-      return res;
+      return this;
     },
   } as unknown as Response;
 
@@ -125,24 +125,23 @@ test("returns only the requesting user's completed withdrawals, newest first", a
     timestamp: new Date(base),
   });
 
-  const { req, res, statusCode, body } = createReqRes(String(userA._id));
-  await getWithdrawalHistory(req, res);
+  const mock = createReqRes(String(userA._id));
+  await getWithdrawalHistory(mock.req, mock.res);
 
-  assert.equal(statusCode, 200);
-  assert.equal(body.success, true);
-  assert.equal(body.total, 3);
-  assert.equal(body.page, 1);
-  assert.equal(body.limit, 10);
-  assert.equal(body.pages, 1);
-  assert.equal(body.withdrawals.length, 3);
+  assert.equal(mock.body.success, true);
+  assert.equal(mock.body.total, 3);
+  assert.equal(mock.body.page, 1);
+  assert.equal(mock.body.limit, 10);
+  assert.equal(mock.body.pages, 1);
+  assert.equal(mock.body.withdrawals.length, 3);
 
   // Newest first.
   assert.deepEqual(
-    body.withdrawals.map((w: any) => w.transactionId),
+    mock.body.withdrawals.map((w: any) => w.transactionId),
     ["tx-newest", "tx-middle", "tx-oldest"],
   );
 
-  const first = body.withdrawals[0];
+  const first = mock.body.withdrawals[0];
   assert.equal(first.amount, 30);
   assert.equal(first.status, "COMPLETED");
   assert.equal(first.destinationAddress, "TXbn5m37PT8ZhTgfsfmZm12EN76bwuxSj7");
@@ -183,11 +182,10 @@ test("paginates with 10 per page", async () => {
 test("returns an empty list for a user with no withdrawals", async () => {
   const user = await createUser();
 
-  const { req, res, body, statusCode } = createReqRes(String(user._id));
-  await getWithdrawalHistory(req, res);
+  const mock = createReqRes(String(user._id));
+  await getWithdrawalHistory(mock.req, mock.res);
 
-  assert.equal(statusCode, 200);
-  assert.equal(body.success, true);
-  assert.deepEqual(body.withdrawals, []);
-  assert.equal(body.total, 0);
+  assert.equal(mock.body.success, true);
+  assert.deepEqual(mock.body.withdrawals, []);
+  assert.equal(mock.body.total, 0);
 });
