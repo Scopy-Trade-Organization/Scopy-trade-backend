@@ -108,6 +108,7 @@ export async function sendOtpEmail(
   firstName: string,
   code: string,
   purpose: "signup" | "password-reset" | "withdrawal",
+  details?: string,
 ): Promise<void> {
   const labels = {
     signup: "Verify your email",
@@ -117,7 +118,7 @@ export async function sendOtpEmail(
   const configuredMinutes = Number(process.env.OTP_EXPIRY_MINUTES || 10);
   const minutes = Number.isFinite(configuredMinutes) ? Math.max(1, configuredMinutes) : 10;
   const title = labels[purpose];
-  const intro = `Hi ${firstName || "there"}, use the verification code below to continue. It expires in ${minutes} minutes.`;
+  const intro = `Hi ${firstName || "there"}, use the verification code below to continue. It expires in ${minutes} minutes. ${details || ""}`;
   const codeHtml = `<div style="font-size:32px;font-weight:800;letter-spacing:10px;text-align:center;background:#0b1020;border-radius:12px;padding:18px;color:#74e0b1">${escapeHtml(code)}</div>`;
   await sendEmail({
     to,

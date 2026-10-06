@@ -23,6 +23,7 @@ const settlementSchema = new Schema(
       index: true,
     },
     simulated: { type: Boolean, default: false },
+    fundingMode: { type: String, enum: ["live", "demo", "unknown"], default: "unknown" },
     accountType: { type: String, default: null },
     availableUsdt: { type: String, default: null },
     withdrawalId: { type: String, default: null },

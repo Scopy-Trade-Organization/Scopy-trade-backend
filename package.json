@@ -7,7 +7,7 @@
     "dev": "nodemon --watch src --ext ts --exec \"tsx src/index.ts\"",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "node --import tsx --test \"src/**/*.test.ts\""
+    "test": "node scripts/run-tests.mjs"
   },
   "keywords": [],
   "author": "",
@@ -53,6 +53,7 @@
     "@types/streamifier": "^0.1.2",
     "@types/validator": "^13.15.10",
     "@types/ws": "^8.18.1",
+    "mongodb-memory-server": "^11.3.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   }

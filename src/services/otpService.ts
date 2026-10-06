@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import type { ClientSession } from "mongoose";
 import EmailOtp, { EmailOtpPurpose } from "../models/emailOtpModel.js";
 
 const MAX_ATTEMPTS = 5;
@@ -45,6 +46,7 @@ export async function consumeOtp(input: {
   purpose: EmailOtpPurpose;
   code: unknown;
   context?: string;
+  session?: ClientSession;
 }): Promise<boolean> {
   const email = input.email.trim().toLowerCase();
   if (!/^\d{6}$/.test(String(input.code ?? ""))) return false;
@@ -54,7 +56,7 @@ export async function consumeOtp(input: {
     usedAt: null,
     expiresAt: { $gt: new Date() },
     attempts: { $lt: MAX_ATTEMPTS },
-  }).sort({ createdAt: -1 }).select("+codeHash +contextHash");
+  }).sort({ createdAt: -1 }).select("+codeHash +contextHash").session(input.session ?? null);
   if (!otp) return false;
 
   const suppliedHash = hash(`${email}:${input.purpose}:${String(input.code)}`);
@@ -67,8 +69,9 @@ export async function consumeOtp(input: {
     return false;
   }
   const consumed = await EmailOtp.updateOne(
-    { _id: otp._id, usedAt: null },
+    { _id: otp._id, usedAt: null, expiresAt: { $gt: new Date() }, attempts: { $lt: MAX_ATTEMPTS } },
     { $set: { usedAt: new Date() } },
+    input.session ? { session: input.session } : {},
   );
   return consumed.modifiedCount === 1;
 }

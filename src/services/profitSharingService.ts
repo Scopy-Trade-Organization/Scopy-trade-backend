@@ -1,3 +1,6 @@
+import { isTestnet, isBitgetDemo, isOkxDemo } from "./exchangeEnvironment.js";
+import { creditProEarning } from "./proFinanceService.js";
+import { profitSplit } from "../helpers/usdt.js";
 import mongoose from "mongoose";
 import crypto from "crypto";
 import { Trade } from "../models/tradeModel.js";
@@ -73,9 +76,10 @@ export async function processTradeClose(
   );
   const tradeResult = classifyResult(pnl);
   const feeApplies = trade.tradeOrigin === "copy" && tradeResult === "profit";
-  const platformFee = feeApplies ? pnl * PLATFORM_FEE_PERCENT : 0;
-  const platformShare = feeApplies ? pnl * PLATFORM_SHARE_PERCENT : 0;
-  const proTraderShare = feeApplies ? pnl * PRO_TRADER_SHARE_PERCENT : 0;
+  const split = feeApplies ? profitSplit(pnl.toFixed(6)) : profitSplit("0");
+  const platformFee = Number(split.platformFee);
+  const platformShare = Number(split.platformShare);
+  const proTraderShare = Number(split.proTraderShare);
   const feeStatus = feeApplies ? "pending" : "waived";
 
   const closed = await Trade.findOneAndUpdate(
@@ -176,35 +180,8 @@ export async function getProfitShareSummary(
   };
 }
 
-async function creditProTraderShare(trade: {
-  _id: mongoose.Types.ObjectId;
-  sourceTradeId?: mongoose.Types.ObjectId | null;
-  proTraderShare?: string | null;
-}): Promise<void> {
-  const source = trade.sourceTradeId
-    ? await Trade.findById(trade.sourceTradeId).select("userId").lean()
-    : null;
-  if (!source) return;
-
-  const session = await mongoose.startSession();
-  try {
-    await session.withTransaction(async () => {
-      const claimed = await Trade.updateOne(
-        { _id: trade._id, feeStatus: "collected", proTraderCreditStatus: "pending" },
-        { $set: { proTraderCreditStatus: "credited", proTraderCreditedAt: new Date() } },
-        { session },
-      );
-      if (claimed.modifiedCount === 1) {
-        await User.updateOne(
-          { _id: source.userId },
-          { $inc: { proEarningsBalance: Number(trade.proTraderShare || 0) } },
-          { session },
-        );
-      }
-    });
-  } finally {
-    await session.endSession();
-  }
+async function creditProTraderShare(trade: { _id: mongoose.Types.ObjectId }): Promise<void> {
+  await creditProEarning(trade._id);
 }
 
 /** Collects all currently accrued fees after explicit copy-trader approval. */
@@ -232,6 +209,7 @@ export async function approveProfitShareWithdrawal(
   ).lean();
   if (!lockedUser) throw new Error("A profit-share withdrawal is already processing.");
 
+  let crossedSubmissionBoundary = false;
   let batchId: string | null = null;
   let claimedIds: mongoose.Types.ObjectId[] = [];
   const requestId = options.requestId || crypto.randomUUID();
@@ -331,6 +309,7 @@ export async function approveProfitShareWithdrawal(
       destinationAddress: wallet.address,
       status: "PROCESSING",
       simulated: options.simulateSuccess === true,
+      fundingMode: options.simulateSuccess || isTestnet() || (exchange === "bitget" && isBitgetDemo()) || (exchange === "okx" && isOkxDemo()) ? "demo" : "live",
       accountType,
       availableUsdt: availableUsdt.toFixed(6),
     });
@@ -347,6 +326,11 @@ export async function approveProfitShareWithdrawal(
       },
     );
 
+    // Persist an ambiguous/submitted state BEFORE crossing the external boundary.
+    if (!options.simulateSuccess) {
+      await Settlement.updateOne({ userId, requestId, status: "PROCESSING" }, { $set: { status: "SUBMITTED", submittedAt: new Date() } });
+      crossedSubmissionBoundary = true;
+    }
     const withdrawal = options.simulateSuccess
       ? {
           transactionId: `simulated-${requestId}`,
@@ -371,7 +355,7 @@ export async function approveProfitShareWithdrawal(
     }
 
     await Settlement.updateOne(
-      { userId, requestId, status: "PROCESSING" },
+      { userId, requestId, status: { $in: ["PROCESSING", "SUBMITTED"] } },
       {
         $set: {
           status: "COMPLETED",
@@ -411,7 +395,7 @@ export async function approveProfitShareWithdrawal(
       idempotent: false,
     };
   } catch (error) {
-    const withdrawalPending = Boolean((error as any)?.withdrawalPending);
+    const withdrawalPending = crossedSubmissionBoundary || Boolean((error as any)?.withdrawalPending);
     if (claimedIds.length && batchId && !withdrawalPending) {
       await Trade.updateMany(
         { settlementBatchId: batchId, feeStatus: "processing" },
@@ -424,7 +408,7 @@ export async function approveProfitShareWithdrawal(
       );
     }
     await Settlement.updateOne(
-      { userId, requestId, status: "PROCESSING" },
+      { userId, requestId, status: { $in: ["PROCESSING", "SUBMITTED"] } },
       {
         $set: {
           status: withdrawalPending ? "SUBMITTED" : "FAILED",
@@ -447,39 +431,19 @@ export async function approveProfitShareWithdrawal(
 
 /** Startup recovery credits pros only; withdrawals always require user approval. */
 export async function resumePendingProfitCredits(): Promise<void> {
-  const staleBefore = new Date(Date.now() - 10 * 60 * 1000);
-  // A submitted withdrawal has crossed the non-idempotent exchange boundary.
-  // Never make those trades retryable automatically; an operator can inspect
-  // the durable settlement and exchange withdrawal ID instead.
-  const submittedBatchIds = await Settlement.distinct("batchId", { status: "SUBMITTED" });
-  await Promise.all([
-    Trade.updateMany(
-      {
-        tradeOrigin: "copy",
-        tradeResult: "profit",
-        feeStatus: "processing",
-        settlementBatchId: {
-          $ne: null,
-          ...(submittedBatchIds.length ? { $nin: submittedBatchIds } : {}),
-        },
-        settlementStartedAt: { $lt: staleBefore },
-      },
-      {
-        $set: {
-          feeStatus: "failed",
-          settlementError: "A previous approved withdrawal was interrupted. Please approve it again.",
-        },
-      },
-    ),
-    User.updateMany(
-      {
-        role: "CopyTrader",
-        profitShareWithdrawalStatus: "processing",
-        profitShareWithdrawalStartedAt: { $lt: staleBefore },
-      },
-      { $set: { profitShareWithdrawalStatus: "idle", profitShareWithdrawalStartedAt: null } },
-    ),
-  ]);
+  // Recover a crash after a confirmed collection but before trade/credit updates.
+  const completed = await Settlement.find({ status: "COMPLETED" }).select("batchId withdrawalId blockchainTransactionId network destinationAddress completedAt").lean();
+  for (const settlement of completed) {
+    await Trade.updateMany({ settlementBatchId: settlement.batchId, feeStatus: "processing" }, { $set: {
+      feeStatus: "collected", settlementTransactionId: settlement.withdrawalId,
+      settlementBlockchainTransactionId: settlement.blockchainTransactionId,
+      settlementNetwork: settlement.network, settlementAddress: settlement.destinationAddress,
+      settlementCompletedAt: settlement.completedAt, settlementError: null,
+    } });
+  }
+  // Interrupted external calls may have transferred funds. Never make them retryable automatically.
+  await Settlement.updateMany({ status: "PROCESSING", createdAt: { $lt: new Date(Date.now() - 10 * 60_000) } },
+    { $set: { status: "SUBMITTED", error: "Interrupted settlement requires reconciliation before retry." } });
 
   const trades = await Trade.find({
     tradeOrigin: "copy",

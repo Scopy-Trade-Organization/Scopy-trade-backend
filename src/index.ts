@@ -1,3 +1,4 @@
+import { initializeProFinance } from "./services/proFinanceService.js";
 import "dotenv/config";
 import app, { initializeTradeMonitoring, server } from "./app.js";
 import mongoose from "mongoose";
@@ -14,6 +15,7 @@ if (!MONGO_URI) {
 try {
   await mongoose.connect(MONGO_URI);
   console.log("MongoDB Connected Successfully");
+  await initializeProFinance();
   await initializeTradeMonitoring();
 } catch (error) {
   console.error("Application initialization error:", error);
