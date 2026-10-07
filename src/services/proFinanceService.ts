@@ -123,7 +123,7 @@ export async function processProWithdrawal(id: mongoose.Types.ObjectId, clientFa
     assertPayoutTransaction(extended, row.address, row.units, sender);
     const signed = await tron.trx.sign(extended);
     const saved = await ProWithdrawal.findOneAndUpdate({ _id: id, status: "QUEUED" },
-      { $set: { status: "SIGNED", signedTransaction: signed, transactionId: signed.txID, expiresAt: new Date(signed.raw_data.expiration) } },
+      { $set: { status: "SIGNED", signedTransaction: signed, senderAddress: sender, transactionId: signed.txID, expiresAt: new Date(signed.raw_data.expiration) } },
       { new: true, writeConcern: { w: "majority" } }).select("+signedTransaction").lean();
     if (!saved) return;
     row = saved;
@@ -147,6 +147,90 @@ export async function processProWithdrawal(id: mongoose.Types.ObjectId, clientFa
     return;
   }
   await tron.trx.sendRawTransaction(row.signedTransaction);
+}
+
+/** Read-only reconciliation remains available while live payouts are paused. */
+export function reconciliationClient() {
+  const host = process.env.TRON_FULL_HOST || "https://api.trongrid.io";
+  if (new URL(host).protocol !== "https:") throw new Error("TRON_FULL_HOST must use HTTPS.");
+  return new TronWeb({ fullHost: host, ...(process.env.TRON_PRO_API_KEY ? { headers: { "TRON-PRO-API-KEY": process.env.TRON_PRO_API_KEY } } : {}) });
+}
+
+export class ReconciliationError extends Error {
+  constructor(message: string, public statusCode: number) { super(message); }
+}
+const unresolvedReason = "The blockchain result remains unresolved. Funds remain reserved; no refund was made.";
+const executionFailures = new Set(["REVERT", "OUT_OF_ENERGY", "OUT_OF_TIME", "ILLEGAL_OPERATION", "BAD_JUMP_DESTINATION", "OUT_OF_MEMORY", "PRECOMPILED_CONTRACT", "STACK_TOO_SMALL", "STACK_TOO_LARGE", "JVM_STACK_OVER_FLOW", "TRANSFER_FAILED", "INVALID_CODE"]);
+
+export async function reconcileProWithdrawal(id: mongoose.Types.ObjectId, admin: mongoose.Types.ObjectId, clientFactory = reconciliationClient) {
+  const initial = await ProWithdrawal.findById(id).readConcern("majority").select("+signedTransaction").lean();
+  if (!initial) throw new ReconciliationError("Withdrawal not found.", 404);
+  if (!["REVIEW", "CONFIRMED", "FAILED"].includes(initial.status)) {
+    throw new ReconciliationError("Only withdrawals under review can be reconciled.", 409);
+  }
+  let status: "REVIEW" | "CONFIRMED" | "FAILED" = "REVIEW";
+  let reason = unresolvedReason;
+  if (initial.status === "REVIEW" && initial.mode === "live" && initial.transactionId && initial.signedTransaction) {
+    try {
+      // New payouts retain their original sender across company key rotations.
+      // Legacy payouts must match the configured company key; otherwise hold for review.
+      const sender = initial.senderAddress || (process.env.TRON_COMPANY_PRIVATE_KEY
+        ? TronWeb.address.fromPrivateKey(process.env.TRON_COMPANY_PRIVATE_KEY) : false);
+      if (!sender || initial.signedTransaction.txID !== initial.transactionId) throw new Error("Missing payout identity");
+      assertPayoutTransaction(initial.signedTransaction, initial.address, initial.units, sender);
+      const tron = clientFactory();
+      const [transaction, info] = await Promise.all([
+        tron.trx.getConfirmedTransaction(initial.transactionId),
+        tron.trx.getTransactionInfo(initial.transactionId),
+      ]);
+      if (transaction.txID !== initial.transactionId || info.id !== initial.transactionId) throw new Error("Receipt identity mismatch");
+      assertPayoutTransaction(transaction, initial.address, initial.units, sender);
+      const result = transaction.ret?.[0]?.contractRet;
+      if (result === "SUCCESS" && transferConfirmed(info, initial.address, initial.units, sender)) {
+        status = "CONFIRMED";
+        reason = "Confirmed the exact USDT transfer on TRON. Reserved funds were paid; no refund was made.";
+      } else if (info.result === "FAILED" && result && executionFailures.has(result) && info.receipt?.result === result) {
+        status = "FAILED";
+        reason = "Confirmed on-chain execution failure; the exact withdrawal amount was refunded.";
+      }
+    } catch {
+      // Missing receipts, timeouts, mismatched evidence and expiry never prove failure.
+      reason = unresolvedReason;
+    }
+  }
+  let output: any;
+  let idempotent = false;
+  await mongoose.connection.transaction(async session => {
+    const current = await ProWithdrawal.findById(id).session(session).lean();
+    if (!current) throw new ReconciliationError("Withdrawal not found.", 404);
+    const previousStatus = current.status;
+    idempotent = ["CONFIRMED", "FAILED"].includes(current.status);
+    if (idempotent) {
+      output = current;
+    } else {
+      if (current.status !== "REVIEW" || current.transactionId !== initial.transactionId ||
+          current.units !== initial.units || current.address !== initial.address || current.mode !== initial.mode ||
+          String(current.userId) !== String(initial.userId) || current.senderAddress !== initial.senderAddress) {
+        throw new ReconciliationError("Withdrawal changed. Refresh before reconciling.", 409);
+      }
+      output = await ProWithdrawal.findOneAndUpdate({ _id: id, status: "REVIEW", transactionId: initial.transactionId },
+        { $set: { status, lastError: reason, ...(status === "REVIEW" ? {} : { completedAt: new Date() }) } },
+        { new: true, session }).lean();
+      if (!output) throw new ReconciliationError("Withdrawal changed. Refresh before reconciling.", 409);
+      if (status === "FAILED") {
+        const field = balanceField(current.mode);
+        const refund = await User.updateOne({ _id: current.userId, [field]: { $lte: Number.MAX_SAFE_INTEGER - current.units } },
+          { $inc: { [field]: current.units } }, { session });
+        if (refund.matchedCount !== 1) throw new Error("Refund account unavailable.");
+      }
+    }
+    await AuditLog.create([{ userId: current.userId, admin, action: "Pro Withdrawal Reconciled", targetId: id,
+      targetType: "ProWithdrawal", details: { withdrawalId: id, requestId: current.requestId, previousStatus,
+        newStatus: output.status, transactionId: current.transactionId, units: current.units, mode: current.mode,
+        result: idempotent ? "ALREADY_RESOLVED" : status === "REVIEW" ? "UNRESOLVED" : status,
+        reason: idempotent ? "Already resolved; balance unchanged." : reason } }], { session });
+  }, { writeConcern: { w: "majority" }, readConcern: { level: "snapshot" } });
+  return { withdrawal: output, idempotent, message: idempotent ? "Already resolved; balance unchanged." : reason };
 }
 
 let working = false;

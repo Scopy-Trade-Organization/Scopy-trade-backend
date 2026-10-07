@@ -113,17 +113,23 @@ function page(req: Request) {
   return value;
 }
 
-function publicWithdrawal(row: any) {
+export function publicWithdrawal(row: any) {
   return {
     _id: row._id,
     requestId: row.requestId,
     mode: row.mode,
-    amount: formatUsdt(row.units),
+    amount: row.amount || formatUsdt(row.units),
     address: row.address,
     status: row.status,
     transactionId: row.transactionId,
     createdAt: row.createdAt,
     completedAt: row.completedAt,
+    fundsReserved: ["QUEUED", "SIGNED", "REVIEW"].includes(row.status),
+    lastError: row.status === "REVIEW"
+      ? "Your withdrawal is under review because the blockchain result could not yet be confirmed. Funds remain reserved."
+      : row.status === "FAILED"
+        ? "Your withdrawal failed. The withdrawal amount has been returned to your available balance."
+        : null,
   };
 }
 
@@ -500,6 +506,7 @@ export const getWithdrawals = handler(async (req, res) => {
         transactionId: 1,
         createdAt: 1,
         completedAt: 1,
+        requestId: 1,
       },
     },
     {
@@ -531,10 +538,7 @@ export const getWithdrawals = handler(async (req, res) => {
   ]);
   res.json({
     success: true,
-    rows: (result?.rows || []).map((row: any) => ({
-      ...row,
-      amount: row.amount || formatUsdt(row.units),
-    })),
+    rows: (result?.rows || []).map(publicWithdrawal),
     page: current,
     pages: Math.max(1, Math.ceil((result?.count[0]?.total || 0) / limit)),
   });

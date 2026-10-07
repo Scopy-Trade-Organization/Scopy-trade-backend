@@ -16,6 +16,7 @@ const withdrawalSchema = new Schema({
   address: { type: String, required: true },
   status: { type: String, enum: ["QUEUED", "SIGNED", "CONFIRMED", "FAILED", "REVIEW"], default: "QUEUED", required: true },
   transactionId: { type: String, default: null },
+  senderAddress: { type: String, default: null },
   signedTransaction: { type: Schema.Types.Mixed, select: false },
   expiresAt: { type: Date, default: null },
   completedAt: { type: Date, default: null },

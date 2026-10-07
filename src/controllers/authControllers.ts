@@ -109,7 +109,6 @@ export const registerUser = async (
     const hashedPassword = await bcrypt.hash(password, 12);
 
     // Check if user already exists
-    // Check if user already exists
     const existingUser = await User.findOne({ email });
 
     if (existingUser) {
@@ -121,54 +120,67 @@ export const registerUser = async (
         });
       }
 
-      // User exists but not verified
-      const code = await issueOtp({
-        email: existingUser.email,
-        purpose: "signup",
-        userId: existingUser._id,
-      });
-      await sendOtpEmail(
-        existingUser.email,
-        existingUser.firstName,
-        code,
-        "signup",
-      );
+      // Temporarily collect unverified registrations directly on the waitlist.
+      if (existingUser.status === "suspended") {
+        return res.status(403).json({
+          status: "fail",
+          message: "Your account has been suspended. Please contact support.",
+        });
+      }
+      existingUser.status = "waitlist";
+      await existingUser.save();
+
+      // Temporarily disabled: signup OTP generation and email delivery.
+      // const code = await issueOtp({
+      //   email: existingUser.email,
+      //   purpose: "signup",
+      //   userId: existingUser._id,
+      // });
+      // await sendOtpEmail(
+      //   existingUser.email,
+      //   existingUser.firstName,
+      //   code,
+      //   "signup",
+      // );
       return res.status(200).json({
         status: "success",
-        message: "A new verification code has been sent to your email.",
-        data: { email: existingUser.email },
+        message: "Registration successful. You've been added to the waitlist.",
+        data: { email: existingUser.email, status: existingUser.status },
       });
     }
 
-    const signupStatus =
-      process.env.SIGNUP_DEFAULT_STATUS === "active" ? "active" : "waitlist";
+    // Temporarily force all new registrations onto the waitlist.
+    // const signupStatus =
+    //   process.env.SIGNUP_DEFAULT_STATUS === "active" ? "active" : "waitlist";
+    const signupStatus = "waitlist";
 
-    // Create the account as unverified. It cannot be used until the emailed OTP is confirmed.
+    // waitlist registrations.
     const user = await User.create({
       email,
       password: hashedPassword,
       firstName,
       lastName,
       role,
+      isVerified: true,
       sponsored,
       traderID:
         role === "CopyTrader" ? generateCopyTraderID() : generateProTraderID(),
       status: signupStatus,
     });
 
-    const code = await issueOtp({
-      email: user.email,
-      purpose: "signup",
-      userId: user._id,
-    });
-    await sendOtpEmail(user.email, user.firstName, code, "signup");
+    // Temporarily disabled: signup OTP generation and email delivery.
+    // const code = await issueOtp({
+    //   email: user.email,
+    //   purpose: "signup",
+    //   userId: user._id,
+    // });
+    // await sendOtpEmail(user.email, user.firstName, code, "signup");
 
     // Respond with success
     return res.status(201).json({
       status: "success",
-      message:
-        "Registration received. Check your email for the verification code.",
-      data: { email: user.email },
+      message: "Registration successful. You've been added to the waitlist.",
+      data: { email: user.email, status: user.status },
     });
   } catch (err: any) {
     console.error("Error registering user:", err);
@@ -314,20 +326,16 @@ export const resendSignupOtp = async (req: Request, res: Response) => {
       });
       await sendOtpEmail(user.email, user.firstName, code, "signup");
     }
-    return res
-      .status(200)
-      .json({
-        status: "success",
-        message: "If that registration exists, a new code has been sent.",
-      });
+    return res.status(200).json({
+      status: "success",
+      message: "If that registration exists, a new code has been sent.",
+    });
   } catch (error) {
     console.error("Error resending signup OTP:", error);
-    return res
-      .status(500)
-      .json({
-        status: "error",
-        message: "Unable to send a verification code.",
-      });
+    return res.status(500).json({
+      status: "error",
+      message: "Unable to send a verification code.",
+    });
   }
 };
 
@@ -398,21 +406,17 @@ export const requestPasswordReset = async (req: Request, res: Response) => {
       });
       await sendOtpEmail(user.email, user.firstName, code, "password-reset");
     }
-    return res
-      .status(200)
-      .json({
-        status: "success",
-        message:
-          "If an account exists for that email, a reset code has been sent.",
-      });
+    return res.status(200).json({
+      status: "success",
+      message:
+        "If an account exists for that email, a reset code has been sent.",
+    });
   } catch (error) {
     console.error("Error requesting password reset:", error);
-    return res
-      .status(500)
-      .json({
-        status: "error",
-        message: "Unable to request a password reset.",
-      });
+    return res.status(500).json({
+      status: "error",
+      message: "Unable to request a password reset.",
+    });
   }
 };
 
@@ -423,12 +427,10 @@ export const resetPassword = async (req: Request, res: Response) => {
       .toLowerCase();
     const { otp, password, confirmPassword } = req.body;
     if (!email || !otp || !password || !confirmPassword) {
-      return res
-        .status(400)
-        .json({
-          status: "fail",
-          message: "Email, code, and both password fields are required.",
-        });
+      return res.status(400).json({
+        status: "fail",
+        message: "Email, code, and both password fields are required.",
+      });
     }
     if (password !== confirmPassword)
       return res
@@ -442,13 +444,11 @@ export const resetPassword = async (req: Request, res: Response) => {
         minNumbers: 1,
       })
     ) {
-      return res
-        .status(400)
-        .json({
-          status: "fail",
-          message:
-            "Password must be at least 8 characters and include an uppercase letter, number, and symbol.",
-        });
+      return res.status(400).json({
+        status: "fail",
+        message:
+          "Password must be at least 8 characters and include an uppercase letter, number, and symbol.",
+      });
     }
     const user = await User.findOne({ email, isVerified: true }).select(
       "+sessionVersion",
@@ -457,12 +457,10 @@ export const resetPassword = async (req: Request, res: Response) => {
       !user ||
       !(await consumeOtp({ email, purpose: "password-reset", code: otp }))
     ) {
-      return res
-        .status(400)
-        .json({
-          status: "fail",
-          message: "Invalid or expired verification code.",
-        });
+      return res.status(400).json({
+        status: "fail",
+        message: "Invalid or expired verification code.",
+      });
     }
     user.password = await bcrypt.hash(password, 12);
     user.sessionVersion = (user.sessionVersion ?? 0) + 1;
