@@ -7,6 +7,7 @@ import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js"
 import { queueAccountStatusEmail } from "../services/emailService.js";
 import { Settlement } from "../models/settlementModel.js";
 import { SUPPORTED_PAIRS } from "../constants.js";
+import { auditLogQuery } from "../helpers/auditLogQuery.js";
 
 const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -596,30 +597,37 @@ export const activateUser = async (req: Request, res: Response) => {
 };
 
 export const fetchAuditLogs = async (req: Request, res: Response) => {
+  let query: ReturnType<typeof auditLogQuery>;
   try {
-    const { page = 1, action } = req.query;
-    const filter: any = {};
-
-    if (action) {
-      filter.action = action;
-    }
-
-    const limit = 10;
-    const currentPage = Number(page);
-    const skip = (currentPage - 1) * limit;
-
-    const logs = await AuditLog.find(filter)
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .skip(skip);
+    query = auditLogQuery(req.query);
+  } catch (error) {
+    return res.status(400).json({ success: false, message: error instanceof Error ? error.message : "Invalid audit log filters." });
+  }
+  try {
+    const { filter, page: currentPage, limit } = query;
+    const total = await AuditLog.countDocuments(filter);
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const page = Math.min(currentPage, pages);
+    const [logs, actions] = await Promise.all([
+      AuditLog.find(filter)
+        .sort({ timestamp: -1, _id: -1 })
+        .limit(limit)
+        .skip((page - 1) * limit)
+        .populate({ path: "admin", select: "firstName lastName email", transform: (doc, id) => doc ?? id })
+        .populate({ path: "userId", select: "firstName lastName email", transform: (doc, id) => doc ?? id })
+        .lean(),
+      AuditLog.distinct("action"),
+    ]);
 
     return res.status(200).json({
       success: true,
       message: "Audit logs retrieved successfully",
       logs,
-      page: currentPage,
+      page,
       limit,
-      pages: Math.ceil((await AuditLog.countDocuments(filter)) / limit),
+      pages,
+      total,
+      actions: actions.sort(),
     });
   } catch (error) {
     console.error("Error fetching audit logs:", error);

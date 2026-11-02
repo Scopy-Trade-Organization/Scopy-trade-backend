@@ -266,8 +266,7 @@ export const login = async (
 
     await AuditLog.create({
       action: "User login attempt",
-      user: user._id,
-      userEmail: user.email,
+      userId: user._id,
       ipAddress: req.ip,
       userAgent: req.headers["user-agent"],
     });
