@@ -1,4 +1,6 @@
 import { initializeProFinance } from "./services/proFinanceService.js";
+import { initializeAutomaticCopying } from "./services/automaticCopyService.js";
+import { initializeTraderRanks } from "./services/traderProfileService.js";
 import "dotenv/config";
 import app, { initializeTradeMonitoring, server } from "./app.js";
 import mongoose from "mongoose";
@@ -17,6 +19,8 @@ try {
   console.log("MongoDB Connected Successfully");
   await initializeProFinance();
   await initializeTradeMonitoring();
+  initializeAutomaticCopying();
+  initializeTraderRanks();
 } catch (error) {
   console.error("Application initialization error:", error);
   process.exit(1);

@@ -12,6 +12,7 @@ import {
   financeLimit,
 } from "../controllers/proFinanceController.js";
 import { Router } from "express";
+import { myCopiers, myRanks } from "../controllers/traderFlowController.js";
 import {
   userAuthenticate,
   requireRole,
@@ -29,6 +30,8 @@ const proTraderDashboardRouter = Router();
 // authentication and role-based access control middleware
 proTraderDashboardRouter.use(userAuthenticate);
 proTraderDashboardRouter.use(requireRole(["ProTrader"]));
+proTraderDashboardRouter.get("/copiers", myCopiers);
+proTraderDashboardRouter.get("/ranks", myRanks);
 
 proTraderDashboardRouter.post("/wallet", financeLimit, saveWalletAddress);
 proTraderDashboardRouter.get("/wallet", getWalletAddress);

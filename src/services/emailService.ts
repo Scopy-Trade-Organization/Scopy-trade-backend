@@ -149,6 +149,15 @@ export function queueEmail(label: string, task: () => Promise<void>): void {
   setImmediate(() => void task().catch((error) => console.error(`[emailService] ${label}:`, error)));
 }
 
+export function queueCopyFailureEmail(userId: unknown, title: string, message: string): void {
+  queueEmail("automatic copy failure notification", async () => {
+    const user = await User.findById(userId).select("email firstName").lean();
+    if (!user) return;
+    const intro = `Hi ${user.firstName}, ${message}`;
+    await sendEmail({ to: user.email, subject: title, text: intro, html: renderLayout(title, intro, "") });
+  });
+}
+
 export function queueTradeEmail(
   userId: unknown,
   event: "opened" | "copied" | "closed",

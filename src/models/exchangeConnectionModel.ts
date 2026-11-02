@@ -43,6 +43,8 @@ const exchangeConnectionSchema = new Schema(
     connectedAt: { type: Date, default: Date.now },
     disconnectedAt: { type: Date, default: null },
     lastTestedAt: { type: Date, default: null },
+    balanceUsdt: { type: Number, default: null },
+    balanceCheckedAt: { type: Date, default: null },
     lastTestStatus: {
       type: String,
       enum: ["ok", "failed", null],

@@ -17,6 +17,6 @@ export function formatUsdt(units: number): string {
 export function profitSplit(profit: string) {
   const units = BigInt(usdtUnits(profit));
   const fee = units * 20n / 100n;
-  const pro = units * 5n / 100n;
+  const pro = units * 10n / 100n;
   return { platformFee: formatUsdt(Number(fee)), proTraderShare: formatUsdt(Number(pro)), platformShare: formatUsdt(Number(fee - pro)) };
 }

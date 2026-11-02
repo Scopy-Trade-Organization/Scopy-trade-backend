@@ -1,10 +1,8 @@
 import { Router } from "express";
 import {
-  initiateTrade,
   getUserTrades,
   getTradeById,
   fetchExchangeBalances,
-  previewTrade,
 } from "../controllers/tradeController.js";
 import {
   userAuthenticate,
@@ -16,11 +14,8 @@ const tradeRouter = Router();
 // All trade routes require authentication
 tradeRouter.use(userAuthenticate);
 
-// Preview trade — calculates position sizing without placing an order
-tradeRouter.post("/preview", requireRole(["CopyTrader"]), previewTrade);
-
-// Initiates a copy trade for the authenticated user:
-tradeRouter.post("/", requireRole(["CopyTrader"]), initiateTrade);
+// Legacy manual copying is replaced by trader subscriptions:
+tradeRouter.post("/", requireRole(["CopyTrader"]), (_req, res) => res.status(410).json({ success: false, message: "Trades are copied automatically. Choose a pro trader from your dashboard to start copying." }));
 
 // GET User Trades
 tradeRouter.get("/", requireRole(["CopyTrader", "ProTrader"]), getUserTrades);

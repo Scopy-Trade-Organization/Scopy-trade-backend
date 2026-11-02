@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { listRankAwards, verifyRankAward } from "../controllers/traderFlowController.js";
 import {
   activateUser,
   fetchAllUsers,
@@ -17,6 +18,8 @@ const adminDashboardRouter = Router();
 
 // All routes require admin authentication
 adminDashboardRouter.use(adminAuthenticate);
+adminDashboardRouter.get("/pro/rank-awards", listRankAwards);
+adminDashboardRouter.post("/pro/rank-awards/:id/verify", reconciliationLimit, verifyRankAward);
 adminDashboardRouter.get("/pro/withdrawals", listProWithdrawals);
 adminDashboardRouter.get("/pro/withdrawals/:id", getProWithdrawal);
 adminDashboardRouter.post("/pro/withdrawals/:id/reconcile", reconciliationLimit, reconcileWithdrawal);

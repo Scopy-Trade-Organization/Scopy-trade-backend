@@ -48,6 +48,7 @@ const tradeSchema = new Schema(
       default: null,
       index: true,
     },
+    copyFanoutAt: { type: Date, default: null },
     // References ExchangeConnection, not a raw exchange name
     exchangeConnectionId: {
       type: Schema.Types.ObjectId,
@@ -216,6 +217,7 @@ tradeSchema.index(
 );
 
 tradeSchema.index({ userId: 1, status: 1, createdAt: -1 });
+tradeSchema.index({ tradeOrigin: 1, copyFanoutAt: 1, createdAt: 1 });
 
 export type ITrade = InferSchemaType<typeof tradeSchema>;
 export type TradeDocument = HydratedDocument<ITrade>;

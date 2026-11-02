@@ -5,6 +5,7 @@ import User from "../models/userModel.js";
 import AuditLog from "../models/auditLogModel.js";
 import { Trade } from "../models/tradeModel.js";
 import { ProEarning, ProWithdrawal } from "../models/proFinanceModel.js";
+import { RankAward } from "../models/rankModel.js";
 import { isValidTronAddress } from "../helpers/tronAddress.js";
 import { formatUsdt, usdtUnits } from "../helpers/usdt.js";
 import { consumeOtp, issueOtp } from "../services/otpService.js";
@@ -136,7 +137,7 @@ export function publicWithdrawal(row: any) {
 export const getFinanceSummary = handler(async (req, res) => {
   const user = await account(req);
   const mode = payoutMode();
-  const [earned, reserved] = await Promise.all([
+  const [earned, reserved, bonuses] = await Promise.all([
     ProEarning.aggregate([
       { $match: { userId: req.user, mode } },
       { $group: { _id: null, units: { $sum: "$units" } } },
@@ -151,6 +152,10 @@ export const getFinanceSummary = handler(async (req, res) => {
       },
       { $group: { _id: null, units: { $sum: "$units" } } },
     ]),
+    RankAward.aggregate([
+      { $match: { userId: req.user, mode, status: "credited" } },
+      { $group: { _id: null, amount: { $sum: "$bonus" } } },
+    ]),
   ]);
   res.json({
     success: true,
@@ -162,7 +167,7 @@ export const getFinanceSummary = handler(async (req, res) => {
     legacyBalance: String(user.proEarningsBalance || 0),
     mode,
     available: formatUsdt(user[balanceField(mode)] || 0),
-    earned: formatUsdt(earned[0]?.units || 0),
+    earned: formatUsdt((earned[0]?.units || 0) + Math.round((bonuses[0]?.amount || 0) * 1_000_000)),
     reserved: formatUsdt(reserved[0]?.units || 0),
     withdrawalAddress: user.withdrawalAddress || null,
     walletUnlocksAt: user.withdrawalAddressChangedAt

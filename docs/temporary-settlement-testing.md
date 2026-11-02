@@ -60,7 +60,7 @@ user.
 ```
 
 With the example prices and copy quantity, copied PnL is 60 USDT, settlement is
-12 USDT (20%), platform share is 9 USDT (15%), and pro share is 3 USDT (5%).
+12 USDT (20%), platform share is 6 USDT (10%), and pro share is 6 USDT (10%).
 The response exposes those computed records and totals. Repeating the same
 request returns the original data without creating more trades.
 
