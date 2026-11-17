@@ -90,11 +90,6 @@ const userSchema = new Schema(
     settlementOwedUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
     proBalanceUnits: { type: Number, default: 0, min: 0 },
     financeOtpSentAt: { type: Date, default: null },
-    proEarningsBalance: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
 
   },
   { timestamps: true },

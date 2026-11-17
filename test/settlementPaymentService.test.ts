@@ -3,14 +3,13 @@ import assert from "node:assert/strict";
 import mongoose from "mongoose";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { TronWeb } from "tronweb";
-import { ensureSettlement, validateSettlementReceipt, verifySettlement, ownershipMessage } from "./settlementPaymentService.js";
-import { MAINNET_USDT, TRANSFER_TOPIC, finishWithdrawal } from "./proFinanceService.js";
-import { Transaction } from "../models/transactionModel.js";
-import { Notification } from "../models/notificationModel.js";
-import { Trade } from "../models/tradeModel.js";
-import User from "../models/userModel.js";
-import { processTradeClose, getProfitShareSummary, backfillSettlementBalances, resumePendingProfitCredits } from "./profitSharingService.js";
-import { migrateFinancialRecords } from "./financialMigrationService.js";
+import { ensureSettlement, validateSettlementReceipt, verifySettlement, ownershipMessage } from "../src/services/settlementPaymentService.js";
+import { MAINNET_USDT, TRANSFER_TOPIC, finishWithdrawal } from "../src/services/proFinanceService.js";
+import { Transaction } from "../src/models/transactionModel.js";
+import { Notification } from "../src/models/notificationModel.js";
+import { Trade } from "../src/models/tradeModel.js";
+import User from "../src/models/userModel.js";
+import { processTradeClose, getProfitShareSummary } from "../src/services/profitSharingService.js";
 
 const wallet = TronWeb.address.fromPrivateKey("1".padStart(64, "0")) as string;
 const senderKey = "2".padStart(64, "0");
@@ -110,29 +109,6 @@ test("threshold and fixed invoice protect later trade fees from being marked pai
   assert.equal(await Trade.countDocuments({ userId, feeStatus: "pending" }), 1);
 });
 
-test("legacy migration preserves IDs and supports restarting without duplicates", async () => {
-  const id = new mongoose.Types.ObjectId(), userId = new mongoose.Types.ObjectId();
-  await mongoose.connection.db!.collection("prowithdrawals").insertOne({ _id: id, userId, requestId: "old", units: 100, mode: "live", status: "COMPLETED", address: wallet, createdAt: new Date() });
-  await migrateFinancialRecords(); await migrateFinancialRecords();
-  assert.equal(await Transaction.countDocuments({ type: "withdrawal", _id: id }), 1);
-  assert.equal(await Transaction.countDocuments({ type: "earning", _id: id }), 0);
-});
-
-test("demo finance is excluded and existing records use only the unified schema fields", async () => {
-  const id = new mongoose.Types.ObjectId(), userId = new mongoose.Types.ObjectId();
-  await Transaction.collection.insertOne({ _id: id, userId, type: "withdrawal", units: 100_000_000, mode: "demo", status: "QUEUED" });
-  await User.collection.insertOne({ _id: userId, email: "migration@example.com", traderID: "migration-test", proLiveUnits: 42_000_000, proDemoUnits: 100_000_000 });
-  await migrateFinancialRecords();
-  assert.equal(await Transaction.countDocuments({ _id: id }), 0);
-  assert.equal(await mongoose.connection.db!.collection("legacy_demo_transactions").countDocuments({ _id: id }), 1);
-  const user = await User.findById(userId).lean();
-  assert.equal(user?.proBalanceUnits, 42_000_000);
-  assert.equal((await User.collection.findOne({ _id: userId }))?.proDemoUnits, undefined);
-  assert.equal(Transaction.discriminators, undefined);
-  for (const field of ["mode", "simulated", "fundingMode", "batchId", "amount", "blockchainTransactionId", "destinationAddress", "accountType", "availableUsdt"]) {
-    assert.equal(Transaction.schema.path(field), undefined);
-  }
-});
 
 
 test("failed withdrawals refund the actual balance only once", async () => {
@@ -162,26 +138,4 @@ test("a missing balance rolls back the trade close instead of losing the debt", 
   await Trade.collection.insertOne({ _id: id, userId, pair: "BTCUSDT", direction: "buy", quantity: "1", entryPrice: "100", status: "filled", tradeOrigin: "copy", signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
   await assert.rejects(processTradeClose(String(id), "120", "tp"), /balance unavailable/);
   assert.equal((await Trade.findById(id).lean())?.status, "filled");
-});
-
-test("backfill totals unpaid fees once and preserves an existing stored balance", async () => {
-  const userId = new mongoose.Types.ObjectId();
-  await User.collection.insertOne({ _id: userId, email: "backfill@example.com", traderID: "backfill-test" });
-  for (const [feeStatus, platformFee] of [["pending", "1.000001"], ["processing", "2.000002"], ["failed", "3.000003"], ["collected", "99.000000"]]) {
-    await Trade.collection.insertOne({ userId, tradeOrigin: "copy", tradeResult: "profit", feeStatus, platformFee, signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
-  }
-  await backfillSettlementBalances();
-  assert.equal((await User.findById(userId).lean())?.settlementOwedUnits, 6_000_006);
-  await User.updateOne({ _id: userId }, { $inc: { settlementOwedUnits: 1 } });
-  await backfillSettlementBalances();
-  assert.equal((await User.findById(userId).lean())?.settlementOwedUnits, 6_000_007);
-});
-
-test("recovery of an older paid settlement deducts its debt once", async () => {
-  const userId = new mongoose.Types.ObjectId();
-  await User.collection.insertOne({ _id: userId, email: "recovery@example.com", traderID: "recovery-test", settlementOwedUnits: 13_000_000 });
-  const invoice = await Transaction.create({ userId, type: "settlement", units: 10_000_000, status: "COMPLETED", address: wallet });
-  await Trade.collection.insertOne({ userId, tradeOrigin: "copy", tradeResult: "profit", feeStatus: "processing", platformFee: "10.000000", settlementBatchId: String(invoice._id), signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
-  await resumePendingProfitCredits(); await resumePendingProfitCredits();
-  assert.equal((await User.findById(userId).lean())?.settlementOwedUnits, 3_000_000);
 });

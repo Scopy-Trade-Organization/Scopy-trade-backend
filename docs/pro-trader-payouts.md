@@ -1,69 +1,66 @@
 # Pro-trader earnings and TRON payouts
 
-The page is /dashboard/pro-trader/earnings (the withdrawals URL opens the same page on the Withdrawals tab). It shows all profitable closed copied trades belonging to the signed-in pro, with the copier profit, total fee, actual pro share, and collection/credit status. Historical recorded payouts remain visible as LEGACY_SUBMITTED because their blockchain finality was not stored.
+The earnings page is `/dashboard/pro-trader/earnings`. The withdrawals URL opens
+the same page on its Withdrawals tab.
 
 ## Accounting
 
-For 100 USDT of copier profit: copier keeps 80, pro earns 5, platform keeps 15. New fee splits use integer micro-USDT and round the pro share down; any fractional micro-unit remainder in the collected fee stays with the platform. Financial balances use integer micro-USDT, with safe-integer bounds.
+For 100 USDT of profitable copied trades, the copier keeps 80 USDT, the pro earns
+10 USDT, and the platform receives 10 USDT. Amounts use integer USDT micro-units:
+1 USDT is 1,000,000 units.
 
-A completed settlement creates a unique ProEarning for the copied trade and credits the appropriate user balance in the same MongoDB transaction. Simulated and exchange-demo/testnet settlements credit proDemoUnits; explicitly recorded live settlements credit proLiveUnits. Older settlements with unknown funding provenance remain unallocated until reconciled. Pending fees are displayed but cannot be withdrawn. The worker retries interrupted pro credits.
+All financial records use the `Transaction` model with type `earning`,
+`withdrawal`, or `settlement`. Confirmed settlement payment marks its fees
+collected. Each pro earning is credited once to `User.proBalanceUnits` in the
+same database transaction as its earning record. Pending fees are not available
+to withdraw. The worker retries interrupted pro credits.
 
-MongoDB must be a replica set (including Atlas) or a sharded cluster. Standalone MongoDB cannot support these transactions. Startup creates the unique earning and withdrawal indexes before HTTP traffic is accepted.
+Copier debt is stored separately in `User.settlementOwedUnits`. New users start
+with zero debt and zero available earnings. See
+[settlement setup](settlement-payments-setup.md) for incoming payments.
 
-## Demo
+MongoDB must support transactions (Atlas or another replica set). Startup creates
+transaction indexes before accepting requests.
 
-Set:
-```dotenv
-PRO_PAYOUT_MODE=demo
-PRO_PAYOUT_LIVE_ENABLED=false
-PRO_DEMO_FUNDING_ENABLED=true
-```
-Keep existing OTP/email configuration working. Sign in as an active, verified pro, visit the earnings page, choose Add demo funds, add a TRON address, verify it by email, and request a withdrawal. Each account can receive the fixed 100 USDT demo grant once. Demo withdrawals reserve only demo balances and the worker confirms them without constructing a TRON client. No key or company wallet funding is needed. Demo funds cannot convert to live funds.
+## Outgoing payout configuration
 
-## Live configuration
+Set these backend environment variables:
 
-```dotenv
-PRO_PAYOUT_MODE=live
-PRO_PAYOUT_LIVE_ENABLED=true
-PRO_DEMO_FUNDING_ENABLED=false
-TRON_FULL_HOST=https://api.trongrid.io
-TRON_COMPANY_PRIVATE_KEY=<server-side signing secret>
-TRON_USDT_CONTRACT_ADDRESS=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
-TRON_PRO_API_KEY=<optional provider API key>
-```
+- `PRO_PAYOUT_LIVE_ENABLED`: false until the payout wallet is configured and funded.
+- `TRON_FULL_HOST`: https://api.trongrid.io
+- `TRON_COMPANY_PRIVATE_KEY`: the company payout wallet's signing key, backend only.
+- `TRON_USDT_CONTRACT_ADDRESS`: TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
+- `TRON_PRO_API_KEY`: your TronGrid key.
 
-The live adapter pins the mainnet USDT contract. Use a trusted mainnet HTTPS RPC endpoint. The company key must control the funded TRON payout wallet; the wallet needs USDT plus sufficient TRX/Energy/Bandwidth. The fee cap is 100 TRX per contract call; the company pays network costs. Secrets belong in your secret manager/environment and never in the frontend. No live transfer was used to test this implementation.
+Fund the company wallet with USDT and enough TRX for network fees before enabling
+payouts. The adapter uses mainnet USDT and caps the contract-call fee at 100 TRX.
+There are no demo payout balances or modes.
 
-The existing PROFIT_WITHDRAWAL_MODE controls copier-to-platform exchange collection; it is separate from PRO_PAYOUT_MODE, which controls platform-to-pro payouts. These settings do not turn demo credits into live balances.
+Wallet verification uses an address-bound email OTP. Adding or changing a payout
+wallet starts a 24-hour withdrawal hold. Pro accounts must be active and verified.
+Existing authentication, rate limits, and CSRF protection apply.
 
-Wallet saves require an address-bound email OTP. Live payouts have a fixed 24-hour hold after wallet verification/change. OTP issue requests are throttled in the database (one minute per user), verification allows at most five failed attempts, and mutations also have per-account HTTP rate limits. Existing session authentication, pro role checks, verified/active status checks, and global CSRF protections apply.
+## Withdrawal requests
 
-## Withdrawal state and recovery
+A request provides a decimal-string amount, OTP, and an `Idempotency-Key` header
+containing 16-80 letters, numbers, underscores, or hyphens. The OTP is bound to the
+amount, wallet, and request ID.
 
-The request must provide an Idempotency-Key (16-80 alphanumeric, underscore or dash characters), amount as a decimal string, mode, and OTP. OTP context includes user email, action, exact integer amount, destination, mode and request ID.
+Balance reservation, OTP consumption, transaction insertion, and the audit entry
+commit together. Repeating the same request returns the same withdrawal.
 
-Reservation, OTP consumption, durable withdrawal insertion and audit log commit in one transaction. Conditional balance updates prevent overdrafts. The same key and payload return the same record even after a response is lost.
+States are `QUEUED`, `SIGNED`, `COMPLETED`, `FAILED`, and `REVIEW`. The worker saves
+the signed transaction before broadcasting. Retries send that same transaction.
+Confirmed failure refunds once; unresolved receipts and expired transactions stay
+reserved for review. Pausing payouts stops submission and rebroadcast without
+releasing reserved funds.
 
-QUEUED -> SIGNED -> CONFIRMED / FAILED / REVIEW.
+Operators can inspect and reconcile withdrawals from the admin dashboard. Check
+the saved hash and actual chain result before resolving a payment under review.
 
-The worker persists the signed transaction and txID before broadcast. Concurrent workers may prepare transactions, but only the compare-and-set winner can persist and send one. Retries broadcast only the persisted transaction, never a newly signed replacement. Confirmation uses the solidified receipt and checks the exact USDT Transfer event sender, recipient and amount. A definitive on-chain execution failure refunds exactly once in a transaction. Timeouts, missing receipts and expired transactions do not release funds.
+## Checks
 
-REVIEW holds the reservation. An operator must investigate the persisted transaction ID against the trusted mainnet chain; never blindly reset SIGNED/REVIEW to QUEUED or refund because an RPC call timed out. Reconciliation must establish that the original transaction cannot execute and whether USDT actually moved. Document and audit any manual resolution. Monitor queued/signed age, REVIEW counts, company balances/resources, worker failures and unapplied credits. Changing the live switch pauses live submission/rebroadcast; it does not release reserved funds.
-
-## Existing installations
-
-The former proEarningsBalance mixed real and simulated settlement credits and did not persist a complete payout ledger. It is deliberately retained and displayed separately, not automatically imported into spendable live units. Before releasing historical money, reconcile each completed Settlement, credited Trade, old Withdrawal Executed audit entry, and actual chain/exchange transfer. Allocate only verified net outstanding obligations to live balance, document the reconciliation, and archive/clear the legacy display amount. Do not simply copy the legacy number into the new live field.
-
-Missing historical payout audit entries cannot be reconstructed safely from the old balance alone. Historical credited rows without a new ledger are labeled legacy credit. New collection credits use the new ledger automatically.
-
-Interrupted copier-fee settlement submissions also remain held for reconciliation instead of becoming retryable automatically; this prevents duplicate collection after a lost exchange response.
-
-## Validation
-
-Run npm test and npm run build in the backend. The pro-finance integration suite starts an isolated MongoDB replica set via mongodb-memory-server and never loads your .env or connects to the configured platform database. Initial test setup downloads the MongoDB binary. Tests exercise concurrent reservations, idempotency, OTP context, insufficient funds, wallet verification, isolated demo grants, credits, refunds and durable broadcast retries.
-
-Run node node_modules/typescript/bin/tsc --noEmit and the scoped ESLint command in the frontend.
-
-TRON references:
-- [Broadcast signed transactions](https://tronweb.network/docu/docs/API%20List/trx/sendRawTransaction/)
-- [Solidified receipts and confirmation](https://developers.tron.network/re/reference/gettransactioninfobyid-1)
+Run `npm test` and `npm run build` in the backend. Tests are in `test/` and use an
+isolated MongoDB replica set with mocked blockchain receipts. Tests send no real
+payments and do not use the application's database. The first run may download
+MongoDB's test binary. Build the frontend separately after UI changes.

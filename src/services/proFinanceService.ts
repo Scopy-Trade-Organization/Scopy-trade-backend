@@ -158,10 +158,7 @@ export async function reconcileProWithdrawal(id: mongoose.Types.ObjectId, admin:
   let reason = unresolvedReason;
   if (initial.status === "REVIEW" && initial.transactionId && initial.signedTransaction && initial.address) {
     try {
-      // New payouts retain their original sender across company key rotations.
-      // Legacy payouts must match the configured company key; otherwise hold for review.
-      const sender = initial.senderAddress || (process.env.TRON_COMPANY_PRIVATE_KEY
-        ? TronWeb.address.fromPrivateKey(process.env.TRON_COMPANY_PRIVATE_KEY) : false);
+      const sender = initial.senderAddress;
       if (!sender || initial.signedTransaction.txID !== initial.transactionId) throw new Error("Missing payout identity");
       assertPayoutTransaction(initial.signedTransaction, initial.address, initial.units, sender);
       const tron = clientFactory();

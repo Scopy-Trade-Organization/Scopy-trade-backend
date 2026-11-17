@@ -18,8 +18,7 @@ All financial records use **one schema and one model** in
 The user model stores the total unpaid amount in `settlementOwedUnits` (the same
 micro-unit format). Trade close adds fees and confirmed payment subtracts the
 invoice amount, each in the same database transaction as the related records.
-Summary requests read this stored balance directly. Existing users are backfilled
-once at startup before workers and requests start.
+Summary requests read this stored balance directly. New users start with zero owed.
 
 The transaction ID is also the invoice ID. `address` holds the receiving wallet,
 and `transactionId` holds the blockchain hash.
@@ -97,17 +96,8 @@ USDT and TRX. There are no simulated payouts or demo-credit endpoints.
 3. Run `npm run build` in the backend and deploy the matching frontend changes.
 4. Start the backend with `npm start`.
 
-The startup migration converts old finance records into the unified schema.
-Old source collections remain as backups. Already-migrated demo records are
-preserved in `legacy_demo_transactions`, outside the active financial ledger;
-they never become real funds. The actual balance moves from `proLiveUnits` to
-`proBalanceUnits`. Old demo rank bonuses return to pending verification.
-The database account needs permission to write records and create indexes.
-
-Old exchange settlements with uncertain outcomes become `REVIEW`. Check the
-exchange withdrawal history before reconciling them. Never create another payment
-request for money that may already have transferred. The application does not
-retry those old withdrawals.
+The server creates the transaction and notification indexes before accepting
+requests. The database account needs permission to create those indexes.
 
 ## 5. Paying an invoice
 

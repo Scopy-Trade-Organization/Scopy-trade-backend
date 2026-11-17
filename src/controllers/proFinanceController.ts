@@ -109,7 +109,7 @@ export function publicWithdrawal(row: any) {
   return {
     _id: row._id,
     requestId: row.requestId,
-    amount: row.amount || formatUsdt(row.units),
+    amount: formatUsdt(row.units),
     address: row.address,
     status: row.status,
     transactionId: row.transactionId,
@@ -148,7 +148,6 @@ export const getFinanceSummary = handler(async (req, res) => {
   res.json({
     success: true,
     accountId: String(user._id),
-    legacyBalance: String(user.proEarningsBalance || 0),
     available: formatUsdt(user.proBalanceUnits || 0),
     earned: formatUsdt((earned[0]?.units || 0) + Math.round((bonuses[0]?.amount || 0) * 1_000_000)),
     reserved: formatUsdt(reserved[0]?.units || 0),
@@ -440,24 +439,6 @@ export const getWithdrawals = handler(async (req, res) => {
         createdAt: 1,
         completedAt: 1,
         requestId: 1,
-      },
-    },
-    {
-      $unionWith: {
-        coll: AuditLog.collection.name,
-        pipeline: [
-          { $match: { userId: req.user, action: "Withdrawal Executed" } },
-          {
-            $project: {
-              _id: 1,
-              amount: { $toString: "$details.amount" },
-              address: "$details.destinationAddress",
-              transactionId: "$details.transactionId",
-              status: { $literal: "LEGACY_SUBMITTED" },
-              createdAt: 1,
-            },
-          },
-        ],
       },
     },
     { $sort: { createdAt: -1, _id: -1 } },
