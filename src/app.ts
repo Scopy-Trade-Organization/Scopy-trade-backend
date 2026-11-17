@@ -27,6 +27,7 @@ import { backfillMissingTradeIds } from "./models/tradeModel.js";
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 70,
+  skip: (req) => req.method === "GET",
   message: "Too many requests from this IP, please try again later",
   standardHeaders: "draft-8",
   legacyHeaders: false,
@@ -90,6 +91,8 @@ app.use("/api", cookieParser());
 app.use("/api", express.urlencoded({ extended: false, limit: "100kb" }));
 app.use("/api", helmet({ crossOriginResourcePolicy: { policy: "same-site" } }));
 app.use("/api", limiter);
+// Dashboard polling has its own budget and cannot exhaust the mutation budget.
+app.use("/api", rateLimit({ windowMs: 15 * 60 * 1000, limit: 1200, skip: req => req.method !== "GET", standardHeaders: "draft-8", legacyHeaders: false }));
 app.use((req, res, next) => {
   req.body = sanitize(req.body);
   req.params = sanitize(req.params);

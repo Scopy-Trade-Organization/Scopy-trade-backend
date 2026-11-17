@@ -7,6 +7,7 @@ import {
 } from "../middleware/authenticationMiddleware.js";
 import {
   approveProfitShare,
+  verifyProfitShare,
   getProfitShare,
 } from "../controllers/copyTraderDashboardController.js";
 
@@ -25,6 +26,7 @@ copyTraderDashboardRouter.get("/subscriptions", mySubscriptions);
 copyTraderDashboardRouter.get("/notifications", notifications);
 copyTraderDashboardRouter.patch("/notifications/:id/read", readNotification);
 copyTraderDashboardRouter.get("/profit-share", getProfitShare);
-copyTraderDashboardRouter.post("/profit-share/approve", approveProfitShare);
+copyTraderDashboardRouter.post("/profit-share/approve", copyLimit, approveProfitShare);
+copyTraderDashboardRouter.post("/profit-share/verify", copyLimit, verifyProfitShare);
 
 export default copyTraderDashboardRouter;

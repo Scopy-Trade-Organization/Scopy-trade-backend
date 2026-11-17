@@ -1,3 +1,4 @@
+import { Transaction } from "../models/transactionModel.js";
 import { Request, Response } from "express";
 import AuditLog from "../models/auditLogModel.js";
 import User from "../models/userModel.js";
@@ -5,7 +6,6 @@ import { Trade } from "../models/tradeModel.js";
 import mongoose from "mongoose";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
 import { queueAccountStatusEmail } from "../services/emailService.js";
-import { Settlement } from "../models/settlementModel.js";
 import { SUPPORTED_PAIRS } from "../constants.js";
 import { auditLogQuery } from "../helpers/auditLogQuery.js";
 
@@ -85,7 +85,6 @@ export const getTrades = async (req: Request, res: Response) => {
     const [trades, total] = await Promise.all([
       Trade.find(filter)
         .populate("userId", "firstName lastName traderID role profilePhoto")
-        .populate("exchangeConnectionId", "exchange label")
         .populate({
           path: "sourceTradeId",
           select: "userId pair",
@@ -169,18 +168,17 @@ export const getSettlements = async (req: Request, res: Response) => {
     const page = Math.max(Number(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
     const filter: Record<string, unknown> = {};
-    if (["PROCESSING", "SUBMITTED", "COMPLETED", "FAILED"].includes(String(req.query.status || ""))) {
+    if (["AWAITING_PAYMENT", "COMPLETED", "FAILED", "REVIEW"].includes(String(req.query.status || ""))) {
       filter.status = req.query.status;
     }
     const [settlements, total] = await Promise.all([
-      Settlement.find(filter)
+      Transaction.find({ ...filter, type: "settlement" })
         .populate("userId", "firstName lastName traderID")
-        .populate("exchangeConnectionId", "exchange label")
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
         .lean(),
-      Settlement.countDocuments(filter),
+      Transaction.countDocuments({ ...filter, type: "settlement" }),
     ]);
     return res.status(200).json({
       success: true,

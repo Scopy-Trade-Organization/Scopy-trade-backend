@@ -86,22 +86,14 @@ const userSchema = new Schema(
       trim: true,
     },
     withdrawalAddressChangedAt: { type: Date, default: null },
-    proLiveUnits: { type: Number, default: 0, min: 0 },
-    proDemoUnits: { type: Number, default: 0, min: 0 },
-    proDemoGranted: { type: Boolean, default: false },
+    proBalanceUnits: { type: Number, default: 0, min: 0 },
     financeOtpSentAt: { type: Date, default: null },
-    proFinanceVersion: { type: Number, default: 0 },
     proEarningsBalance: {
       type: Number,
       default: 0,
       min: 0,
     },
-    profitShareWithdrawalStatus: {
-      type: String,
-      enum: ["idle", "processing"],
-      default: "idle",
-    },
-    profitShareWithdrawalStartedAt: { type: Date, default: null },
+
   },
   { timestamps: true },
 );

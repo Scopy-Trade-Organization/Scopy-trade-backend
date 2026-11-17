@@ -133,7 +133,7 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
         return tradeOutcome(402, {
           success: false,
           code: "PROFIT_SHARE_DUE",
-          message: `Approve the ${Number(profitShare.pendingAmount).toFixed(2)} USDT platform profit-share withdrawal before copying another trade.`,
+          message: `Settle the ${Number(profitShare.pendingAmount).toFixed(2)} USDT profit share in your dashboard before copying another trade.`,
           profitShare,
         });
       }

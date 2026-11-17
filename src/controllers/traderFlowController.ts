@@ -8,7 +8,7 @@ import AuditLog from "../models/auditLogModel.js";
 import { traderProfile, getCopiers } from "../services/traderProfileService.js";
 import { refreshConnectionBalance } from "../services/automaticCopyService.js";
 import { RANKS } from "../services/rankRules.js";
-import { balanceField, payoutMode } from "../services/proFinanceService.js";
+import { getProfitShareSummary } from "../services/profitSharingService.js";
 import { SUPPORTED_TRADE_EXCHANGES } from "../constants.js";
 
 const handler = (fn: (req: Request, res: Response) => Promise<unknown>) => async (req: Request, res: Response) => {
@@ -38,6 +38,7 @@ export const getTraderProfile = handler(async (req, res) => {
 });
 
 export const startCopying = handler(async (req, res) => {
+  if ((await getProfitShareSummary(req.user as mongoose.Types.ObjectId)).settlementRequired) return res.status(403).json({ success: false, message: "Settle your outstanding profit share in your dashboard before copying new trades." });
   const { exchangeConnectionId, allocation } = req.body;
   if (!mongoose.isValidObjectId(req.params.traderId) || !mongoose.isValidObjectId(exchangeConnectionId)) return res.status(400).json({ success: false, message: "Select a trader and an exchange account." });
   if (typeof allocation !== "number" || !Number.isFinite(allocation) || allocation < 1 || allocation > 1e9) return res.status(400).json({ success: false, message: "Allocation must be a positive USDT amount of at least 1." });
@@ -98,14 +99,14 @@ export const listRankAwards = handler(async (req, res) => {
 export const verifyRankAward = handler(async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid award ID." });
   if (req.body.platformEarningsVerified !== true) return res.status(422).json({ success: false, message: "Platform earnings verification is required before crediting a rank bonus." });
-  const mode = payoutMode(), field = balanceField(mode);
+  const field = "proBalanceUnits";
   await mongoose.connection.transaction(async session => {
-    const award = await RankAward.findOneAndUpdate({ _id: req.params.id, status: "pending" }, { $set: { status: "credited", verifiedBy: req.admin, verifiedAt: new Date(), mode } }, { session, new: true });
+    const award = await RankAward.findOneAndUpdate({ _id: req.params.id, status: "pending" }, { $set: { status: "credited", verifiedBy: req.admin, verifiedAt: new Date() } }, { session, new: true });
     if (!award) return;
     const units = Math.round(award.bonus * 1_000_000);
     const result = await User.updateOne({ _id: award.userId, role: "ProTrader", [field]: { $lte: Number.MAX_SAFE_INTEGER - units } }, { $inc: { [field]: units } }, { session });
     if (result.matchedCount !== 1) throw new Error("Bonus balance is unavailable.");
-    await AuditLog.create([{ userId: award.userId, action: "Rank Bonus Credited", targetId: award._id, details: { level: award.level, bonus: award.bonus, mode, verifiedBy: req.admin } }], { session });
+    await AuditLog.create([{ userId: award.userId, action: "Rank Bonus Credited", targetId: award._id, details: { level: award.level, bonus: award.bonus, verifiedBy: req.admin } }], { session });
   });
-  return res.json({ success: true, message: "Rank bonus verified and credited, or previously credited.", mode });
+  return res.json({ success: true, message: "Rank bonus verified and credited, or previously credited." });
 });

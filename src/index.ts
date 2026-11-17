@@ -1,3 +1,5 @@
+import { migrateFinancialRecords } from "./services/financialMigrationService.js";
+import { initializeSettlements } from "./services/settlementPaymentService.js";
 import { initializeProFinance } from "./services/proFinanceService.js";
 import { initializeAutomaticCopying } from "./services/automaticCopyService.js";
 import { initializeTraderRanks } from "./services/traderProfileService.js";
@@ -17,7 +19,9 @@ if (!MONGO_URI) {
 try {
   await mongoose.connect(MONGO_URI);
   console.log("MongoDB Connected Successfully");
+  await migrateFinancialRecords();
   await initializeProFinance();
+  await initializeSettlements();
   await initializeTradeMonitoring();
   initializeAutomaticCopying();
   initializeTraderRanks();

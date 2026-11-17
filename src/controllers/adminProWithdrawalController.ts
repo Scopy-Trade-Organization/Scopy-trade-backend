@@ -1,8 +1,8 @@
+import { Transaction } from "../models/transactionModel.js";
 import type { Request, Response } from "express";
 import mongoose from "mongoose";
 import rateLimit from "express-rate-limit";
 import User from "../models/userModel.js";
-import { ProWithdrawal } from "../models/proFinanceModel.js";
 import { publicWithdrawal } from "./proFinanceController.js";
 import { reconcileProWithdrawal, ReconciliationError } from "../services/proFinanceService.js";
 
@@ -34,16 +34,16 @@ export const listProWithdrawals = handler(async (req, res) => {
   const page = Number(req.query.page || 1);
   if (!Number.isSafeInteger(page) || page < 1 || page > 100_000) throw new ReconciliationError("Invalid page.", 400);
   const status = req.query.status;
-  if (status !== undefined && !["QUEUED", "SIGNED", "CONFIRMED", "FAILED", "REVIEW"].includes(String(status))) throw new ReconciliationError("Invalid status.", 400);
+  if (status !== undefined && !["QUEUED", "SIGNED", "COMPLETED", "FAILED", "REVIEW"].includes(String(status))) throw new ReconciliationError("Invalid status.", 400);
   const filter = status ? { status: String(status) } : {};
   const [rows, total] = await Promise.all([
-    ProWithdrawal.find(filter).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * 20).limit(20).lean(),
-    ProWithdrawal.countDocuments(filter),
+    Transaction.find({ ...filter, type: "withdrawal" }).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * 20).limit(20).lean(),
+    Transaction.countDocuments({ ...filter, type: "withdrawal" }),
   ]);
   res.json({ success: true, rows: await Promise.all(rows.map(adminWithdrawal)), page, pages: Math.max(1, Math.ceil(total / 20)), total });
 });
 export const getProWithdrawal = handler(async (req, res) => {
-  const row = await ProWithdrawal.findById(withdrawalId(req)).lean();
+  const row = await Transaction.findOne({ type: "withdrawal", _id: withdrawalId(req) }).lean();
   if (!row) throw new ReconciliationError("Withdrawal not found.", 404);
   res.json({ success: true, withdrawal: await adminWithdrawal(row) });
 });

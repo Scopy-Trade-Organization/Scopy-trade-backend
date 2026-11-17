@@ -3,9 +3,9 @@ import { Signal } from "../models/signalModel.js";
 import { Trade } from "../models/tradeModel.js";
 import mongoose from "mongoose";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
-import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
+import { formatUsdt } from "../helpers/usdt.js";
+import { ensureSettlement, verifySettlement } from "../services/settlementPaymentService.js";
 import {
-  approveProfitShareWithdrawal,
   getProfitShareSummary,
 } from "../services/profitSharingService.js";
 
@@ -96,66 +96,39 @@ export async function getProTradeById(req: Request, res: Response) {
 }
 
 async function profitSharePayload(userId: mongoose.Types.ObjectId) {
-  const [summary, connections] = await Promise.all([
-    getProfitShareSummary(userId),
-    ExchangeConnection.find({ userId, isActive: true })
-      .select("exchange label")
-      .sort({ connectedAt: 1 })
-      .lean(),
-  ]);
-  return {
-    ...summary,
-    connections: connections.map((connection) => ({
-      connectionId: String(connection._id),
-      exchange: connection.exchange,
-      label: connection.label ?? "",
-    })),
-  };
+  const settlement = await ensureSettlement(userId);
+  return { ...await getProfitShareSummary(userId), settlement: settlement ? { ...settlement, amount: formatUsdt(settlement.units), destinationAddress: settlement.address } : null };
 }
 
 export async function getProfitShare(req: Request, res: Response) {
   try {
-    const userId = req.user as mongoose.Types.ObjectId;
-    return res.status(200).json({
-      success: true,
-      profitShare: await profitSharePayload(userId),
-    });
-  } catch (error) {
-    console.error("[getProfitShare]", error);
-    return res.status(500).json({ success: false, message: "Failed to load profit share." });
+    return res.json({ success: true, profitShare: await profitSharePayload(req.user as mongoose.Types.ObjectId) });
+  } catch {
+    return res.status(503).json({ success: false, message: "Settlement details are temporarily unavailable. Please try again." });
   }
 }
 
+// Compatibility route creates/displays an invoice; it never debits an exchange.
 export async function approveProfitShare(req: Request, res: Response) {
+  return getProfitShare(req, res);
+}
+
+export async function verifyProfitShare(req: Request, res: Response) {
   try {
-    const userId = req.user as mongoose.Types.ObjectId;
-    const exchangeConnectionId = String(req.body.exchangeConnectionId || "");
-    if (!mongoose.isValidObjectId(exchangeConnectionId)) {
-      return res.status(400).json({ success: false, message: "Select a valid exchange connection." });
+    const { settlementId, transactionHash, signature } = req.body;
+    if (typeof settlementId !== "string" || typeof transactionHash !== "string" ||
+        (signature !== undefined && (typeof signature !== "string" || signature.length > 200))) {
+      return res.status(400).json({ success: false, message: "Provide a settlement ID and transaction hash." });
     }
-    const requestIdHeader = req.get("Idempotency-Key");
-    const requestId = String(requestIdHeader || req.body.requestId || "").trim();
-    if (requestId && !/^[A-Za-z0-9_-]{1,64}$/.test(requestId)) {
-      return res.status(400).json({ success: false, message: "Idempotency-Key must contain 1-64 letters, numbers, underscores, or hyphens." });
-    }
-    const result = await approveProfitShareWithdrawal(
-      userId,
-      exchangeConnectionId,
-      requestId ? { requestId } : {},
-    );
-    return res.status(200).json({
-      success: true,
-      message: `${Number(result.amount).toFixed(2)} USDT profit share was submitted successfully.`,
-      transactionId: result.transactionId,
-      idempotent: result.idempotent,
-      profitShare: await profitSharePayload(userId),
-    });
+    await verifySettlement(req.user as mongoose.Types.ObjectId, settlementId, transactionHash.trim(), signature);
+    return res.json({ success: true, message: "Settlement confirmed.", profitShare: await profitSharePayload(req.user as mongoose.Types.ObjectId) });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Profit-share withdrawal failed.";
-    console.error("[approveProfitShare]", message);
+    const message = error instanceof Error && !('isAxiosError' in error) && !('code' in error)
+      ? error.message : "Payment could not be verified. Check the hash and try again after confirmation.";
     return res.status(422).json({ success: false, message });
   }
 }
+
 //GET  all active signals.
 export async function getActiveSignals(req: Request, res: Response) {
   try {

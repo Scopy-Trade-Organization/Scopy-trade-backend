@@ -1,19 +1,17 @@
+import { Transaction } from "../models/transactionModel.js";
 import type { Request, Response } from "express";
 import mongoose from "mongoose";
 import rateLimit from "express-rate-limit";
 import User from "../models/userModel.js";
 import AuditLog from "../models/auditLogModel.js";
 import { Trade } from "../models/tradeModel.js";
-import { ProEarning, ProWithdrawal } from "../models/proFinanceModel.js";
 import { RankAward } from "../models/rankModel.js";
 import { isValidTronAddress } from "../helpers/tronAddress.js";
 import { formatUsdt, usdtUnits } from "../helpers/usdt.js";
 import { consumeOtp, issueOtp } from "../services/otpService.js";
 import { sendOtpEmail } from "../services/emailService.js";
 import {
-  balanceField,
   liveClient,
-  payoutMode,
 } from "../services/proFinanceService.js";
 
 class InputError extends Error {}
@@ -88,22 +86,15 @@ function wallet(value: unknown): string {
   return value;
 }
 
-function context(mode: string, units: number, address: string, key: string) {
-  return JSON.stringify(["pro-withdrawal", mode, units, address, key]);
+function context(units: number, address: string, key: string) {
+  return JSON.stringify(["pro-withdrawal", units, address, key]);
 }
 
-function ready(user: Awaited<ReturnType<typeof account>>, mode: string) {
+function ready(user: Awaited<ReturnType<typeof account>>) {
   wallet(user.withdrawalAddress);
-  if (mode === "live") {
-    liveClient();
-    if (
-      !user.withdrawalAddressChangedAt ||
-      Date.now() - user.withdrawalAddressChangedAt.getTime() < 24 * 60 * 60_000
-    ) {
-      throw new InputError(
-        "Live withdrawals unlock 24 hours after verifying your wallet.",
-      );
-    }
+  liveClient();
+  if (!user.withdrawalAddressChangedAt || Date.now() - user.withdrawalAddressChangedAt.getTime() < 24 * 60 * 60_000) {
+    throw new InputError("Withdrawals unlock 24 hours after verifying your wallet.");
   }
 }
 
@@ -118,7 +109,6 @@ export function publicWithdrawal(row: any) {
   return {
     _id: row._id,
     requestId: row.requestId,
-    mode: row.mode,
     amount: row.amount || formatUsdt(row.units),
     address: row.address,
     status: row.status,
@@ -136,37 +126,30 @@ export function publicWithdrawal(row: any) {
 
 export const getFinanceSummary = handler(async (req, res) => {
   const user = await account(req);
-  const mode = payoutMode();
   const [earned, reserved, bonuses] = await Promise.all([
-    ProEarning.aggregate([
-      { $match: { userId: req.user, mode } },
+    Transaction.aggregate([{ $match: { type: "earning" } },
+      { $match: { userId: req.user, status: "COMPLETED" } },
       { $group: { _id: null, units: { $sum: "$units" } } },
     ]),
-    ProWithdrawal.aggregate([
+    Transaction.aggregate([{ $match: { type: "withdrawal" } },
       {
         $match: {
           userId: req.user,
-          mode,
           status: { $in: ["QUEUED", "SIGNED", "REVIEW"] },
         },
       },
       { $group: { _id: null, units: { $sum: "$units" } } },
     ]),
     RankAward.aggregate([
-      { $match: { userId: req.user, mode, status: "credited" } },
+      { $match: { userId: req.user, status: "credited" } },
       { $group: { _id: null, amount: { $sum: "$bonus" } } },
     ]),
   ]);
   res.json({
     success: true,
     accountId: String(user._id),
-    demoFundingEnabled:
-      mode === "demo" &&
-      process.env.PRO_DEMO_FUNDING_ENABLED === "true" &&
-      !user.proDemoGranted,
     legacyBalance: String(user.proEarningsBalance || 0),
-    mode,
-    available: formatUsdt(user[balanceField(mode)] || 0),
+    available: formatUsdt(user.proBalanceUnits || 0),
     earned: formatUsdt((earned[0]?.units || 0) + Math.round((bonuses[0]?.amount || 0) * 1_000_000)),
     reserved: formatUsdt(reserved[0]?.units || 0),
     withdrawalAddress: user.withdrawalAddress || null,
@@ -194,37 +177,6 @@ async function throttleOtp(userId: mongoose.Types.ObjectId) {
   if (!result.modifiedCount)
     throw new InputError("Wait one minute before requesting another code.");
 }
-
-export const grantDemoFunds = handler(async (req, res) => {
-  const user = await account(req);
-  if (
-    payoutMode() !== "demo" ||
-    process.env.PRO_DEMO_FUNDING_ENABLED !== "true"
-  )
-    throw new InputError("Demo funding is disabled.");
-  await mongoose.connection.transaction(
-    async (session) => {
-      const result = await User.updateOne(
-        { _id: user._id, proDemoGranted: { $ne: true } },
-        { $set: { proDemoGranted: true }, $inc: { proDemoUnits: 100_000_000 } },
-        { session },
-      );
-      if (result.modifiedCount)
-        await AuditLog.create(
-          [
-            {
-              userId: user._id,
-              action: "Demo Funds Granted",
-              details: { units: 100_000_000, mode: "demo" },
-            },
-          ],
-          { session },
-        );
-    },
-    { writeConcern: { w: "majority" }, readConcern: { level: "snapshot" } },
-  );
-  res.json({ success: true, message: "Demo funds available." });
-});
 
 export const requestWalletOtp = handler(async (req, res) => {
   const user = await account(req);
@@ -267,7 +219,6 @@ export const saveWalletAddress = handler(async (req, res) => {
             withdrawalAddress: address,
             withdrawalAddressChangedAt: new Date(),
           },
-          $inc: { proFinanceVersion: 1 },
         },
         { session },
       );
@@ -295,28 +246,24 @@ export const saveWalletAddress = handler(async (req, res) => {
 
 export const requestWithdrawalOtp = handler(async (req, res) => {
   const user = await account(req);
-  const mode = payoutMode(),
-    units = amountUnits(req.body.amount),
+  const units = amountUnits(req.body.amount),
     key = requestId(req);
-  if (req.body.mode !== mode)
-    throw new InputError("Payout mode changed. Refresh this page.");
-  ready(user, mode);
-  if ((user[balanceField(mode)] || 0) < units)
+  ready(user);
+  if ((user.proBalanceUnits || 0) < units)
     throw new InputError("Insufficient available balance.");
   await throttleOtp(user._id);
   const code = await issueOtp({
     email: user.email,
     purpose: "withdrawal",
     userId: user._id,
-    context: context(mode, units, user.withdrawalAddress!, key),
+    context: context(units, user.withdrawalAddress!, key),
   });
   await sendOtpEmail(
     user.email,
     user.firstName,
     code,
     "withdrawal",
-    mode.toUpperCase() +
-      " withdrawal: " +
+    "Withdrawal: " +
       formatUsdt(units) +
       " USDT to " +
       user.withdrawalAddress,
@@ -328,12 +275,12 @@ export const withdrawFunds = handler(async (req, res) => {
   const user = await account(req);
   const units = amountUnits(req.body.amount),
     key = requestId(req);
-  const existing = await ProWithdrawal.findOne({
+  const existing = await Transaction.findOne({ type: "withdrawal",
     userId: user._id,
     requestId: key,
   }).lean();
   if (existing) {
-    if (existing.units !== units || existing.mode !== req.body.mode)
+    if (existing.units !== units)
       throw new InputError(
         "Request ID already used for a different withdrawal.",
       );
@@ -344,11 +291,8 @@ export const withdrawFunds = handler(async (req, res) => {
     });
     return;
   }
-  const mode = payoutMode();
-  if (req.body.mode !== mode)
-    throw new InputError("Payout mode changed. Refresh this page.");
-  ready(user, mode);
-  const field = balanceField(mode);
+  ready(user);
+  const field = "proBalanceUnits";
   let result: any;
   try {
     await mongoose.connection.transaction(
@@ -357,7 +301,7 @@ export const withdrawFunds = handler(async (req, res) => {
           email: user.email,
           purpose: "withdrawal",
           code: req.body.otp,
-          context: context(mode, units, user.withdrawalAddress!, key),
+          context: context(units, user.withdrawalAddress!, key),
           session,
         });
         if (!valid)
@@ -374,20 +318,20 @@ export const withdrawFunds = handler(async (req, res) => {
             withdrawalAddressChangedAt: user.withdrawalAddressChangedAt ?? null,
             [field]: { $gte: units },
           },
-          { $inc: { [field]: -units, proFinanceVersion: 1 } },
+          { $inc: { [field]: -units } },
           { session },
         );
         if (debited.modifiedCount !== 1)
           throw new InputError(
             "Balance or wallet changed. Refresh and request a new code.",
           );
-        const rows = await ProWithdrawal.create(
+        const rows = await Transaction.create(
           [
             {
+              type: "withdrawal", status: "QUEUED",
               userId: user._id,
               requestId: key,
               units,
-              mode,
               address: user.withdrawalAddress,
             },
           ],
@@ -402,8 +346,7 @@ export const withdrawFunds = handler(async (req, res) => {
               targetId: result._id,
               details: {
                 units,
-                mode,
-                address: user.withdrawalAddress,
+                  address: user.withdrawalAddress,
                 requestId: key,
               },
               ipAddress: req.ip,
@@ -416,20 +359,17 @@ export const withdrawFunds = handler(async (req, res) => {
     );
   } catch (error) {
     // Covers duplicate requests and an ambiguous transaction commit response.
-    const replay = await ProWithdrawal.findOne({
+    const replay = await Transaction.findOne({ type: "withdrawal",
       userId: user._id,
       requestId: key,
     }).lean();
-    if (!replay || replay.units !== units || replay.mode !== mode) throw error;
+    if (!replay || replay.units !== units) throw error;
     result = replay;
   }
   res.status(202).json({
     success: true,
     withdrawal: publicWithdrawal(result),
-    message:
-      mode === "demo"
-        ? "Demo withdrawal queued. No funds will be transferred."
-        : "Withdrawal queued for TRON confirmation.",
+    message: "Withdrawal queued for TRON confirmation.",
   });
 });
 
@@ -458,14 +398,6 @@ export const getEarnings = handler(async (req, res) => {
           { $skip: (current - 1) * limit },
           { $limit: limit },
           {
-            $lookup: {
-              from: ProEarning.collection.name,
-              localField: "_id",
-              foreignField: "tradeId",
-              as: "credit",
-            },
-          },
-          {
             $project: {
               _id: 1,
               tradeId: 1,
@@ -477,9 +409,6 @@ export const getEarnings = handler(async (req, res) => {
               proTraderShare: 1,
               feeStatus: 1,
               proTraderCreditStatus: 1,
-              mode: {
-                $ifNull: [{ $arrayElemAt: ["$credit.mode", 0] }, "unallocated"],
-              },
               sourceTradeId: 1,
             },
           },
@@ -499,13 +428,12 @@ export const getWithdrawals = handler(async (req, res) => {
   await account(req);
   const current = page(req),
     limit = 20;
-  const [result] = await ProWithdrawal.aggregate([
+  const [result] = await Transaction.aggregate([{ $match: { type: "withdrawal" } },
     { $match: { userId: req.user } },
     {
       $project: {
         _id: 1,
         units: 1,
-        mode: 1,
         address: 1,
         status: 1,
         transactionId: 1,
@@ -523,7 +451,6 @@ export const getWithdrawals = handler(async (req, res) => {
             $project: {
               _id: 1,
               amount: { $toString: "$details.amount" },
-              mode: { $literal: "live" },
               address: "$details.destinationAddress",
               transactionId: "$details.transactionId",
               status: { $literal: "LEGACY_SUBMITTED" },
@@ -554,7 +481,7 @@ export const getWithdrawalRequest = handler(async (req, res) => {
   const key = req.params.requestId;
   if (typeof key !== "string" || !/^[a-zA-Z0-9_-]{16,80}$/.test(key))
     throw new InputError("Invalid request ID.");
-  const row = await ProWithdrawal.findOne({
+  const row = await Transaction.findOne({ type: "withdrawal",
     userId: req.user,
     requestId: key,
   }).lean();
