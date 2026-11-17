@@ -1,6 +1,7 @@
 import { Transaction } from "../models/transactionModel.js";
 import { creditProEarning } from "./proFinanceService.js";
-import { profitSplit } from "../helpers/usdt.js";
+import User from "../models/userModel.js";
+import { profitSplit, usdtUnits, formatUsdt } from "../helpers/usdt.js";
 import mongoose from "mongoose";
 import { Trade } from "../models/tradeModel.js";
 import {
@@ -72,28 +73,37 @@ export async function processTradeClose(
   const proTraderShare = Number(split.proTraderShare);
   const feeStatus = feeApplies ? "pending" : "waived";
 
-  const closed = await Trade.findOneAndUpdate(
-    { _id: tradeId, status: { $ne: "closed" } },
-    {
-      $set: {
-        status: "closed",
-        exitPrice,
-        closedVia,
-        closedAt: new Date(),
-        realizedPnl: pnl.toFixed(6),
-        platformFee: platformFee.toFixed(6),
-        platformShare: platformShare.toFixed(6),
-        proTraderShare: proTraderShare.toFixed(6),
-        feeStatus,
-        proTraderCreditStatus: feeApplies ? "pending" : "waived",
-        tradeResult,
-        wsMonitoringActive: false,
-        monitoringStatus: "disconnected",
-        monitoringError: null,
+  const closed = await mongoose.connection.transaction(async session => {
+    const result = await Trade.findOneAndUpdate(
+      { _id: tradeId, status: { $ne: "closed" } },
+      {
+        $set: {
+          status: "closed",
+          exitPrice,
+          closedVia,
+          closedAt: new Date(),
+          realizedPnl: pnl.toFixed(6),
+          platformFee: platformFee.toFixed(6),
+          platformShare: platformShare.toFixed(6),
+          proTraderShare: proTraderShare.toFixed(6),
+          feeStatus,
+          proTraderCreditStatus: feeApplies ? "pending" : "waived",
+          tradeResult,
+          wsMonitoringActive: false,
+          monitoringStatus: "disconnected",
+          monitoringError: null,
+        },
       },
-    },
-    { new: true },
-  ).lean();
+      { new: true, session },
+    ).lean();
+    if (result && feeApplies) {
+      const units = usdtUnits(split.platformFee);
+      const updated = await User.updateOne({ _id: result.userId, settlementOwedUnits: { $lte: Number.MAX_SAFE_INTEGER - units } },
+        { $inc: { settlementOwedUnits: units } }, { session });
+      if (updated.matchedCount !== 1) throw new Error("Settlement balance unavailable.");
+    }
+    return result;
+  });
 
   if (!closed) {
     const current = await Trade.findById(tradeId).lean();
@@ -144,49 +154,53 @@ export interface ProfitShareSummary {
 export async function getProfitShareSummary(
   userId: mongoose.Types.ObjectId,
 ): Promise<ProfitShareSummary> {
-  const [totals] = await Trade.aggregate<{ amount: number; processing: number }>([
-    {
-      $match: {
-        userId,
-        tradeOrigin: "copy",
-        tradeResult: "profit",
-        feeStatus: { $in: [...OUTSTANDING_FEE_STATUSES] },
-      },
-    },
-    {
-      $group: {
-        _id: null,
-        amount: {
-          $sum: {
-            $convert: { input: "$platformFee", to: "double", onError: 0, onNull: 0 },
-          },
-        },
-        processing: {
-          $sum: { $cond: [{ $eq: ["$feeStatus", "processing"] }, 1, 0] },
-        },
-      },
-    },
+  const [user, processing] = await Promise.all([
+    User.findById(userId).select("settlementOwedUnits").lean(),
+    Trade.exists({ userId, tradeOrigin: "copy", feeStatus: "processing" }),
   ]);
-  const amount = totals?.amount ?? 0;
+  if (!user || !Number.isSafeInteger(user.settlementOwedUnits) || user.settlementOwedUnits < 0) {
+    throw new Error("Settlement balance unavailable.");
+  }
+  const required = user.settlementOwedUnits >= PROFIT_SHARE_WITHDRAWAL_THRESHOLD * 1_000_000;
   return {
-    pendingAmount: amount.toFixed(6),
+    pendingAmount: formatUsdt(user.settlementOwedUnits),
     threshold: PROFIT_SHARE_WITHDRAWAL_THRESHOLD.toFixed(2),
-    withdrawalRequired: amount + 1e-9 >= PROFIT_SHARE_WITHDRAWAL_THRESHOLD,
-    settlementRequired: amount + 1e-9 >= PROFIT_SHARE_WITHDRAWAL_THRESHOLD,
-    processing: (totals?.processing ?? 0) > 0,
+    withdrawalRequired: required,
+    settlementRequired: required,
+    processing: Boolean(processing),
   };
 }
 
 export async function resumePendingProfitCredits(): Promise<void> {
   const completed = await Transaction.find({ type: "settlement", status: "COMPLETED" }).lean();
   for (const settlement of completed) {
-    await Trade.updateMany({ settlementBatchId: String(settlement._id), feeStatus: "processing" }, { $set: {
-      feeStatus: "collected", settlementTransactionId: settlement.transactionId,
-      settlementBlockchainTransactionId: settlement.transactionId,
-      settlementNetwork: "TRON", settlementAddress: settlement.address,
-      settlementCompletedAt: settlement.completedAt, settlementError: null,
-    } });
+    await mongoose.connection.transaction(async session => {
+      const pending = await Trade.find({ userId: settlement.userId, settlementBatchId: String(settlement._id), feeStatus: "processing" }).select("platformFee").session(session).lean();
+      if (!pending.length) return;
+      const units = pending.reduce((sum, trade) => sum + usdtUnits(trade.platformFee || "0"), 0);
+      await Trade.updateMany({ userId: settlement.userId, settlementBatchId: String(settlement._id), feeStatus: "processing" }, { $set: {
+        feeStatus: "collected", settlementTransactionId: settlement.transactionId,
+        settlementBlockchainTransactionId: settlement.transactionId,
+        settlementNetwork: "TRON", settlementAddress: settlement.address,
+        settlementCompletedAt: settlement.completedAt, settlementError: null,
+      } }, { session });
+      const updated = await User.updateOne({ _id: settlement.userId, settlementOwedUnits: { $gte: units } }, { $inc: { settlementOwedUnits: -units } }, { session });
+      if (updated.matchedCount !== 1) throw new Error("Settlement balance unavailable during recovery.");
+    });
   }
   const trades = await Trade.find({ tradeOrigin: "copy", feeStatus: "collected", proTraderCreditStatus: "pending" }).select("_id").limit(100).lean();
   for (const trade of trades) await creditProEarning(trade._id).catch(() => console.error("[Settlement] Pro credit requires retry", String(trade._id)));
+}
+
+
+/** Backfill once per existing user before workers and requests start. */
+export async function backfillSettlementBalances(): Promise<void> {
+  for await (const user of User.find({ settlementOwedUnits: { $exists: false } }).select("_id").lean().cursor()) {
+    await mongoose.connection.transaction(async session => {
+      const trades = await Trade.find({ userId: user._id, tradeOrigin: "copy", tradeResult: "profit", feeStatus: { $in: [...OUTSTANDING_FEE_STATUSES] } }).select("platformFee").session(session).lean();
+      const units = trades.reduce((sum, trade) => sum + usdtUnits(trade.platformFee || "0"), 0);
+      if (!Number.isSafeInteger(units)) throw new Error("Settlement balance exceeds supported precision.");
+      await User.updateOne({ _id: user._id, settlementOwedUnits: { $exists: false } }, { $set: { settlementOwedUnits: units } }, { session });
+    });
+  }
 }

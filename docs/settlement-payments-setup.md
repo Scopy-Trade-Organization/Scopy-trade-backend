@@ -15,6 +15,12 @@ All financial records use **one schema and one model** in
 `src/models/transactionModel.ts`. The `type` is `earning`, `withdrawal`, or
 `settlement`. Amounts are stored once as integer USDT micro-units (`units`);
 1 USDT is 1,000,000 units. There are no discriminators or demo finance modes.
+The user model stores the total unpaid amount in `settlementOwedUnits` (the same
+micro-unit format). Trade close adds fees and confirmed payment subtracts the
+invoice amount, each in the same database transaction as the related records.
+Summary requests read this stored balance directly. Existing users are backfilled
+once at startup before workers and requests start.
+
 The transaction ID is also the invoice ID. `address` holds the receiving wallet,
 and `transactionId` holds the blockchain hash.
 

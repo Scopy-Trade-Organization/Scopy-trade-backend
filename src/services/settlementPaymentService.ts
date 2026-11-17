@@ -119,6 +119,8 @@ export async function verifySettlement(userId: mongoose.Types.ObjectId, id: stri
       $set: { status: "COMPLETED", transactionId: hash, senderAddress, completedAt: new Date(), lastError: null },
     }, { session, new: true });
     if (!paid) return;
+    const updated = await User.updateOne({ _id: userId, settlementOwedUnits: { $gte: paid.units } }, { $inc: { settlementOwedUnits: -paid.units } }, { session });
+    if (updated.matchedCount !== 1) throw new Error("Settlement balance unavailable.");
     await Trade.updateMany({ _id: { $in: paid.tradeIds }, settlementBatchId: String(paid._id), feeStatus: "processing" }, {
       $set: { feeStatus: "collected", settlementTransactionId: hash, settlementBlockchainTransactionId: hash, settlementNetwork: "TRON", settlementAddress: paid.address, settlementCompletedAt: paid.completedAt },
     }, { session });

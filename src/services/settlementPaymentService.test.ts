@@ -9,6 +9,7 @@ import { Transaction } from "../models/transactionModel.js";
 import { Notification } from "../models/notificationModel.js";
 import { Trade } from "../models/tradeModel.js";
 import User from "../models/userModel.js";
+import { processTradeClose, getProfitShareSummary, backfillSettlementBalances, resumePendingProfitCredits } from "./profitSharingService.js";
 import { migrateFinancialRecords } from "./financialMigrationService.js";
 
 const wallet = TronWeb.address.fromPrivateKey("1".padStart(64, "0")) as string;
@@ -65,7 +66,7 @@ after(async () => { await mongoose.disconnect(); await replica?.stop(); });
 test("invoice creation, notification, chain completion and earnings are idempotent", async () => {
   const copierId = new mongoose.Types.ObjectId(), proId = new mongoose.Types.ObjectId();
   const sourceId = new mongoose.Types.ObjectId(), tradeId = new mongoose.Types.ObjectId();
-  await User.collection.insertMany([{ _id: copierId, email: "copier@example.com", traderID: "copy-test", role: "CopyTrader" }, { _id: proId, email: "pro@example.com", traderID: "pro-test", proBalanceUnits: 0 }]);
+  await User.collection.insertMany([{ _id: copierId, email: "copier@example.com", traderID: "copy-test", role: "CopyTrader", settlementOwedUnits: 12_000_000 }, { _id: proId, email: "pro@example.com", traderID: "pro-test", proBalanceUnits: 0 }]);
   await Trade.collection.insertMany([{ _id: sourceId, tradeOrigin: "pro", userId: proId, signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() }, {
     _id: tradeId, userId: copierId, sourceTradeId: sourceId, signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId(), tradeOrigin: "copy", tradeResult: "profit", status: "closed",
     platformFee: "12.000000", proTraderShare: "6.000000", feeStatus: "pending", proTraderCreditStatus: "pending",
@@ -75,12 +76,16 @@ test("invoice creation, notification, chain completion and earnings are idempote
   assert.equal(String(invoice._id), String(invoices[1]!._id));
   assert.equal(await Notification.countDocuments({ userId: copierId, kind: "settlement_due" }), 1);
   assert.equal((await Trade.findById(tradeId).lean())?.feeStatus, "processing");
+  // Fees accruing after invoice creation must remain owed after this invoice is paid.
+  await User.updateOne({ _id: copierId }, { $inc: { settlementOwedUnits: 2_000_000 } });
   const { tx, info } = receipt(invoice);
   const factory = (() => ({ post: async (path: string) => ({ data: path.endsWith("gettransactionbyid") ? tx : info }) })) as any;
   await verifySettlement(copierId, String(invoice._id), hash, undefined, factory);
   await verifySettlement(copierId, String(invoice._id), hash, undefined, factory);
   assert.equal((await Transaction.findOne({ type: "settlement", _id: invoice._id }).lean())?.status, "COMPLETED");
   assert.equal((await Trade.findById(tradeId).lean())?.feeStatus, "collected");
+  assert.equal((await User.findById(copierId).lean())?.settlementOwedUnits, 2_000_000);
+  assert.equal((await getProfitShareSummary(copierId)).pendingAmount, "2.000000");
   assert.equal((await User.findById(proId).lean())?.proBalanceUnits, 6_000_000);
   assert.equal(await Transaction.countDocuments({ type: "earning", tradeId }), 1);
   assert.equal(await Transaction.countDocuments({ userId: proId, type: "earning" }), 1);
@@ -93,9 +98,11 @@ test("invoice creation, notification, chain completion and earnings are idempote
 test("threshold and fixed invoice protect later trade fees from being marked paid", async () => {
   const userId = new mongoose.Types.ObjectId();
   const id = new mongoose.Types.ObjectId();
+  await User.collection.insertOne({ _id: userId, email: "threshold@example.com", traderID: "threshold-test", settlementOwedUnits: 9_999_999 });
   await Trade.collection.insertOne({ _id: id, userId, signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId(), tradeOrigin: "copy", tradeResult: "profit", platformFee: "9.999999", feeStatus: "pending" });
   assert.equal(await ensureSettlement(userId), null);
   await Trade.collection.updateOne({ _id: id }, { $set: { platformFee: "10.000000" } });
+  await User.updateOne({ _id: userId }, { $inc: { settlementOwedUnits: 1 } });
   const invoice = await ensureSettlement(userId);
   assert.equal(invoice?.units, 10_000_000);
   await Trade.collection.insertOne({ userId, signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId(), tradeOrigin: "copy", tradeResult: "profit", platformFee: "2.000000", feeStatus: "pending" });
@@ -136,4 +143,45 @@ test("failed withdrawals refund the actual balance only once", async () => {
   await finishWithdrawal(withdrawal._id, "FAILED", "QUEUED");
   assert.equal((await User.findById(userId).lean())?.proBalanceUnits, 8_000_000);
   assert.equal((await Transaction.findById(withdrawal._id).lean())?.status, "FAILED");
+});
+
+
+test("trade close accrues settlement debt exactly once under concurrent requests", async () => {
+  const userId = new mongoose.Types.ObjectId(), id = new mongoose.Types.ObjectId();
+  await User.collection.insertOne({ _id: userId, email: "close@example.com", traderID: "close-test", settlementOwedUnits: 0 });
+  await Trade.collection.insertOne({ _id: id, userId, pair: "BTCUSDT", direction: "buy", quantity: "1", entryPrice: "100", status: "filled", tradeOrigin: "copy", signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
+  await Promise.all([processTradeClose(String(id), "120", "tp"), processTradeClose(String(id), "120", "tp")]);
+  await processTradeClose(String(id), "120", "tp");
+  assert.equal((await User.findById(userId).lean())?.settlementOwedUnits, 4_000_000);
+  assert.equal((await getProfitShareSummary(userId)).pendingAmount, "4.000000");
+  assert.equal((await Trade.findById(id).lean())?.status, "closed");
+});
+
+test("a missing balance rolls back the trade close instead of losing the debt", async () => {
+  const userId = new mongoose.Types.ObjectId(), id = new mongoose.Types.ObjectId();
+  await Trade.collection.insertOne({ _id: id, userId, pair: "BTCUSDT", direction: "buy", quantity: "1", entryPrice: "100", status: "filled", tradeOrigin: "copy", signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
+  await assert.rejects(processTradeClose(String(id), "120", "tp"), /balance unavailable/);
+  assert.equal((await Trade.findById(id).lean())?.status, "filled");
+});
+
+test("backfill totals unpaid fees once and preserves an existing stored balance", async () => {
+  const userId = new mongoose.Types.ObjectId();
+  await User.collection.insertOne({ _id: userId, email: "backfill@example.com", traderID: "backfill-test" });
+  for (const [feeStatus, platformFee] of [["pending", "1.000001"], ["processing", "2.000002"], ["failed", "3.000003"], ["collected", "99.000000"]]) {
+    await Trade.collection.insertOne({ userId, tradeOrigin: "copy", tradeResult: "profit", feeStatus, platformFee, signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
+  }
+  await backfillSettlementBalances();
+  assert.equal((await User.findById(userId).lean())?.settlementOwedUnits, 6_000_006);
+  await User.updateOne({ _id: userId }, { $inc: { settlementOwedUnits: 1 } });
+  await backfillSettlementBalances();
+  assert.equal((await User.findById(userId).lean())?.settlementOwedUnits, 6_000_007);
+});
+
+test("recovery of an older paid settlement deducts its debt once", async () => {
+  const userId = new mongoose.Types.ObjectId();
+  await User.collection.insertOne({ _id: userId, email: "recovery@example.com", traderID: "recovery-test", settlementOwedUnits: 13_000_000 });
+  const invoice = await Transaction.create({ userId, type: "settlement", units: 10_000_000, status: "COMPLETED", address: wallet });
+  await Trade.collection.insertOne({ userId, tradeOrigin: "copy", tradeResult: "profit", feeStatus: "processing", platformFee: "10.000000", settlementBatchId: String(invoice._id), signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
+  await resumePendingProfitCredits(); await resumePendingProfitCredits();
+  assert.equal((await User.findById(userId).lean())?.settlementOwedUnits, 3_000_000);
 });
