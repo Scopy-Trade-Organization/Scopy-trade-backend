@@ -7,13 +7,12 @@ import { Notification } from "../models/notificationModel.js";
 import User from "../models/userModel.js";
 import { usdtUnits, formatUsdt } from "../helpers/usdt.js";
 import { getProfitShareSummary } from "./profitSharingService.js";
-import { MAINNET_USDT, TRANSFER_TOPIC, creditProEarning } from "./proFinanceService.js";
+import { MAINNET_USDT, TRANSFER_TOPIC, creditProEarning, tronHost } from "./proFinanceService.js";
 import { sendEmail } from "./emailService.js";
 
 export function settlementWallet() {
   const address = process.env.SYSTEM_WALLET_ADDRESS?.trim();
   if (!address || !TronWeb.isAddress(address)) throw new Error("Configure a valid SYSTEM_WALLET_ADDRESS.");
-  if ((process.env.SYSTEM_WALLET_NETWORK || "TRON") !== "TRON") throw new Error("Settlement requires TRON.");
   return address;
 }
 
@@ -53,9 +52,7 @@ export async function ensureSettlement(userId: mongoose.Types.ObjectId) {
 }
 
 function api() {
-  const host = process.env.SETTLEMENT_TRON_HOST || "https://api.trongrid.io";
-  // Incoming settlement receipts must always be mainnet; payouts have separate configuration.
-  if (host !== "https://api.trongrid.io") throw new Error("Settlement verification requires the mainnet TronGrid endpoint.");
+  const host = tronHost();
   return axios.create({ baseURL: host, timeout: 15_000, headers: process.env.TRON_PRO_API_KEY ? { "TRON-PRO-API-KEY": process.env.TRON_PRO_API_KEY } : {} });
 }
 

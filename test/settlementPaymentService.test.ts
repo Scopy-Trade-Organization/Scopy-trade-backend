@@ -58,7 +58,6 @@ before(async () => {
   await mongoose.connect(replica.getUri());
   await Promise.all([Transaction.init(), Notification.init()]);
   process.env.SYSTEM_WALLET_ADDRESS = wallet;
-  process.env.SYSTEM_WALLET_NETWORK = "TRON";
 }, { timeout: 180_000 });
 after(async () => { await mongoose.disconnect(); await replica?.stop(); });
 

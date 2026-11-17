@@ -8,15 +8,18 @@ import { usdtUnits } from "../helpers/usdt.js";
 
 export const MAINNET_USDT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 export const TRANSFER_TOPIC = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+// Incoming verification and outgoing payouts use the same mainnet provider.
+export function tronHost(): string {
+  const host = (process.env.TRON_FULL_HOST?.trim() || "https://api.trongrid.io").replace(/\/+$/, "");
+  if (host !== "https://api.trongrid.io") throw new Error("TRON_FULL_HOST must use the mainnet TronGrid endpoint.");
+  return host;
+}
+
 export function liveClient() {
   if (process.env.PRO_PAYOUT_LIVE_ENABLED !== "true") throw new Error("Live payouts are disabled.");
   const privateKey = process.env.TRON_COMPANY_PRIVATE_KEY;
   if (!privateKey || !/^[0-9a-f]{64}$/i.test(privateKey)) throw new Error("Configure the company signing key.");
-  const host = process.env.TRON_FULL_HOST || "https://api.trongrid.io";
-  if (new URL(host).protocol !== "https:") throw new Error("TRON_FULL_HOST must use HTTPS.");
-  if (process.env.TRON_USDT_CONTRACT_ADDRESS && process.env.TRON_USDT_CONTRACT_ADDRESS !== MAINNET_USDT) {
-    throw new Error("Live payouts require the mainnet USDT contract.");
-  }
+  const host = tronHost();
   return new TronWeb({ fullHost: host, privateKey, ...(process.env.TRON_PRO_API_KEY ? { headers: { "TRON-PRO-API-KEY": process.env.TRON_PRO_API_KEY } } : {}) });
 }
 
@@ -137,8 +140,7 @@ export async function processProWithdrawal(id: mongoose.Types.ObjectId, clientFa
 
 /** Read-only reconciliation remains available while live payouts are paused. */
 export function reconciliationClient() {
-  const host = process.env.TRON_FULL_HOST || "https://api.trongrid.io";
-  if (new URL(host).protocol !== "https:") throw new Error("TRON_FULL_HOST must use HTTPS.");
+  const host = tronHost();
   return new TronWeb({ fullHost: host, ...(process.env.TRON_PRO_API_KEY ? { headers: { "TRON-PRO-API-KEY": process.env.TRON_PRO_API_KEY } } : {}) });
 }
 

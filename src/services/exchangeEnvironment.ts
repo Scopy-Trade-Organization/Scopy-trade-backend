@@ -65,17 +65,11 @@ export function shouldRebaseTestnetSignals(): boolean {
   return process.env.TESTNET_REBASE_SIGNAL_PRICES?.toLowerCase() !== "false";
 }
 
-// ─── Exchange demo/simulated modes ─────────────────────────────────────────────
-// Bitget and OKX expose their paper-trading environments through a request
-// header rather than a separate base URL, so demo selection is a header concern.
-// Both helpers fail safe: OKX defaults to simulated (a real withdrawal only
-// fires when OKX_DEMO_MODE is explicitly "false"), matching the previously
-// hard-coded behaviour while finally making live OKX operations reachable.
-
+// Both exchanges select their test environment with request headers.
 export function isBitgetDemo(): boolean {
-  return process.env.BITGET_DEMO_MODE === "true";
+  return isTestnet();
 }
 
 export function isOkxDemo(): boolean {
-  return process.env.OKX_DEMO_MODE !== "false";
+  return isTestnet();
 }

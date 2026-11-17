@@ -10,8 +10,7 @@ export interface SessionJwtPayload extends JwtPayload {
 }
 
 const issuer = "scopy-trade";
-const accessSecret = () => process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET;
-const refreshSecret = () => process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET;
+const signingSecret = () => process.env.JWT_SECRET;
 
 function signToken(id: string, sessionVersion: number, tokenType: TokenType, expiresIn: string | undefined, secret: string | undefined): string {
   if (!secret) throw new Error("JWT signing secret is not configured");
@@ -26,15 +25,15 @@ function signToken(id: string, sessionVersion: number, tokenType: TokenType, exp
 }
 
 export const signAccessToken = (id: string, principal: PrincipalType, sessionVersion: number): string => {
-  return signToken(id, sessionVersion, `${principal}_access`, process.env.JWT_EXPIRES_IN, accessSecret());
+  return signToken(id, sessionVersion, `${principal}_access`, process.env.JWT_EXPIRES_IN, signingSecret());
 };
 
 export const signRefreshToken = (id: string, principal: PrincipalType, sessionVersion: number): string => {
-  return signToken(id, sessionVersion, `${principal}_refresh`, process.env.JWT_REFRESH_EXPIRES_IN, refreshSecret());
+  return signToken(id, sessionVersion, `${principal}_refresh`, process.env.JWT_REFRESH_EXPIRES_IN, signingSecret());
 };
 
 export function verifyToken(token: string, principal: PrincipalType, refresh = false): SessionJwtPayload {
-  const secret = refresh ? refreshSecret() : accessSecret();
+  const secret = signingSecret();
   if (!secret) throw new Error("JWT verification secret is not configured");
   const expectedType: TokenType = `${principal}_${refresh ? "refresh" : "access"}`;
   const decoded = jwt.verify(token, secret, {

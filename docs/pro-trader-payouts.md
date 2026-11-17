@@ -29,7 +29,6 @@ Set these backend environment variables:
 - `PRO_PAYOUT_LIVE_ENABLED`: false until the payout wallet is configured and funded.
 - `TRON_FULL_HOST`: https://api.trongrid.io
 - `TRON_COMPANY_PRIVATE_KEY`: the company payout wallet's signing key, backend only.
-- `TRON_USDT_CONTRACT_ADDRESS`: TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 - `TRON_PRO_API_KEY`: your TronGrid key.
 
 Fund the company wallet with USDT and enough TRX for network fees before enabling

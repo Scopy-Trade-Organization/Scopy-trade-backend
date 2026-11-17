@@ -63,8 +63,7 @@ alone does not configure the application.
 
 ```dotenv
 SYSTEM_WALLET_ADDRESS=YOUR_PUBLIC_TRON_ADDRESS
-SYSTEM_WALLET_NETWORK=TRON
-SETTLEMENT_TRON_HOST=https://api.trongrid.io
+TRON_FULL_HOST=https://api.trongrid.io
 TRON_PRO_API_KEY=YOUR_TRONGRID_KEY
 SETTLEMENT_AUTO_VERIFY_ENABLED=true
 FRONTEND_URL=https://YOUR_FRONTEND_DOMAIN
@@ -78,6 +77,13 @@ GMAIL_SENDER_NAME=SCopyTrade
 ENABLE_TEMPORARY_TEST_ENDPOINTS=false
 PRO_PAYOUT_LIVE_ENABLED=false
 ```
+
+Use `TRON_FULL_HOST` for both settlement verification and pro payouts. The network
+and mainnet USDT contract are fixed in code. Exchange trading uses one
+`EXCHANGE_MODE` setting; `testnet` selects the test/simulated environment for all
+exchanges and `live` selects real accounts. `BITGET_API_URL` is the single Bitget
+REST override. Authentication uses `JWT_SECRET` for both token kinds; access and
+refresh tokens retain their separate types and expiration settings.
 
 Keep your existing MongoDB, authentication, encryption, and exchange settings.
 The email integration uses your existing Gmail OAuth credentials with the

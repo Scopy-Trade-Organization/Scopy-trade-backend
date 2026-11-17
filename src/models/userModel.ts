@@ -88,7 +88,8 @@ const userSchema = new Schema(
     withdrawalAddressChangedAt: { type: Date, default: null },
     // Unpaid copier settlement fees, in USDT micro-units.
     settlementOwedUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
-    proBalanceUnits: { type: Number, default: 0, min: 0 },
+    // Available pro-trader earnings after withdrawal reservations, in USDT micro-units.
+    proBalanceUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
     financeOtpSentAt: { type: Date, default: null },
 
   },

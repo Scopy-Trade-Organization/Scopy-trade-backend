@@ -6,9 +6,8 @@ import {
   normalizeError,
   getBybitTimestamp,
 } from "./exchangeConnectionService.js";
-import { getExchangeRestUrl } from "./exchangeEnvironment.js";
+import { getExchangeRestUrl, isBitgetDemo } from "./exchangeEnvironment.js";
 
-const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
 
 // ─── Order Types ──────────────────────────────────────────────────────────────
 
@@ -159,7 +158,7 @@ async function prepareFuturesOrder(
       {
         params: { productType: "USDT-FUTURES", symbol },
         headers: {
-          ...(process.env.BITGET_DEMO_MODE === "true"
+          ...(isBitgetDemo()
             ? { paptrading: "1" }
             : {}),
         },
@@ -481,11 +480,11 @@ async function placeBitgetOrder(
   let data: BitgetOrderResponse;
   try {
     ({ data } = await http.post<BitgetOrderResponse>(
-      BITGET_BASE_URL + path,
+      getExchangeRestUrl("bitget") + path,
       body,
       {
         headers: {
-          ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+          ...(isBitgetDemo() ? { paptrading: "1" } : {}),
           "ACCESS-KEY": apiKey,
           "ACCESS-SIGN": signature,
           "ACCESS-TIMESTAMP": timestamp,
@@ -707,10 +706,10 @@ async function getBitgetOrderStatus(
   }
 
   const { data } = await http.get<BitgetStatusResponse>(
-    BITGET_BASE_URL + path,
+    getExchangeRestUrl("bitget") + path,
     {
       headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -800,11 +799,11 @@ async function getBitgetCurrentPrice(
   const normalizedPair = normalizePairForExchange("bitget", pair);
 
   const { data } = await http.get(
-    BITGET_BASE_URL + "/api/v2/mix/market/ticker",
+    getExchangeRestUrl("bitget") + "/api/v2/mix/market/ticker",
     {
       params: { symbol: normalizedPair, productType: "USDT-FUTURES" },
       headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
       },
     },
   );
@@ -1036,11 +1035,11 @@ async function getBitgetBalance(
   }
 
   const { data } = await http.get<BitgetBalanceResponse>(
-    BITGET_BASE_URL + path,
+    getExchangeRestUrl("bitget") + path,
     {
       params: { productType: "USDT-FUTURES", marginCoin: "USDT" },
       headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -1271,9 +1270,9 @@ async function amendBitgetPendingTrade(p: AmendTradeParams): Promise<AmendTradeR
     const body = JSON.stringify(payload);
     const signature = crypto.createHmac("sha256", apiSecret)
       .update(timestamp + "POST" + path + body).digest("base64");
-    const { data } = await http.post(BITGET_BASE_URL + path, body, {
+    const { data } = await http.post(getExchangeRestUrl("bitget") + path, body, {
       headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -1459,7 +1458,7 @@ export async function closeTradeOrder(
     const { data } = await http.post(`${baseUrl}${path}`, body, {
       headers: exchange === "okx"
         ? { "OK-ACCESS-KEY": apiKey, "OK-ACCESS-SIGN": signature, "OK-ACCESS-TIMESTAMP": timestamp, "OK-ACCESS-PASSPHRASE": passphrase, "Content-Type": "application/json", "x-simulated-trading": "1" }
-        : { ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}), "ACCESS-KEY": apiKey, "ACCESS-SIGN": signature, "ACCESS-TIMESTAMP": timestamp, "ACCESS-PASSPHRASE": passphrase, "Content-Type": "application/json" },
+        : { ...(isBitgetDemo() ? { paptrading: "1" } : {}), "ACCESS-KEY": apiKey, "ACCESS-SIGN": signature, "ACCESS-TIMESTAMP": timestamp, "ACCESS-PASSPHRASE": passphrase, "Content-Type": "application/json" },
     });
     const failed = exchange === "okx" ? data.code !== "0" || data.data?.[0]?.sCode !== "0" : data.code !== "00000";
     if (failed) throw new Error(data.data?.[0]?.sMsg || data.msg || `${exchange.toUpperCase()} manual close failed.`);

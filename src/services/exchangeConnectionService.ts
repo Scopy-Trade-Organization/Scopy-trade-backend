@@ -13,7 +13,6 @@ import {
 import axiosRetry from "axios-retry";
 import { getExchangeRestUrl, isBitgetDemo, isOkxDemo } from "./exchangeEnvironment.js";
 
-const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
 
 export const http = axios.create({
   timeout: 8000,
@@ -290,7 +289,7 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
       };
     }
 
-    const { data } = await http.get<BitgetResponse>(BITGET_BASE_URL + path, {
+    const { data } = await http.get<BitgetResponse>(getExchangeRestUrl("bitget") + path, {
       headers: {
         ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
