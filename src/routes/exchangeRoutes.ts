@@ -10,8 +10,12 @@ import {
 import { userAuthenticate } from "../middleware/authenticationMiddleware.js";
 import { validateConnectBody, validateCredentialUpdateBody } from "../middleware/validateExchange.js";
 import { connectionLimiter } from "../middleware/rateLimit.js";
+import { getPublicIpHandler } from "../services/publicIpService.js";
 
 const exchangeRouter = Router();
+
+// GET  /api/exchanges/public-ip     — outbound server IP for exchange API key whitelisting
+exchangeRouter.get("/public-ip", getPublicIpHandler);
 
 // All routes require a valid JWT
 exchangeRouter.use(userAuthenticate);

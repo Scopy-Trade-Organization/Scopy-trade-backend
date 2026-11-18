@@ -21,6 +21,7 @@ import copyTraderDashboardRouter from "./routes/copyTraderDashboardRoutes.js";
 import temporaryWithdrawalRouter from "./routes/temporaryWithdrawalRoutes.js";
 import { resumePendingProfitCredits } from "./services/profitSharingService.js";
 import { backfillMissingTradeIds } from "./models/tradeModel.js";
+import { getPublicIpHandler } from "./services/publicIpService.js";
 // import "./config/passport.js";
 
 // Rate limiting configuration
@@ -83,6 +84,8 @@ app.use(
 
 app.set("trust proxy", 1);
 
+app.get("/ip", getPublicIpHandler);
+
 app.use("/api", passport.initialize());
 app.use("/api", express.json({ limit: "100kb" }));
 app.use("/api", compression());
@@ -110,4 +113,3 @@ app.use("/api/temporary", temporaryWithdrawalRouter);
 
 export { server };
 export default app;
-

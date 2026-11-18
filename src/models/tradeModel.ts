@@ -137,6 +137,7 @@ const tradeSchema = new Schema(
         "reconnecting",
         "disconnected",
         "unsupported",
+        "review_required",
       ],
       default: "disconnected",
       index: true,

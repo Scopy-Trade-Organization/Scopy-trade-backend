@@ -13,17 +13,35 @@ import {
 import axiosRetry from "axios-retry";
 import { getExchangeRestUrl, isBitgetDemo, isOkxDemo } from "./exchangeEnvironment.js";
 
-const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
-
 export const http = axios.create({
   timeout: 8000,
 });
 
+function isIdempotentMethod(method?: string): boolean {
+  if (!method) return false;
+  const m = method.toLowerCase();
+  return m === "get" || m === "head" || m === "options";
+}
+
 axiosRetry(http, {
   retries: 2,
   retryDelay: axiosRetry.exponentialDelay,
-  retryCondition: (error) =>
-    axiosRetry.isNetworkError(error) || (error.response?.status ?? 0) >= 500,
+  retryCondition: (error) => {
+    // 1. Explicit request-level override: if retries configured to 0, never retry
+    const config = error.config as any;
+    if (config?.["axios-retry"]?.retries === 0) {
+      return false;
+    }
+
+    // 2. Only safe, idempotent read requests (GET, HEAD, OPTIONS) can be retried
+    const method = error.config?.method?.toLowerCase();
+    if (!isIdempotentMethod(method)) {
+      return false;
+    }
+
+    // 3. For safe read requests: retry on network error or 5xx server error
+    return axiosRetry.isNetworkError(error) || (error.response?.status ?? 0) >= 500;
+  },
 });
 
 function normalizeError(err: unknown): Error {
@@ -290,7 +308,7 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
       };
     }
 
-    const { data } = await http.get<BitgetResponse>(BITGET_BASE_URL + path, {
+    const { data } = await http.get<BitgetResponse>(getExchangeRestUrl("bitget") + path, {
       headers: {
         ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
