@@ -8,20 +8,30 @@ positions continue being managed. The server never withdraws from the copier's
 exchange account.
 
 The user sends the exact invoice amount in mainnet TRC-20 USDT to your wallet,
-including the displayed memo. The server checks for payment automatically. The
-user can also paste the transaction hash for verification.
+including the displayed memo when supported. The server automatically checks
+payments with invoice memos. Users can also submit a transaction hash manually,
+including for payments without memos.
 
-All financial records use **one schema and one model** in
-`src/models/transactionModel.ts`. The `type` is `earning`, `withdrawal`, or
-`settlement`. Amounts are stored once as integer USDT micro-units (`units`);
+Withdrawals and settlements use `src/models/transactionModel.ts` in the
+`transactions` collection. Settlement invoices have `settlementRecordKind: invoice`.
+Permanent payment claims have
+`settlementRecordKind: payment`, reference their invoice through `invoiceId`, and
+use PROCESSING, CONFIRMED, and REJECTED states. A unique `network` /
+`transactionHash` index protects claims. Confirmed claims must never be deleted
+or expired.
+
+Pro-trader earnings have their own schema in `src/models/earningModel.ts` and
+collection `earnings`, with one unique earning per trade. Transaction `type` is
+`withdrawal` or `settlement`. Amounts use integer USDT micro-units (`units`):
 1 USDT is 1,000,000 units. There are no discriminators or demo finance modes.
 The user model stores the total unpaid amount in `settlementOwedUnits` (the same
 micro-unit format). Trade close adds fees and confirmed payment subtracts the
 invoice amount, each in the same database transaction as the related records.
 Summary requests read this stored balance directly. New users start with zero owed.
 
-The transaction ID is also the invoice ID. `address` holds the receiving wallet,
-and `transactionId` holds the blockchain hash.
+The invoice document's `_id` is its invoice ID. `address` holds the receiving
+wallet, and `transactionId` holds the confirmed blockchain hash. Payment-claim
+records store the normalized hash in `transactionHash`.
 
 ## 1. Set your receiving wallet
 
@@ -46,7 +56,7 @@ wallet private key and cannot sign payments.
 5. Copy that key into your backend environment as `TRON_PRO_API_KEY`.
 6. Check the console's current request quota. If you restrict allowed APIs,
    permit TRC-20 account history and the `/walletsolidity/` transaction and
-   receipt endpoints.
+   receipt endpoints. See [TRON confirmation semantics](https://developers.tron.network/docs/confirmation-semantics).
 7. Restart the backend after saving your environment settings.
 
 Production requests need a working API key. Anonymous access can be limited or
@@ -102,15 +112,21 @@ USDT and TRX. There are no simulated payouts or demo-credit endpoints.
 3. Run `npm run build` in the backend and deploy the matching frontend changes.
 4. Start the backend with `npm start`.
 
-The server creates the transaction and notification indexes before accepting
+The server creates transaction, earning, and notification indexes before accepting
 requests. The database account needs permission to create those indexes.
 
 ## 5. Paying an invoice
 
 The copier dashboard displays the amount, receiving wallet, and unique memo.
 Users should send the **exact** amount on TRON and attach that memo as actual
-transaction metadata. A note saved only inside a wallet app is not a blockchain
+transaction metadata when their wallet supports it. A note saved only inside a wallet app is not a blockchain
 memo. Keep enough TRX in the sending wallet for network fees.
+
+Settlement users pay all network, gas, and exchange withdrawal fees separately.
+The full invoice amount must arrive at the company wallet. If an exchange
+deducts its transfer fee from the amount sent, increase the exchange withdrawal
+so that the receiving amount still exactly matches the invoice. Network fees
+do not reduce the settlement debt or earn payment credit.
 
 The backend worker checks every minute when automatic verification is enabled.
 The dashboard refreshes payment state every 30 seconds and the notification bell
@@ -118,16 +134,23 @@ every minute. There are no push notifications or notification WebSockets.
 
 If automatic detection misses the payment, paste its 64-character transaction
 hash into **Verify payment**. Verification checks confirmed execution, the USDT
-contract, recipient, exact amount, invoice creation time, and memo. A transfer
+contract, recipient, exact amount, invoice creation time, and any existing memo. A transfer
 cannot be used twice.
 
-If a wallet omitted the memo, the payer must sign the displayed invoice message
-with the sending wallet and paste the signature. A connected TronLink wallet can
-use `tronWeb.trx.signMessageV2(message)`. This proves payment ownership without
-sharing a private key. If an exchange-hosted wallet cannot sign messages, contact
-support. A public transaction hash alone does not prove who owns a memo-less
-payment. Wrong memos, partial payments, overpayments, and wrong-network payments
-also require support review.
+If a wallet or exchange omitted the memo, submit the hash directly. No wallet
+signature or routine admin approval is required. The first account that claims
+the hash and passes verification receives credit. A public memo-less transaction
+cannot establish which Scopy Trade user initiated it. An existing nonempty memo
+must match the invoice. Wrong memos, partial payments, overpayments, and
+wrong-network payments are rejected; exact amounts remain required.
+
+Claims are created atomically before blockchain verification. Concurrent claims
+are protected by the unique database index. Failures leave REJECTED records and
+can be retried; PROCESSING leases expire after two minutes to recover interrupted
+requests. Claim tokens prevent an older request from confirming after takeover.
+CONFIRMED records remain permanently unavailable to other invoices. Repeating a
+successful submission for the same invoice is idempotent. Previously confirmed
+invoice hashes remain protected by the existing transaction index and lookup.
 
 The invoice stays fixed if more trades close. Those later fees may produce a
 second invoice if they reach 10 USDT. Confirmed payment credits each pro earning
@@ -149,7 +172,7 @@ Main endpoints:
 
 - `GET /api/copy-trader/dashboard/profit-share`: totals and current invoice.
 - `POST /api/copy-trader/dashboard/profit-share/verify`: accepts `settlementId`,
-  `transactionHash`, and optionally a wallet `signature`.
+  `transactionHash`.
 - `GET /api/copy-trader/dashboard/notifications`: notices and unread count.
 - `PATCH /api/copy-trader/dashboard/notifications/:id/read`: mark a notice read.
 - `GET /api/admin/dashboard/settlements`: settlement inspection.
@@ -159,5 +182,19 @@ settlement approval route only returns the invoice; it cannot withdraw money.
 The old `/api/temporary/withdraw-usdt` route returns HTTP 410.
 
 The automatic scanner checks up to 20 invoices per run and five pages of 200
-transfers per invoice. Use hash verification if older transfers fall outside that
-scan window. Monitor the TronGrid quota and worker logs as volume grows.
+transfers per invoice, persisting each fully processed page's fingerprint and
+fixed timestamp window on the invoice. Subsequent runs and restarts resume that
+window instead of starting over. A failed page is replayed. A rejected expired
+provider cursor restarts only the same window; payment claims prevent duplicate
+credit. Invoice scan leases coordinate backend instances.
+
+Once a window is drained, the scanner advances with a one-minute overlap and a
+two-minute indexing delay allowance. Longer TronGrid indexing delays or repeated
+provider cursor expiry can still delay or miss automatic discovery; manual hash
+verification remains available for every valid payment. Memo-less transfers are
+never automatically assigned. Monitor provider quotas and worker logs.
+
+Deployment must stop older backend instances before starting the corrected
+version. Index creation deliberately fails if existing data assigns one trade
+fee to multiple invoices; reconcile those historical inconsistencies before
+restarting. Do not remove unique indexes to bypass an initialization failure.

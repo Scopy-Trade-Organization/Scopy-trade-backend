@@ -90,6 +90,7 @@ const userSchema = new Schema(
     settlementOwedUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
     // Available pro-trader earnings after withdrawal reservations, in USDT micro-units.
     proBalanceUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
+    proNetworkFeeOwedUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
     financeOtpSentAt: { type: Date, default: null },
 
   },

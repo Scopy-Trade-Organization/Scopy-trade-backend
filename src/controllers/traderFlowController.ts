@@ -1,3 +1,4 @@
+import { adjustProBalance } from "../services/proBalanceService.js";
 import { Request, Response } from "express";
 import mongoose from "mongoose";
 import User from "../models/userModel.js";
@@ -99,13 +100,11 @@ export const listRankAwards = handler(async (req, res) => {
 export const verifyRankAward = handler(async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid award ID." });
   if (req.body.platformEarningsVerified !== true) return res.status(422).json({ success: false, message: "Platform earnings verification is required before crediting a rank bonus." });
-  const field = "proBalanceUnits";
   await mongoose.connection.transaction(async session => {
     const award = await RankAward.findOneAndUpdate({ _id: req.params.id, status: "pending" }, { $set: { status: "credited", verifiedBy: req.admin, verifiedAt: new Date() } }, { session, new: true });
     if (!award) return;
     const units = Math.round(award.bonus * 1_000_000);
-    const result = await User.updateOne({ _id: award.userId, role: "ProTrader", [field]: { $lte: Number.MAX_SAFE_INTEGER - units } }, { $inc: { [field]: units } }, { session });
-    if (result.matchedCount !== 1) throw new Error("Bonus balance is unavailable.");
+    await adjustProBalance(award.userId, units, 0, session, true);
     await AuditLog.create([{ userId: award.userId, action: "Rank Bonus Credited", targetId: award._id, details: { level: award.level, bonus: award.bonus, verifiedBy: req.admin } }], { session });
   });
   return res.json({ success: true, message: "Rank bonus verified and credited, or previously credited." });

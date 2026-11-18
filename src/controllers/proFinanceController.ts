@@ -1,3 +1,5 @@
+import { quoteWithdrawalFee } from "../services/withdrawalFeeService.js";
+import { Earning } from "../models/earningModel.js";
 import { Transaction } from "../models/transactionModel.js";
 import type { Request, Response } from "express";
 import mongoose from "mongoose";
@@ -86,13 +88,16 @@ function wallet(value: unknown): string {
   return value;
 }
 
-function context(units: number, address: string, key: string) {
-  return JSON.stringify(["pro-withdrawal", units, address, key]);
+export function withdrawalOtpContext(units: number, address: string, key: string, quote: any) {
+  return JSON.stringify(["pro-withdrawal", units, address, key, quote.payoutUnits,
+    quote.networkFeeReserveUnits, quote.feeLimitSun, quote.bandwidthSunPerByte,
+    quote.trxPriceUnits, new Date(quote.quoteExpiresAt).toISOString()]);
 }
 
 function ready(user: Awaited<ReturnType<typeof account>>) {
   wallet(user.withdrawalAddress);
   liveClient();
+  if (user.proNetworkFeeOwedUnits > 0) throw new InputError("Outstanding network fees must be covered before withdrawing.");
   if (!user.withdrawalAddressChangedAt || Date.now() - user.withdrawalAddressChangedAt.getTime() < 24 * 60 * 60_000) {
     throw new InputError("Withdrawals unlock 24 hours after verifying your wallet.");
   }
@@ -110,6 +115,12 @@ export function publicWithdrawal(row: any) {
     _id: row._id,
     requestId: row.requestId,
     amount: formatUsdt(row.units),
+    payoutAmount: formatUsdt(row.payoutUnits ?? row.units),
+    networkFeeReserve: formatUsdt(row.networkFeeReserveUnits ?? 0),
+    networkFee: row.networkFeeUnits === undefined ? null : formatUsdt(row.networkFeeUnits),
+    refundedAmount: row.refundUnits === undefined ? null : formatUsdt(row.refundUnits),
+    additionalNetworkFee: formatUsdt(row.feeOverrunUnits ?? 0),
+    quoteExpiresAt: row.quoteExpiresAt ?? null,
     address: row.address,
     status: row.status,
     transactionId: row.transactionId,
@@ -119,7 +130,7 @@ export function publicWithdrawal(row: any) {
     lastError: row.status === "REVIEW"
       ? "Your withdrawal is under review because the blockchain result could not yet be confirmed. Funds remain reserved."
       : row.status === "FAILED"
-        ? "Your withdrawal failed. The withdrawal amount has been returned to your available balance."
+        ? "Transfer failed or was cancelled. Unsent funds were refunded after any consumed network fee."
         : null,
   };
 }
@@ -127,8 +138,7 @@ export function publicWithdrawal(row: any) {
 export const getFinanceSummary = handler(async (req, res) => {
   const user = await account(req);
   const [earned, reserved, bonuses] = await Promise.all([
-    Transaction.aggregate([{ $match: { type: "earning" } },
-      { $match: { userId: req.user, status: "COMPLETED" } },
+    Earning.aggregate([{ $match: { userId: req.user, status: "COMPLETED" } },
       { $group: { _id: null, units: { $sum: "$units" } } },
     ]),
     Transaction.aggregate([{ $match: { type: "withdrawal" } },
@@ -149,6 +159,7 @@ export const getFinanceSummary = handler(async (req, res) => {
     success: true,
     accountId: String(user._id),
     available: formatUsdt(user.proBalanceUnits || 0),
+    networkFeeOwed: formatUsdt(user.proNetworkFeeOwedUnits || 0),
     earned: formatUsdt((earned[0]?.units || 0) + Math.round((bonuses[0]?.amount || 0) * 1_000_000)),
     reserved: formatUsdt(reserved[0]?.units || 0),
     withdrawalAddress: user.withdrawalAddress || null,
@@ -250,12 +261,23 @@ export const requestWithdrawalOtp = handler(async (req, res) => {
   ready(user);
   if ((user.proBalanceUnits || 0) < units)
     throw new InputError("Insufficient available balance.");
+  let quote = await Transaction.findOne({ type: "withdrawal", userId: user._id, requestId: key }).lean();
+  if (quote && quote.units !== units) throw new InputError("Request ID already used for a different withdrawal.");
+  if (quote && quote.status !== "QUOTED") throw new InputError("This withdrawal was already submitted. Refresh its status.");
+  if (!quote || quote.address !== user.withdrawalAddress || !quote.quoteExpiresAt || quote.quoteExpiresAt.getTime() <= Date.now()) {
+    let feeQuote;
+    try { feeQuote = await quoteWithdrawalFee(units, user.withdrawalAddress!); }
+    catch (error) { throw new InputError(error instanceof Error && error.message === "Withdrawal amount must exceed its network fee reserve." ? error.message : "Network fees cannot be quoted right now. Please try again later."); }
+    quote = await Transaction.findOneAndUpdate({ type: "withdrawal", userId: user._id, requestId: key, status: "QUOTED" },
+      { $set: { units, address: user.withdrawalAddress, ...feeQuote } }, { upsert: true, new: true, runValidators: true }).lean();
+  }
+  if (!quote) throw new Error("Withdrawal quote unavailable.");
   await throttleOtp(user._id);
   const code = await issueOtp({
     email: user.email,
     purpose: "withdrawal",
     userId: user._id,
-    context: context(units, user.withdrawalAddress!, key),
+    context: withdrawalOtpContext(units, user.withdrawalAddress!, key, quote),
   });
   await sendOtpEmail(
     user.email,
@@ -265,9 +287,12 @@ export const requestWithdrawalOtp = handler(async (req, res) => {
     "Withdrawal: " +
       formatUsdt(units) +
       " USDT to " +
-      user.withdrawalAddress,
+      user.withdrawalAddress + ". Total debit: " + formatUsdt(units) +
+      " USDT; network fee reserve: " + formatUsdt(quote.networkFeeReserveUnits!) +
+      " USDT; wallet receives: " + formatUsdt(quote.payoutUnits!) +
+      " USDT. Unused reserve is returned to your balance after confirmation. Failed transfers may still consume network fees.",
   );
-  res.json({ success: true, message: "Withdrawal verification code sent." });
+  res.json({ success: true, message: "Withdrawal verification code sent.", quote: publicWithdrawal(quote) });
 });
 
 export const withdrawFunds = handler(async (req, res) => {
@@ -278,11 +303,8 @@ export const withdrawFunds = handler(async (req, res) => {
     userId: user._id,
     requestId: key,
   }).lean();
-  if (existing) {
-    if (existing.units !== units)
-      throw new InputError(
-        "Request ID already used for a different withdrawal.",
-      );
+  if (existing && existing.units !== units) throw new InputError("Request ID already used for a different withdrawal.");
+  if (existing && existing.status !== "QUOTED") {
     res.json({
       success: true,
       withdrawal: publicWithdrawal(existing),
@@ -296,11 +318,14 @@ export const withdrawFunds = handler(async (req, res) => {
   try {
     await mongoose.connection.transaction(
       async (session) => {
+        const quote = await Transaction.findOne({ type: "withdrawal", userId: user._id, requestId: key, status: "QUOTED",
+          units, address: user.withdrawalAddress, quoteExpiresAt: { $gt: new Date() } }).session(session).lean();
+        if (!quote?.payoutUnits || quote.networkFeeReserveUnits === undefined) throw new InputError("Request a new network fee quote and verification code.");
         const valid = await consumeOtp({
           email: user.email,
           purpose: "withdrawal",
           code: req.body.otp,
-          context: context(units, user.withdrawalAddress!, key),
+          context: withdrawalOtpContext(units, user.withdrawalAddress!, key, quote),
           session,
         });
         if (!valid)
@@ -316,6 +341,7 @@ export const withdrawFunds = handler(async (req, res) => {
             withdrawalAddress: user.withdrawalAddress,
             withdrawalAddressChangedAt: user.withdrawalAddressChangedAt ?? null,
             [field]: { $gte: units },
+            $or: [{ proNetworkFeeOwedUnits: { $lte: 0 } }, { proNetworkFeeOwedUnits: { $exists: false } }],
           },
           { $inc: { [field]: -units } },
           { session },
@@ -324,19 +350,9 @@ export const withdrawFunds = handler(async (req, res) => {
           throw new InputError(
             "Balance or wallet changed. Refresh and request a new code.",
           );
-        const rows = await Transaction.create(
-          [
-            {
-              type: "withdrawal", status: "QUEUED",
-              userId: user._id,
-              requestId: key,
-              units,
-              address: user.withdrawalAddress,
-            },
-          ],
-          { session },
-        );
-        result = rows[0];
+        result = await Transaction.findOneAndUpdate({ _id: quote._id, status: "QUOTED" },
+          { $set: { status: "QUEUED" } }, { new: true, session });
+        if (!result) throw new InputError("Withdrawal quote changed. Refresh and try again.");
         await AuditLog.create(
           [
             {
@@ -362,7 +378,7 @@ export const withdrawFunds = handler(async (req, res) => {
       userId: user._id,
       requestId: key,
     }).lean();
-    if (!replay || replay.units !== units) throw error;
+    if (!replay || replay.status === "QUOTED" || replay.units !== units) throw error;
     result = replay;
   }
   res.status(202).json({
@@ -389,6 +405,15 @@ export const getEarnings = handler(async (req, res) => {
       },
     },
     { $match: { "source.userId": req.user, "source.tradeOrigin": "pro" } },
+    {
+      $lookup: {
+        from: Earning.collection.name,
+        localField: "_id",
+        foreignField: "tradeId",
+        pipeline: [{ $match: { userId: req.user, status: "COMPLETED" } }],
+        as: "earning",
+      },
+    },
     { $sort: { closedAt: -1, _id: -1 } },
     {
       $facet: {
@@ -409,6 +434,7 @@ export const getEarnings = handler(async (req, res) => {
               feeStatus: 1,
               proTraderCreditStatus: 1,
               sourceTradeId: 1,
+              earning: { $arrayElemAt: ["$earning", 0] },
             },
           },
         ],
@@ -427,7 +453,7 @@ export const getWithdrawals = handler(async (req, res) => {
   await account(req);
   const current = page(req),
     limit = 20;
-  const [result] = await Transaction.aggregate([{ $match: { type: "withdrawal" } },
+  const [result] = await Transaction.aggregate([{ $match: { type: "withdrawal", status: { $ne: "QUOTED" } } },
     { $match: { userId: req.user } },
     {
       $project: {
@@ -439,6 +465,8 @@ export const getWithdrawals = handler(async (req, res) => {
         createdAt: 1,
         completedAt: 1,
         requestId: 1,
+        payoutUnits: 1, networkFeeReserveUnits: 1, networkFeeUnits: 1,
+        refundUnits: 1, feeOverrunUnits: 1, quoteExpiresAt: 1,
       },
     },
     { $sort: { createdAt: -1, _id: -1 } },
@@ -464,7 +492,7 @@ export const getWithdrawalRequest = handler(async (req, res) => {
     throw new InputError("Invalid request ID.");
   const row = await Transaction.findOne({ type: "withdrawal",
     userId: req.user,
-    requestId: key,
+    requestId: key, status: { $ne: "QUOTED" },
   }).lean();
   res.json({ success: true, withdrawal: row ? publicWithdrawal(row) : null });
 });

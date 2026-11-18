@@ -162,8 +162,8 @@ export async function getProfitShareSummary(
   return {
     pendingAmount: formatUsdt(user.settlementOwedUnits),
     threshold: PROFIT_SHARE_WITHDRAWAL_THRESHOLD.toFixed(2),
-    withdrawalRequired: required,
-    settlementRequired: required,
+    withdrawalRequired: required || Boolean(processing),
+    settlementRequired: required || Boolean(processing),
     processing: Boolean(processing),
   };
 }

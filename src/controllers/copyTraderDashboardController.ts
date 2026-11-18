@@ -115,12 +115,11 @@ export async function approveProfitShare(req: Request, res: Response) {
 
 export async function verifyProfitShare(req: Request, res: Response) {
   try {
-    const { settlementId, transactionHash, signature } = req.body;
-    if (typeof settlementId !== "string" || typeof transactionHash !== "string" ||
-        (signature !== undefined && (typeof signature !== "string" || signature.length > 200))) {
+    const { settlementId, transactionHash } = req.body;
+    if (typeof settlementId !== "string" || typeof transactionHash !== "string") {
       return res.status(400).json({ success: false, message: "Provide a settlement ID and transaction hash." });
     }
-    await verifySettlement(req.user as mongoose.Types.ObjectId, settlementId, transactionHash.trim(), signature);
+    await verifySettlement(req.user as mongoose.Types.ObjectId, settlementId, transactionHash);
     return res.json({ success: true, message: "Settlement confirmed.", profitShare: await profitSharePayload(req.user as mongoose.Types.ObjectId) });
   } catch (error) {
     const message = error instanceof Error && !('isAxiosError' in error) && !('code' in error)

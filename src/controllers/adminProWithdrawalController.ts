@@ -37,8 +37,8 @@ export const listProWithdrawals = handler(async (req, res) => {
   if (status !== undefined && !["QUEUED", "SIGNED", "COMPLETED", "FAILED", "REVIEW"].includes(String(status))) throw new ReconciliationError("Invalid status.", 400);
   const filter = status ? { status: String(status) } : {};
   const [rows, total] = await Promise.all([
-    Transaction.find({ ...filter, type: "withdrawal" }).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * 20).limit(20).lean(),
-    Transaction.countDocuments({ ...filter, type: "withdrawal" }),
+    Transaction.find({ status: { $ne: "QUOTED" }, ...filter, type: "withdrawal" }).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * 20).limit(20).lean(),
+    Transaction.countDocuments({ status: { $ne: "QUOTED" }, ...filter, type: "withdrawal" }),
   ]);
   res.json({ success: true, rows: await Promise.all(rows.map(adminWithdrawal)), page, pages: Math.max(1, Math.ceil(total / 20)), total });
 });

@@ -327,6 +327,9 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
     }
 
     // ── 6. Place the order on the exchange ───────────────────────────────────
+    if (!isProTrade && (await getProfitShareSummary(userId)).settlementRequired) {
+      return tradeOutcome(402, { success: false, code: "PROFIT_SHARE_DUE", message: "Settle your outstanding profit share in your dashboard before copying another trade." });
+    }
     const exchangeClientOrderId = `sc_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     let placed;
     try {

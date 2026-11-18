@@ -1,3 +1,4 @@
+import { getProfitShareSummary } from "./profitSharingService.js";
 import mongoose from "mongoose";
 import { CopyExecution, CopyExecutionLock, CopyNotification, CopySubscription } from "../models/copySubscriptionModel.js";
 import { Trade } from "../models/tradeModel.js";
@@ -110,6 +111,7 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
             await CopyExecution.updateOne({ _id: job._id }, { $set: { status: "skipped", completedAt: new Date() } });
             continue;
           }
+          if ((await getProfitShareSummary(job.copierId)).settlementRequired) throw new Error("Settle your outstanding profit share in your dashboard before copying new trades.");
           const result = await (dependencies.executeTrade ?? executeTrade)(job.copierId, { sourceTradeId: String(job.sourceTradeId), exchangeConnectionId: String(job.exchangeConnectionId), balance: subscription.allocation }, false);
           retainLock = result.body.code === "ORDER_REVIEW_REQUIRED";
           if (result.status !== 201) throw new Error(safeFailure(result));

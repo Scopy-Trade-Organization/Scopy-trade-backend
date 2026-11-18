@@ -172,13 +172,13 @@ export const getSettlements = async (req: Request, res: Response) => {
       filter.status = req.query.status;
     }
     const [settlements, total] = await Promise.all([
-      Transaction.find({ ...filter, type: "settlement" })
+      Transaction.find({ ...filter, type: "settlement", settlementRecordKind: { $ne: "payment" } })
         .populate("userId", "firstName lastName traderID")
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
         .lean(),
-      Transaction.countDocuments({ ...filter, type: "settlement" }),
+      Transaction.countDocuments({ ...filter, type: "settlement", settlementRecordKind: { $ne: "payment" } }),
     ]);
     return res.status(200).json({
       success: true,
