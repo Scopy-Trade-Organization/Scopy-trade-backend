@@ -6,9 +6,12 @@ import {
   normalizeError,
   getBybitTimestamp,
 } from "./exchangeConnectionService.js";
-import { getExchangeRestUrl } from "./exchangeEnvironment.js";
+import { getExchangeRestUrl, isBitgetDemo, isOkxDemo } from "./exchangeEnvironment.js";
 
-const BITGET_BASE_URL = process.env.BITGET_BASE_URL || "https://api.bitget.com";
+
+// Non-idempotent order submissions, amendments, and TP/SL placements must never be silently
+// retried by Axios. Disable axios-retry per-request for all order placement calls.
+export const NO_RETRY = { "axios-retry": { retries: 0 } } as const;
 
 // ─── Order Types ──────────────────────────────────────────────────────────────
 
@@ -21,6 +24,119 @@ export interface PlaceOrderParams {
   entryPrice: string; // limit price
   tp: string;
   sl: string;
+}
+
+
+export type OrderFailureClassification = "EXCHANGE_REJECTED" | "AMBIGUOUS_OUTCOME";
+
+export class OrderExecutionError extends Error {
+  public readonly classification: OrderFailureClassification;
+  public readonly exchange: ExchangeId;
+  public readonly status?: number | undefined;
+  public readonly exchangeCode?: string | undefined;
+  public readonly clientOrderId?: string | undefined;
+  public readonly originalMessage: string;
+
+  constructor(params: {
+    message: string;
+    classification: OrderFailureClassification;
+    exchange: ExchangeId;
+    status?: number | undefined;
+    exchangeCode?: string | undefined;
+    clientOrderId?: string | undefined;
+    originalMessage: string;
+  }) {
+    super(params.message);
+    this.name = "OrderExecutionError";
+    this.classification = params.classification;
+    this.exchange = params.exchange;
+    this.status = params.status;
+    this.exchangeCode = params.exchangeCode;
+    this.clientOrderId = params.clientOrderId;
+    this.originalMessage = params.originalMessage;
+  }
+}
+
+export function classifyOrderError(
+  exchange: ExchangeId,
+  err: unknown,
+  clientOrderId?: string,
+): OrderExecutionError {
+  if (err instanceof OrderExecutionError) return err;
+
+  const exchangeName =
+    exchange === "okx"
+      ? "OKX"
+      : exchange.charAt(0).toUpperCase() + exchange.slice(1);
+
+  if (axios.isAxiosError(err)) {
+    const status = err.response?.status;
+    const responseData = err.response?.data as any;
+    const exchangeCode =
+      responseData?.code || responseData?.retCode || responseData?.errorCode;
+    const errorMsg =
+      responseData?.msg ||
+      responseData?.retMsg ||
+      responseData?.message ||
+      err.message;
+
+    // 1. Network timeout, socket hangup, connection reset, HTTP 408 Request Timeout, or exchange 5xx server error
+    const isNetworkOrTimeout =
+      status === 408 ||
+      err.code === "ECONNABORTED" ||
+      err.code === "ETIMEDOUT" ||
+      err.code === "ECONNRESET" ||
+      err.code === "ENOTFOUND" ||
+      err.code === "EAI_AGAIN" ||
+      err.message?.toLowerCase().includes("timeout") ||
+      !err.response ||
+      (status !== undefined && status >= 500);
+
+    if (isNetworkOrTimeout) {
+      return new OrderExecutionError({
+        message: `${exchangeName} order placement timed out or connection was interrupted: ${errorMsg || err.message}`,
+        classification: "AMBIGUOUS_OUTCOME",
+        exchange,
+        status,
+        exchangeCode: exchangeCode ? String(exchangeCode) : undefined,
+        clientOrderId,
+        originalMessage: errorMsg || err.message,
+      });
+    }
+
+    // 2. Genuine 4xx exchange rejection from API server (excluding 408)
+    if (status !== undefined && status >= 400 && status < 500) {
+      return new OrderExecutionError({
+        message: `${exchangeName} order rejected${exchangeCode ? ` (${exchangeCode})` : ""}: ${errorMsg}`,
+        classification: "EXCHANGE_REJECTED",
+        exchange,
+        status,
+        exchangeCode: exchangeCode ? String(exchangeCode) : undefined,
+        clientOrderId,
+        originalMessage: errorMsg,
+      });
+    }
+
+    return new OrderExecutionError({
+      message: `${exchangeName} order placement failed: ${errorMsg}`,
+      classification: "AMBIGUOUS_OUTCOME",
+      exchange,
+      status,
+      exchangeCode: exchangeCode ? String(exchangeCode) : undefined,
+      clientOrderId,
+      originalMessage: errorMsg,
+    });
+  }
+
+  const message = err instanceof Error ? err.message : "Order placement failed.";
+  const isTimeoutMsg = message.toLowerCase().includes("timeout");
+  return new OrderExecutionError({
+    message,
+    classification: isTimeoutMsg ? "AMBIGUOUS_OUTCOME" : "EXCHANGE_REJECTED",
+    exchange,
+    clientOrderId,
+    originalMessage: message,
+  });
 }
 
 export interface PlacedOrderResult {
@@ -92,6 +208,7 @@ export interface AssetBalance {
 export interface ExchangeBalance {
   balances: AssetBalance[]; // non-zero assets only
   totalUsdtEquivalent: string | null; // provided natively by some exchanges
+  availableUsdt?: string | null;
 }
 
 // ─── Pair Normalization ──────────────────────────────────────────────────────
@@ -119,7 +236,7 @@ function decimalPlaces(step: string): number {
   return dot === -1 ? 0 : normalized.length - dot - 1;
 }
 
-function alignToStep(value: string, step: string, roundDown = false): string {
+export function alignToStep(value: string, step: string, roundDown = false): string {
   const numericValue = Number(value);
   const numericStep = Number(step);
   if (!Number.isFinite(numericValue) || !Number.isFinite(numericStep) || numericStep <= 0) {
@@ -130,14 +247,44 @@ function alignToStep(value: string, step: string, roundDown = false): string {
   return (alignedUnits * numericStep).toFixed(decimalPlaces(step));
 }
 
-async function prepareFuturesOrder(
+export interface FuturesContractRules {
+  symbol: string;
+  tickSize: string;
+  qtyStep: string;
+  minQty: string;
+  minNotional: string;
+  multiplier: number;
+}
+
+const contractRulesCache = new Map<
+  string,
+  { rules: FuturesContractRules; cachedAt: number }
+>();
+const CONTRACT_RULES_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
+export function clearContractRulesCache(): void {
+  contractRulesCache.clear();
+}
+
+export async function getFuturesContractRules(
   exchange: ExchangeId,
-  p: PlaceOrderParams,
-): Promise<PlaceOrderParams> {
-  if (exchange !== "binance" && exchange !== "bybit" && exchange !== "bitget") return p;
+  pair: string,
+): Promise<FuturesContractRules> {
+  if (exchange !== "binance" && exchange !== "bybit" && exchange !== "bitget") {
+    throw new Error(`Futures trading is not supported for exchange "${exchange}". Only Binance, Bybit, and Bitget are supported.`);
+  }
+
+  const cacheKey = `${exchange}:${pair}`;
+  const now = Date.now();
+  const cached = contractRulesCache.get(cacheKey);
+  if (cached && now - cached.cachedAt < CONTRACT_RULES_CACHE_TTL) {
+    return cached.rules;
+  }
 
   const baseUrl = getExchangeRestUrl(exchange);
-  const symbol = normalizePairForExchange(exchange, p.pair);
+  const symbol = normalizePairForExchange(exchange, pair);
+
+  let rules: FuturesContractRules;
 
   if (exchange === "bitget") {
     interface BitgetContractResponse {
@@ -159,9 +306,7 @@ async function prepareFuturesOrder(
       {
         params: { productType: "USDT-FUTURES", symbol },
         headers: {
-          ...(process.env.BITGET_DEMO_MODE === "true"
-            ? { paptrading: "1" }
-            : {}),
+          ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         },
       },
     );
@@ -187,68 +332,114 @@ async function prepareFuturesOrder(
       pricePlaces < 0 ||
       !Number.isFinite(priceEndStep) ||
       priceEndStep <= 0 ||
-      !sizeMultiplier
+      !sizeMultiplier ||
+      !Number.isFinite(Number(sizeMultiplier)) ||
+      Number(sizeMultiplier) <= 0
     ) {
-      throw new Error(`Bitget returned incomplete Futures rules for ${symbol}.`);
+      throw new Error(`Bitget returned incomplete or invalid Futures rules for ${symbol}.`);
     }
 
     const priceStep = (priceEndStep * 10 ** -pricePlaces).toFixed(pricePlaces);
-    const quantity = alignToStep(p.quantity, sizeMultiplier, true);
-    const entryPrice = alignToStep(p.entryPrice, priceStep);
-    const tp = alignToStep(p.tp, priceStep);
-    const sl = alignToStep(p.sl, priceStep);
-    if (
-      Number(quantity) < Number(instrument.minTradeNum || 0) ||
-      Number(quantity) * Number(entryPrice) < Number(instrument.minTradeUSDT || 0)
-    ) {
-      throw new Error(`Calculated quantity is below Bitget Futures minimum for ${symbol}.`);
-    }
-
-    return { ...p, quantity, entryPrice, tp, sl };
-  }
-
-  if (exchange === "binance") {
+    rules = {
+      symbol,
+      tickSize: priceStep,
+      qtyStep: sizeMultiplier,
+      minQty: instrument.minTradeNum || sizeMultiplier,
+      minNotional: instrument.minTradeUSDT || "0",
+      multiplier: 1, // Bitget USDT-FUTURES contracts use sizeMultiplier as lot step; contract multiplier for base coin is 1
+    };
+  } else if (exchange === "binance") {
     const { data } = await http.get(`${baseUrl}/fapi/v1/exchangeInfo`);
     const instrument = data.symbols?.find((item: any) => item.symbol === symbol);
     if (!instrument) throw new Error(`Binance Futures does not support ${symbol}.`);
+    if (instrument.status && instrument.status !== "TRADING") {
+      throw new Error(`Binance Futures symbol ${symbol} is not currently trading (${instrument.status}).`);
+    }
     const priceFilter = instrument.filters?.find((item: any) => item.filterType === "PRICE_FILTER");
     const lotFilter = instrument.filters?.find((item: any) => item.filterType === "LOT_SIZE");
     const minNotionalFilter = instrument.filters?.find((item: any) => item.filterType === "MIN_NOTIONAL");
     if (!priceFilter?.tickSize || !lotFilter?.stepSize) {
       throw new Error(`Binance returned incomplete Futures rules for ${symbol}.`);
     }
-    const quantity = alignToStep(p.quantity, lotFilter.stepSize, true);
-    const entryPrice = alignToStep(p.entryPrice, priceFilter.tickSize);
-    const tp = alignToStep(p.tp, priceFilter.tickSize);
-    const sl = alignToStep(p.sl, priceFilter.tickSize);
-    if (
-      Number(quantity) < Number(lotFilter.minQty || 0) ||
-      Number(quantity) * Number(entryPrice) < Number(minNotionalFilter?.notional || 0)
-    ) {
-      throw new Error(`Calculated quantity is below Binance Futures minimum for ${symbol}.`);
+    rules = {
+      symbol,
+      tickSize: priceFilter.tickSize,
+      qtyStep: lotFilter.stepSize,
+      minQty: lotFilter.minQty || lotFilter.stepSize,
+      minNotional: minNotionalFilter?.notional || "0",
+      multiplier: 1, // Binance USDT-M Futures are linear; 1 contract = 1 base coin
+    };
+  } else if (exchange === "bybit") {
+    const { data } = await http.get(`${baseUrl}/v5/market/instruments-info`, {
+      params: { category: "linear", symbol },
+    });
+    if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit instrument lookup failed.");
+    const instrument = data.result?.list?.[0];
+    if (!instrument) throw new Error(`Bybit Linear does not support ${symbol}.`);
+    if (instrument.status && instrument.status !== "Trading") {
+      throw new Error(`Bybit Linear symbol ${symbol} is not currently trading (${instrument.status}).`);
     }
-    return { ...p, quantity, entryPrice, tp, sl };
+    const qtyStep = instrument.lotSizeFilter?.qtyStep;
+    const tickSize = instrument.priceFilter?.tickSize;
+    if (!qtyStep || !tickSize) throw new Error(`Bybit returned incomplete Linear rules for ${symbol}.`);
+    rules = {
+      symbol,
+      tickSize,
+      qtyStep,
+      minQty: instrument.lotSizeFilter?.minOrderQty || qtyStep,
+      minNotional: instrument.lotSizeFilter?.minNotionalValue || "0",
+      multiplier: 1, // Bybit Linear USDT contracts are sized in base coin units; multiplier is 1
+    };
+  } else {
+    throw new Error(`Futures trading is not supported for exchange "${exchange}".`);
   }
 
-  const { data } = await http.get(`${baseUrl}/v5/market/instruments-info`, {
-    params: { category: "linear", symbol },
-  });
-  if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit instrument lookup failed.");
-  const instrument = data.result?.list?.[0];
-  if (!instrument) throw new Error(`Bybit Linear does not support ${symbol}.`);
-  const qtyStep = instrument.lotSizeFilter?.qtyStep;
-  const tickSize = instrument.priceFilter?.tickSize;
-  if (!qtyStep || !tickSize) throw new Error(`Bybit returned incomplete Linear rules for ${symbol}.`);
-  const quantity = alignToStep(p.quantity, qtyStep, true);
-  const entryPrice = alignToStep(p.entryPrice, tickSize);
-  const tp = alignToStep(p.tp, tickSize);
-  const sl = alignToStep(p.sl, tickSize);
+  // Unconditional validation of parsed contract rules
+  const tickNum = Number(rules.tickSize);
+  const qtyStepNum = Number(rules.qtyStep);
+  const minQtyNum = Number(rules.minQty);
+  const minNotionalNum = Number(rules.minNotional);
+  const multiplierNum = Number(rules.multiplier);
+
   if (
-    Number(quantity) < Number(instrument.lotSizeFilter?.minOrderQty || 0) ||
-    Number(quantity) * Number(entryPrice) < Number(instrument.lotSizeFilter?.minNotionalValue || 0)
+    !Number.isFinite(tickNum) || tickNum <= 0 ||
+    !Number.isFinite(qtyStepNum) || qtyStepNum <= 0 ||
+    !Number.isFinite(minQtyNum) || minQtyNum <= 0 ||
+    !Number.isFinite(minNotionalNum) || minNotionalNum < 0 ||
+    !Number.isFinite(multiplierNum) || multiplierNum <= 0
   ) {
-    throw new Error(`Calculated quantity is below Bybit Linear minimum for ${symbol}.`);
+    throw new Error(`Invalid contract rules for ${exchange} ${symbol}: metadata validation failed.`);
   }
+
+  contractRulesCache.set(cacheKey, { rules, cachedAt: now });
+  return rules;
+}
+
+async function prepareFuturesOrder(
+  exchange: ExchangeId,
+  p: PlaceOrderParams,
+): Promise<PlaceOrderParams> {
+  if (exchange !== "binance" && exchange !== "bybit" && exchange !== "bitget") return p;
+
+  const rules = await getFuturesContractRules(exchange, p.pair);
+  const quantity = alignToStep(p.quantity, rules.qtyStep, true);
+  const entryPrice = alignToStep(p.entryPrice, rules.tickSize);
+  const tp = alignToStep(p.tp, rules.tickSize);
+  const sl = alignToStep(p.sl, rules.tickSize);
+
+  if (
+    Number(quantity) < Number(rules.minQty) ||
+    Number(quantity) * Number(entryPrice) < Number(rules.minNotional)
+  ) {
+    const exchangeName =
+      exchange === "bitget"
+        ? "Bitget Futures"
+        : exchange === "binance"
+          ? "Binance Futures"
+          : "Bybit Linear";
+    throw new Error(`Calculated quantity is below ${exchangeName} minimum for ${rules.symbol}.`);
+  }
+
   return { ...p, quantity, entryPrice, tp, sl };
 }
 
@@ -270,45 +461,49 @@ async function placeBinanceOrder(
   const sign = (qs: string) =>
     crypto.createHmac("sha256", apiSecret).update(qs).digest("hex");
 
-  // 1. Place the limit entry order
-  const ts = await getTimestamp();
-  const side = p.direction.toUpperCase();
+  try {
+    const ts = await getTimestamp();
+    const side = p.direction.toUpperCase();
 
-  const entryParams = new URLSearchParams({
-    symbol: normalizedPair,
-    side,
-    type: "LIMIT",
-    timeInForce: "GTC",
-    quantity: p.quantity,
-    price: p.entryPrice,
-    ...(p.clientOrderId ? { newClientOrderId: p.clientOrderId } : {}),
-    timestamp: String(ts),
-  });
-  const entryQs = entryParams.toString();
-  const { data: orderData } = await http.post(
-    `${baseUrl}/fapi/v1/order`,
-    null,
-    {
-      params: {
-        ...Object.fromEntries(new URLSearchParams(entryQs)),
-        signature: sign(entryQs),
-      },
-      headers: { "X-MBX-APIKEY": apiKey },
-    },
-  );
-
-  const orderId = String(orderData.orderId);
-
-  return {
-    orderId,
-    raw: orderData,
-    execution: {
+    const entryParams = new URLSearchParams({
+      symbol: normalizedPair,
+      side,
+      type: "LIMIT",
+      timeInForce: "GTC",
       quantity: p.quantity,
-      entryPrice: p.entryPrice,
-      tp: p.tp,
-      sl: p.sl,
-    },
-  };
+      price: p.entryPrice,
+      ...(p.clientOrderId ? { newClientOrderId: p.clientOrderId } : {}),
+      timestamp: String(ts),
+    });
+    const entryQs = entryParams.toString();
+    const { data: orderData } = await http.post(
+      `${baseUrl}/fapi/v1/order`,
+      null,
+      {
+        params: {
+          ...Object.fromEntries(new URLSearchParams(entryQs)),
+          signature: sign(entryQs),
+        },
+        headers: { "X-MBX-APIKEY": apiKey },
+        ...NO_RETRY,
+      },
+    );
+
+    const orderId = String(orderData.orderId);
+
+    return {
+      orderId,
+      raw: orderData,
+      execution: {
+        quantity: p.quantity,
+        entryPrice: p.entryPrice,
+        tp: p.tp,
+        sl: p.sl,
+      },
+    };
+  } catch (err) {
+    throw classifyOrderError("binance", err, p.clientOrderId);
+  }
 }
 
 // ── Bybit Futures (Linear) — places limit order with TP/SL in a single call
@@ -319,65 +514,85 @@ async function placeBybitOrder(
   const baseUrl = getExchangeRestUrl("bybit");
   const normalizedPair = normalizePairForExchange("bybit", p.pair);
 
-  const timestamp = await getBybitTimestamp(baseUrl);
-  const recvWindow = "5000";
+  try {
+    const timestamp = await getBybitTimestamp(baseUrl);
+    const recvWindow = "5000";
 
-  const body = JSON.stringify({
-    category: "linear",
-    symbol: normalizedPair,
-    ...(p.clientOrderId ? { orderLinkId: p.clientOrderId } : {}),
-    side: p.direction === "buy" ? "Buy" : "Sell",
-    orderType: "Limit",
-    qty: p.quantity,
-    price: p.entryPrice,
-    takeProfit: p.tp,
-    stopLoss: p.sl,
-    tpslMode: "Full",
-    tpOrderType: "Market",
-    slOrderType: "Market",
-    tpTriggerBy: "MarkPrice",
-    slTriggerBy: "MarkPrice",
-    timeInForce: "GTC",
-    positionIdx: 0,
-  });
+    const body = JSON.stringify({
+      category: "linear",
+      symbol: normalizedPair,
+      ...(p.clientOrderId ? { orderLinkId: p.clientOrderId } : {}),
+      side: p.direction === "buy" ? "Buy" : "Sell",
+      orderType: "Limit",
+      qty: p.quantity,
+      price: p.entryPrice,
+      takeProfit: p.tp,
+      stopLoss: p.sl,
+      tpslMode: "Full",
+      tpOrderType: "Market",
+      slOrderType: "Market",
+      tpTriggerBy: "MarkPrice",
+      slTriggerBy: "MarkPrice",
+      timeInForce: "GTC",
+      positionIdx: 0,
+    });
 
-  const signPayload = timestamp + apiKey + recvWindow + body;
-  const signature = crypto
-    .createHmac("sha256", apiSecret)
-    .update(signPayload)
-    .digest("hex");
+    const signPayload = timestamp + apiKey + recvWindow + body;
+    const signature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(signPayload)
+      .digest("hex");
 
-  interface BybitOrderResponse {
-    retCode: number;
-    retMsg: string;
-    result: { orderId: string };
-  }
+    interface BybitOrderResponse {
+      retCode: number;
+      retMsg: string;
+      result: { orderId: string };
+    }
 
-  const { data } = await http.post<BybitOrderResponse>(
-    `${baseUrl}/v5/order/create`,
-    body,
-    {
-      headers: {
-        "X-BAPI-API-KEY": apiKey,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recvWindow,
-        "Content-Type": "application/json",
+    const { data } = await http.post<BybitOrderResponse>(
+      `${baseUrl}/v5/order/create`,
+      body,
+      {
+        headers: {
+          "X-BAPI-API-KEY": apiKey,
+          "X-BAPI-SIGN": signature,
+          "X-BAPI-TIMESTAMP": timestamp,
+          "X-BAPI-RECV-WINDOW": recvWindow,
+          "Content-Type": "application/json",
+        },
+        ...NO_RETRY,
       },
-    },
-  );
+    );
 
-  if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit order failed.");
-  return {
-    orderId: data.result.orderId,
-    raw: data,
-    execution: {
-      quantity: p.quantity,
-      entryPrice: p.entryPrice,
-      tp: p.tp,
-      sl: p.sl,
-    },
-  };
+    if (data.retCode !== 0) {
+      const isAmbiguous =
+        data.retCode === 10002 ||
+        data.retCode === 10016 ||
+        /system error|server timeout|busy/i.test(data.retMsg || "");
+      throw new OrderExecutionError({
+        message: `Bybit order ${isAmbiguous ? "interrupted" : "rejected"} (${data.retCode}): ${data.retMsg || "Bybit order failed."}`,
+        classification: isAmbiguous ? "AMBIGUOUS_OUTCOME" : "EXCHANGE_REJECTED",
+        exchange: "bybit",
+        status: 200,
+        exchangeCode: String(data.retCode),
+        clientOrderId: p.clientOrderId,
+        originalMessage: data.retMsg || "Bybit order failed.",
+      });
+    }
+
+    return {
+      orderId: data.result.orderId,
+      raw: data,
+      execution: {
+        quantity: p.quantity,
+        entryPrice: p.entryPrice,
+        tp: p.tp,
+        sl: p.sl,
+      },
+    };
+  } catch (err) {
+    throw classifyOrderError("bybit", err, p.clientOrderId);
+  }
 }
 
 // ── OKX Futures — places limit order with attached TP/SL
@@ -385,6 +600,7 @@ async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
   const { apiKey, apiSecret, passphrase } = p.credentials;
   if (!passphrase) throw new Error("OKX requires a passphrase.");
 
+  const baseUrl = getExchangeRestUrl("okx");
   const normalizedPair = normalizePairForExchange("okx", p.pair);
 
   const timestamp = new Date().toISOString();
@@ -402,6 +618,7 @@ async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
     slTriggerPx: p.sl,
     slOrdPx: p.sl,
     posSide: "net",
+    ...(p.clientOrderId ? { clOrdId: p.clientOrderId } : {}),
   });
 
   const signPayload = timestamp + method + path + body;
@@ -416,26 +633,71 @@ async function placeOkxOrder(p: PlaceOrderParams): Promise<PlacedOrderResult> {
     data: Array<{ ordId: string; sCode: string; sMsg: string }>;
   }
 
-  const { data } = await http.post<OkxOrderResponse>(
-    "https://www.okx.com" + path,
-    body,
-    {
-      headers: {
-        "OK-ACCESS-KEY": apiKey,
-        "OK-ACCESS-SIGN": signature,
-        "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": passphrase,
-        "Content-Type": "application/json",
-        "x-simulated-trading": "1",
+  let data: OkxOrderResponse;
+  try {
+    ({ data } = await http.post<OkxOrderResponse>(
+      baseUrl + path,
+      body,
+      {
+        headers: {
+          "OK-ACCESS-KEY": apiKey,
+          "OK-ACCESS-SIGN": signature,
+          "OK-ACCESS-TIMESTAMP": timestamp,
+          "OK-ACCESS-PASSPHRASE": passphrase,
+          "Content-Type": "application/json",
+          ...(isOkxDemo() ? { "x-simulated-trading": "1" } : {}),
+        },
+        ...NO_RETRY,
       },
-    },
-  );
+    ));
+  } catch (err) {
+    throw classifyOrderError("okx", err, p.clientOrderId);
+  }
 
-  if (data.code !== "0") throw new Error(data.msg || "OKX order failed.");
-  const result = data.data[0];
-  if (result?.sCode !== "0")
-    throw new Error(result?.sMsg || "OKX order error.");
-  return { orderId: result.ordId, raw: data };
+  if (data.code !== "0") {
+    const isAmbiguous =
+      data.code === "50001" ||
+      data.code === "50004" ||
+      /system|timeout|busy/i.test(data.msg || "");
+    throw new OrderExecutionError({
+      message: `OKX order ${isAmbiguous ? "interrupted" : "rejected"} (${data.code}): ${data.msg || "OKX order failed."}`,
+      classification: isAmbiguous ? "AMBIGUOUS_OUTCOME" : "EXCHANGE_REJECTED",
+      exchange: "okx",
+      status: 200,
+      exchangeCode: data.code,
+      clientOrderId: p.clientOrderId,
+      originalMessage: data.msg || "OKX order failed.",
+    });
+  }
+
+  const result = data.data?.[0];
+  if (!result || (result.sCode && result.sCode !== "0")) {
+    const sCode = result?.sCode;
+    const isAmbiguous =
+      sCode === "50001" ||
+      sCode === "50004" ||
+      /system|timeout|busy/i.test(result?.sMsg || "");
+    throw new OrderExecutionError({
+      message: `OKX order ${isAmbiguous ? "interrupted" : "rejected"}${sCode ? ` (${sCode})` : ""}: ${result?.sMsg || "OKX order error."}`,
+      classification: isAmbiguous ? "AMBIGUOUS_OUTCOME" : "EXCHANGE_REJECTED",
+      exchange: "okx",
+      status: 200,
+      exchangeCode: sCode,
+      clientOrderId: p.clientOrderId,
+      originalMessage: result?.sMsg || "OKX order error.",
+    });
+  }
+
+  return {
+    orderId: result.ordId,
+    raw: data,
+    execution: {
+      quantity: p.quantity,
+      entryPrice: p.entryPrice,
+      tp: p.tp,
+      sl: p.sl,
+    },
+  };
 }
 
 // ── Bitget Futures (Mix) — places limit order
@@ -481,51 +743,48 @@ async function placeBitgetOrder(
   let data: BitgetOrderResponse;
   try {
     ({ data } = await http.post<BitgetOrderResponse>(
-      BITGET_BASE_URL + path,
+      getExchangeRestUrl("bitget") + path,
       body,
       {
         headers: {
-          ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+          ...(isBitgetDemo() ? { paptrading: "1" } : {}),
           "ACCESS-KEY": apiKey,
           "ACCESS-SIGN": signature,
           "ACCESS-TIMESTAMP": timestamp,
           "ACCESS-PASSPHRASE": passphrase,
           "Content-Type": "application/json",
         },
+        ...NO_RETRY,
       },
     ));
-  } catch (error) {
-    if (axios.isAxiosError(error)) {
-      const response = error.response?.data as
-        | { code?: unknown; msg?: unknown }
-        | undefined;
-      const code =
-        typeof response?.code === "string" ? response.code : undefined;
-      const message =
-        typeof response?.msg === "string" && response.msg.trim()
-          ? response.msg.trim()
-          : "The request was rejected by Bitget.";
-      console.error("[Bitget] Order request failed", {
-        status: error.response?.status,
-        code,
-        message,
-      });
-      throw new Error(
-        `Bitget order rejected${code ? ` (${code})` : ""}: ${message}`,
-      );
-    }
-    throw error;
+  } catch (err) {
+    throw classifyOrderError("bitget", err, p.clientOrderId);
   }
 
   if (data.code !== "00000") {
-    throw new Error(
-      `Bitget order rejected (${data.code}): ${data.msg || "Unknown Bitget error."}`,
-    );
+    throw new OrderExecutionError({
+      message: `Bitget order rejected (${data.code}): ${data.msg || "Unknown Bitget error."}`,
+      classification: "EXCHANGE_REJECTED",
+      exchange: "bitget",
+      status: 200,
+      exchangeCode: data.code,
+      clientOrderId: p.clientOrderId,
+      originalMessage: data.msg || "Unknown Bitget error.",
+    });
   }
 
   const orderId = data.data.orderId;
 
-  return { orderId, raw: data };
+  return {
+    orderId,
+    raw: data,
+    execution: {
+      quantity: p.quantity,
+      entryPrice: p.entryPrice,
+      tp: p.tp,
+      sl: p.sl,
+    },
+  };
 }
 
 // ─── Order Status Checkers ─────────────────────────────────────────────────────
@@ -707,10 +966,10 @@ async function getBitgetOrderStatus(
   }
 
   const { data } = await http.get<BitgetStatusResponse>(
-    BITGET_BASE_URL + path,
+    getExchangeRestUrl("bitget") + path,
     {
       headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -800,11 +1059,11 @@ async function getBitgetCurrentPrice(
   const normalizedPair = normalizePairForExchange("bitget", pair);
 
   const { data } = await http.get(
-    BITGET_BASE_URL + "/api/v2/mix/market/ticker",
+    getExchangeRestUrl("bitget") + "/api/v2/mix/market/ticker",
     {
       params: { symbol: normalizedPair, productType: "USDT-FUTURES" },
       headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
       },
     },
   );
@@ -836,10 +1095,12 @@ async function getBinanceBalance(
       .digest("hex");
 
     interface BinanceAccountResponse {
+      availableBalance?: string;
       assets: Array<{
         asset: string;
         walletBalance: string;
         marginBalance: string;
+        availableBalance?: string;
       }>;
     }
 
@@ -854,14 +1115,17 @@ async function getBinanceBalance(
     const nonZero = data.assets.filter((b) => parseFloat(b.walletBalance) > 0);
 
     const usdtEntry = nonZero.find((b) => b.asset === "USDT");
+    const availableUsdt =
+      usdtEntry?.availableBalance ?? (data as any).availableBalance ?? usdtEntry?.walletBalance ?? null;
 
     return {
       balances: nonZero.map((b) => ({
         asset: b.asset,
-        free: b.walletBalance,
-        locked: "0",
+        free: b.availableBalance ?? b.walletBalance,
+        locked: (b as any).marginBalance || "0",
       })),
       totalUsdtEquivalent: usdtEntry?.walletBalance || null,
+      availableUsdt,
     };
   } catch (err: any) {
     const status = err?.response?.status;
@@ -926,14 +1190,32 @@ async function getBybitBalance(
     if (!account) throw new Error("Bybit returned an empty wallet response.");
 
     const nonZero = account.coin.filter((c) => parseFloat(c.walletBalance) > 0);
+    const usdtCoin = account.coin.find((c) => c.coin === "USDT");
+    const accountAvailable = (account as any).totalAvailableBalance;
+    const availableUsdt =
+      accountAvailable && accountAvailable !== ""
+        ? accountAvailable
+        : (usdtCoin as any)?.availableToWithdraw ||
+          (usdtCoin
+            ? String(
+                Math.max(
+                  0,
+                  parseFloat(usdtCoin.walletBalance) -
+                    parseFloat(usdtCoin.locked || "0"),
+                ),
+              )
+            : null);
 
     return {
       balances: nonZero.map((c) => ({
         asset: c.coin,
-        free: String(parseFloat(c.walletBalance) - parseFloat(c.locked || "0")),
+        free:
+          (c as any).availableToWithdraw ||
+          String(Math.max(0, parseFloat(c.walletBalance) - parseFloat(c.locked || "0"))),
         locked: c.locked || "0",
       })),
       totalUsdtEquivalent: account.totalEquity || null,
+      availableUsdt: availableUsdt || null,
     };
   } catch (err: any) {
     const status = err?.response?.status;
@@ -1036,11 +1318,11 @@ async function getBitgetBalance(
   }
 
   const { data } = await http.get<BitgetBalanceResponse>(
-    BITGET_BASE_URL + path,
+    getExchangeRestUrl("bitget") + path,
     {
       params: { productType: "USDT-FUTURES", marginCoin: "USDT" },
       headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
@@ -1061,6 +1343,8 @@ async function getBitgetBalance(
     (sum, a) => sum + parseFloat(a.usdtEquity || "0"),
     0,
   );
+  const usdtEntry = (data.data ?? []).find((a) => a.marginCoin === "USDT");
+  const availableUsdt = usdtEntry?.available ?? (usdtEntry as any)?.maxOpenPosAvailable ?? null;
 
   return {
     balances: nonZero.map((a) => ({
@@ -1069,6 +1353,7 @@ async function getBitgetBalance(
       locked: a.locked || "0",
     })),
     totalUsdtEquivalent: totalUsdt > 0 ? String(totalUsdt) : null,
+    availableUsdt,
   };
 }
 
@@ -1142,6 +1427,7 @@ async function amendBinanceTrade(p: AmendTradeParams): Promise<AmendTradeResult>
         signature: sign(query),
       },
       headers: { "X-MBX-APIKEY": apiKey },
+      ...NO_RETRY,
     });
     return {
       entryPrice: prepared.entryPrice,
@@ -1171,6 +1457,7 @@ async function amendBinanceTrade(p: AmendTradeParams): Promise<AmendTradeResult>
             signature: sign(query),
           },
           headers: { "X-MBX-APIKEY": apiKey },
+          ...NO_RETRY,
         },
       );
     }),
@@ -1229,6 +1516,7 @@ async function amendBybitTrade(p: AmendTradeParams): Promise<AmendTradeResult> {
       "X-BAPI-RECV-WINDOW": recvWindow,
       "Content-Type": "application/json",
     },
+    ...NO_RETRY,
   });
   if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit amendment failed.");
   return { entryPrice: prepared.entryPrice, tp: prepared.tp, sl: prepared.sl, raw: data };
@@ -1246,15 +1534,16 @@ async function amendOkxPendingTrade(p: AmendTradeParams): Promise<AmendTradeResu
   });
   const signature = crypto.createHmac("sha256", apiSecret)
     .update(timestamp + "POST" + path + body).digest("base64");
-  const { data } = await http.post("https://www.okx.com" + path, body, {
+  const { data } = await http.post(getExchangeRestUrl("okx") + path, body, {
     headers: {
       "OK-ACCESS-KEY": apiKey,
       "OK-ACCESS-SIGN": signature,
       "OK-ACCESS-TIMESTAMP": timestamp,
       "OK-ACCESS-PASSPHRASE": passphrase,
       "Content-Type": "application/json",
-      "x-simulated-trading": "1",
+      ...(isOkxDemo() ? { "x-simulated-trading": "1" } : {}),
     },
+    ...NO_RETRY,
   });
   if (data.code !== "0" || data.data?.[0]?.sCode !== "0") {
     throw new Error(data.data?.[0]?.sMsg || data.msg || "OKX amendment failed.");
@@ -1271,15 +1560,16 @@ async function amendBitgetPendingTrade(p: AmendTradeParams): Promise<AmendTradeR
     const body = JSON.stringify(payload);
     const signature = crypto.createHmac("sha256", apiSecret)
       .update(timestamp + "POST" + path + body).digest("base64");
-    const { data } = await http.post(BITGET_BASE_URL + path, body, {
+    const { data } = await http.post(getExchangeRestUrl("bitget") + path, body, {
       headers: {
-        ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}),
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
         "ACCESS-KEY": apiKey,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
         "ACCESS-PASSPHRASE": passphrase,
         "Content-Type": "application/json",
       },
+      ...NO_RETRY,
     });
     if (data.code !== "00000") {
       throw new Error(data.msg || "Bitget amendment failed.");
@@ -1317,13 +1607,239 @@ async function amendBitgetPendingTrade(p: AmendTradeParams): Promise<AmendTradeR
 
 // ─── Public Trading API ──────────────────────────────────────────────────────
 
+
+export async function reconcileOrderByClientOrderId(
+  exchange: ExchangeId,
+  credentials: RawCredentials,
+  pair: string,
+  clientOrderId: string,
+  retryDelayMs: number = 1000,
+): Promise<{ orderId: string; raw: unknown } | "NOT_FOUND" | "UNRESOLVED"> {
+  const normalizedPair = normalizePairForExchange(exchange, pair);
+  const baseUrl = getExchangeRestUrl(exchange);
+
+  const querySingleAttempt = async (): Promise<
+    { orderId: string; raw: unknown } | "NOT_FOUND" | "UNRESOLVED"
+  > => {
+    if (exchange === "binance") {
+      const { apiKey, apiSecret } = credentials;
+      const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`, NO_RETRY);
+      const ts = timeData.serverTime as number;
+      const qs = `symbol=${normalizedPair}&origClientOrderId=${clientOrderId}&timestamp=${ts}`;
+      const sig = crypto.createHmac("sha256", apiSecret).update(qs).digest("hex");
+
+      try {
+        const { data } = await http.get(`${baseUrl}/fapi/v1/order`, {
+          params: { ...Object.fromEntries(new URLSearchParams(qs)), signature: sig },
+          headers: { "X-MBX-APIKEY": apiKey },
+          ...NO_RETRY,
+        });
+        if (data?.orderId) {
+          return { orderId: String(data.orderId), raw: data };
+        }
+        return "UNRESOLVED";
+      } catch (err: any) {
+        const code = err.response?.data?.code;
+        if (code === -2011) {
+          return "NOT_FOUND";
+        }
+        return "UNRESOLVED";
+      }
+    } else if (exchange === "bybit") {
+      const { apiKey, apiSecret } = credentials;
+      const timestamp = await getBybitTimestamp(baseUrl);
+      const recvWindow = "5000";
+      const signPayload = `${timestamp}${apiKey}${recvWindow}category=linear&orderLinkId=${clientOrderId}&symbol=${normalizedPair}`;
+      const signature = crypto
+        .createHmac("sha256", apiSecret)
+        .update(signPayload)
+        .digest("hex");
+
+      interface BybitQueryResponse {
+        retCode: number;
+        retMsg: string;
+        result?: { list?: Array<{ orderId: string; orderLinkId: string }> };
+      }
+
+      try {
+        const { data } = await http.get<BybitQueryResponse>(
+          `${baseUrl}/v5/order/realtime`,
+          {
+            params: { category: "linear", orderLinkId: clientOrderId, symbol: normalizedPair },
+            headers: {
+              "X-BAPI-API-KEY": apiKey,
+              "X-BAPI-SIGN": signature,
+              "X-BAPI-TIMESTAMP": timestamp,
+              "X-BAPI-RECV-WINDOW": recvWindow,
+            },
+            ...NO_RETRY,
+          },
+        );
+
+        const found = data.result?.list?.[0];
+        if (data.retCode === 0 && found?.orderId) {
+          return { orderId: found.orderId, raw: found };
+        }
+
+        const histTimestamp = await getBybitTimestamp(baseUrl);
+        const histSignPayload = `${histTimestamp}${apiKey}${recvWindow}category=linear&orderLinkId=${clientOrderId}&symbol=${normalizedPair}`;
+        const histSignature = crypto
+          .createHmac("sha256", apiSecret)
+          .update(histSignPayload)
+          .digest("hex");
+
+        const { data: histData } = await http.get<BybitQueryResponse>(
+          `${baseUrl}/v5/order/history`,
+          {
+            params: { category: "linear", orderLinkId: clientOrderId, symbol: normalizedPair },
+            headers: {
+              "X-BAPI-API-KEY": apiKey,
+              "X-BAPI-SIGN": histSignature,
+              "X-BAPI-TIMESTAMP": histTimestamp,
+              "X-BAPI-RECV-WINDOW": recvWindow,
+            },
+            ...NO_RETRY,
+          },
+        );
+
+        const histFound = histData.result?.list?.[0];
+        if (histData.retCode === 0 && histFound?.orderId) {
+          return { orderId: histFound.orderId, raw: histFound };
+        }
+
+        if (data.retCode === 0 && histData.retCode === 0) {
+          return "NOT_FOUND";
+        }
+        return "UNRESOLVED";
+      } catch (err) {
+        return "UNRESOLVED";
+      }
+    } else if (exchange === "bitget") {
+      const { apiKey, apiSecret, passphrase } = credentials;
+      if (!passphrase) return "UNRESOLVED";
+
+      const timestamp = Date.now().toString();
+      const method = "GET";
+      const path = `/api/v2/mix/order/detail?symbol=${normalizedPair}&productType=USDT-FUTURES&clientOid=${clientOrderId}`;
+      const signPayload = timestamp + method + path;
+      const signature = crypto
+        .createHmac("sha256", apiSecret)
+        .update(signPayload)
+        .digest("base64");
+
+      interface BitgetQueryResponse {
+        code: string;
+        msg?: string;
+        data?: { orderId?: string; clientOid?: string };
+      }
+
+      try {
+        const { data } = await http.get<BitgetQueryResponse>(
+          baseUrl + path,
+          {
+            headers: {
+              ...(isBitgetDemo() ? { paptrading: "1" } : {}),
+              "ACCESS-KEY": apiKey,
+              "ACCESS-SIGN": signature,
+              "ACCESS-TIMESTAMP": timestamp,
+              "ACCESS-PASSPHRASE": passphrase,
+              "Content-Type": "application/json",
+            },
+            ...NO_RETRY,
+          },
+        );
+
+        if (data.code === "00000" && data.data?.orderId) {
+          return { orderId: data.data.orderId, raw: data };
+        }
+
+        if (data.code === "40768" || data.code === "40762" || /not exist|not found/i.test(data.msg || "")) {
+          return "NOT_FOUND";
+        }
+
+        return "UNRESOLVED";
+      } catch (err: any) {
+        const resCode = err.response?.data?.code;
+        if (resCode === "40768" || resCode === "40762") {
+          return "NOT_FOUND";
+        }
+        return "UNRESOLVED";
+      }
+    } else if (exchange === "okx") {
+      const { apiKey, apiSecret, passphrase } = credentials;
+      if (!passphrase) return "UNRESOLVED";
+
+      const timestamp = new Date().toISOString();
+      const method = "GET";
+      const path = `/api/v5/trade/order?instId=${normalizedPair}&clOrdId=${clientOrderId}`;
+      const signPayload = timestamp + method + path;
+      const signature = crypto
+        .createHmac("sha256", apiSecret)
+        .update(signPayload)
+        .digest("base64");
+
+      try {
+        const { data } = await http.get<any>(
+          baseUrl + path,
+          {
+            headers: {
+              "OK-ACCESS-KEY": apiKey,
+              "OK-ACCESS-SIGN": signature,
+              "OK-ACCESS-TIMESTAMP": timestamp,
+              "OK-ACCESS-PASSPHRASE": passphrase,
+              ...(isOkxDemo() ? { "x-simulated-trading": "1" } : {}),
+            },
+            ...NO_RETRY,
+          },
+        );
+
+        if (data.code === "0" && data.data?.[0]?.ordId) {
+          return { orderId: data.data[0].ordId, raw: data };
+        }
+        if (data.code === "51001" || data.data?.[0]?.sCode === "51001") {
+          return "NOT_FOUND";
+        }
+        return "UNRESOLVED";
+      } catch (err: any) {
+        if (err.response?.data?.code === "51001") {
+          return "NOT_FOUND";
+        }
+        return "UNRESOLVED";
+      }
+    }
+
+    return "UNRESOLVED";
+  };
+
+  try {
+    const firstAttempt = await querySingleAttempt();
+    if (firstAttempt !== "NOT_FOUND") {
+      return firstAttempt;
+    }
+
+    // Do not interpret a temporarily missing order as confirmed absence without adequate evidence.
+    // If the initial check reports NOT_FOUND, allow an indexing grace period and verify once more.
+    if (retryDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+    }
+    return await querySingleAttempt();
+  } catch (err) {
+    return "UNRESOLVED";
+  }
+}
+
 export async function placeOrder(
   exchange: ExchangeId,
   params: PlaceOrderParams,
 ): Promise<PlacedOrderResult> {
+  const prepared = await prepareFuturesOrder(exchange, params);
+  const placer = orderPlacer[exchange];
+  if (!placer) {
+    throw new Error(`Exchange "${exchange}" does not support order placement.`);
+  }
+
   try {
-    const prepared = await prepareFuturesOrder(exchange, params);
-    const placed = await orderPlacer[exchange](prepared);
+    const placed = await placer(prepared);
     return {
       ...placed,
       execution: {
@@ -1334,7 +1850,53 @@ export async function placeOrder(
       },
     };
   } catch (err) {
-    throw normalizeError(err);
+    const classified = classifyOrderError(exchange, err, params.clientOrderId);
+
+    // If ambiguous outcome and a clientOrderId exists, reconcile whether order reached exchange
+    if (classified.classification === "AMBIGUOUS_OUTCOME" && params.clientOrderId) {
+      try {
+        const reconciled = await reconcileOrderByClientOrderId(
+          exchange,
+          params.credentials,
+          params.pair,
+          params.clientOrderId,
+        );
+
+        if (reconciled !== "UNRESOLVED" && reconciled !== "NOT_FOUND") {
+          console.log(
+            `[placeOrder] Successfully reconciled ambiguous order on ${exchange} via clientOrderId ${params.clientOrderId}: orderId=${reconciled.orderId}`,
+          );
+          return {
+            orderId: reconciled.orderId,
+            raw: reconciled.raw,
+            execution: {
+              quantity: prepared.quantity,
+              entryPrice: prepared.entryPrice,
+              tp: prepared.tp,
+              sl: prepared.sl,
+            },
+          };
+        }
+
+        if (reconciled === "NOT_FOUND") {
+          console.log(
+            `[placeOrder] Confirmed order ${params.clientOrderId} was NOT accepted on ${exchange}.`,
+          );
+          throw new OrderExecutionError({
+            message: `${exchange.toUpperCase()} order placement timed out and was confirmed absent on exchange.`,
+            classification: "EXCHANGE_REJECTED",
+            exchange,
+            clientOrderId: params.clientOrderId,
+            originalMessage: "Order timed out before reaching matching engine and was confirmed absent on exchange.",
+          });
+        }
+      } catch (reconErr) {
+        if (reconErr instanceof OrderExecutionError) throw reconErr;
+        console.error(`[placeOrder] Reconciliation check failed for ${params.clientOrderId}:`, reconErr);
+      }
+    }
+
+    throw classified;
   }
 }
 
@@ -1436,6 +1998,7 @@ export async function closeTradeOrder(
         .update(timestamp + apiKey + recvWindow + body).digest("hex");
       const { data } = await http.post(`${baseUrl}${path}`, body, {
         headers: { "X-BAPI-API-KEY": apiKey, "X-BAPI-SIGN": signature, "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow, "Content-Type": "application/json" },
+        ...NO_RETRY,
       });
       if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit manual close failed.");
       const price = params.status === "filled" ? (await getCurrentPrice(exchange, params.pair)).price : null;
@@ -1458,8 +2021,9 @@ export async function closeTradeOrder(
       .update(timestamp + "POST" + path + body).digest("base64");
     const { data } = await http.post(`${baseUrl}${path}`, body, {
       headers: exchange === "okx"
-        ? { "OK-ACCESS-KEY": apiKey, "OK-ACCESS-SIGN": signature, "OK-ACCESS-TIMESTAMP": timestamp, "OK-ACCESS-PASSPHRASE": passphrase, "Content-Type": "application/json", "x-simulated-trading": "1" }
-        : { ...(process.env.BITGET_DEMO_MODE === "true" ? { paptrading: "1" } : {}), "ACCESS-KEY": apiKey, "ACCESS-SIGN": signature, "ACCESS-TIMESTAMP": timestamp, "ACCESS-PASSPHRASE": passphrase, "Content-Type": "application/json" },
+        ? { "OK-ACCESS-KEY": apiKey, "OK-ACCESS-SIGN": signature, "OK-ACCESS-TIMESTAMP": timestamp, "OK-ACCESS-PASSPHRASE": passphrase, "Content-Type": "application/json", ...(isOkxDemo() ? { "x-simulated-trading": "1" } : {}) }
+        : { ...(isBitgetDemo() ? { paptrading: "1" } : {}), "ACCESS-KEY": apiKey, "ACCESS-SIGN": signature, "ACCESS-TIMESTAMP": timestamp, "ACCESS-PASSPHRASE": passphrase, "Content-Type": "application/json" },
+      ...NO_RETRY,
     });
     const failed = exchange === "okx" ? data.code !== "0" || data.data?.[0]?.sCode !== "0" : data.code !== "00000";
     if (failed) throw new Error(data.data?.[0]?.sMsg || data.msg || `${exchange.toUpperCase()} manual close failed.`);
@@ -1505,6 +2069,7 @@ export async function attachBinanceTpSl(
           signature: sign(query),
         },
         headers: { "X-MBX-APIKEY": apiKey },
+        ...NO_RETRY,
       });
       return String(data.algoId);
     };
@@ -1540,4 +2105,21 @@ export async function getExchangeBalance(
     (error as any).exchange = exchange;
     throw error;
   }
+}
+
+
+export async function getExchangeAvailableBalance(
+  exchange: ExchangeId,
+  credentials: RawCredentials,
+): Promise<number> {
+  const balanceData = await getExchangeBalance(exchange, credentials);
+  const candidate =
+    balanceData.availableUsdt ??
+    balanceData.balances.find((b) => b.asset === "USDT")?.free ??
+    balanceData.totalUsdtEquivalent;
+  const num = candidate !== null && candidate !== undefined ? parseFloat(candidate) : NaN;
+  if (!Number.isFinite(num) || num < 0) {
+    throw new Error(`Available USDT balance could not be verified for ${exchange}.`);
+  }
+  return num;
 }

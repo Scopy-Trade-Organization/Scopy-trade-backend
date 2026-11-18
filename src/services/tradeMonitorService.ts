@@ -68,7 +68,8 @@ type MonitoringStatus =
   | "connected"
   | "reconnecting"
   | "disconnected"
-  | "unsupported";
+  | "unsupported"
+  | "review_required";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -1160,6 +1161,22 @@ export class TradeMonitorService extends EventEmitter {
         console.warn(
           `[TradeMonitor][Binance] Trade ${monitored.tradeId} was already filled before startup but has ${existingProtectionIds.length} open protection orders; refusing to create replacement orders without a confirmed open position.`,
         );
+        await Trade.updateOne(
+          { _id: monitored.tradeId },
+          {
+            $set: {
+              wsMonitoringActive: false,
+              monitoringStatus: "review_required",
+              monitoringError: `Binance position filled but only ${existingProtectionIds.length} protection orders found. Manual review required.`,
+            },
+          },
+        );
+        this.emit("monitoringUpdate", {
+          tradeId: monitored.tradeId,
+          wsMonitoringActive: false,
+          monitoringStatus: "review_required",
+          monitoringError: `Binance position filled but only ${existingProtectionIds.length} protection orders found. Manual review required.`,
+        });
         return;
       }
 
@@ -1211,11 +1228,28 @@ export class TradeMonitorService extends EventEmitter {
         },
       );
     } catch (err) {
-      monitored.protectionSetupStarted = false;
+      monitored.protectionSetupStarted = true;
+      const errMsg = err instanceof Error ? err.message : String(err);
       console.error(
         `[TradeMonitor][Binance] Failed to attach TP/SL for ${monitored.tradeId}:`,
         err,
       );
+      await Trade.updateOne(
+        { _id: monitored.tradeId },
+        {
+          $set: {
+            wsMonitoringActive: false,
+            monitoringStatus: "review_required",
+            monitoringError: `TP/SL protection attachment failed: ${errMsg}`,
+          },
+        },
+      );
+      this.emit("monitoringUpdate", {
+        tradeId: monitored.tradeId,
+        wsMonitoringActive: false,
+        monitoringStatus: "review_required",
+        monitoringError: `TP/SL protection attachment failed: ${errMsg}`,
+      });
     }
   }
 
@@ -1445,8 +1479,7 @@ export class TradeMonitorService extends EventEmitter {
       return;
     }
 
-    const wsUrl =
-      process.env.BITGET_WS_URL || "wss://ws.bitget.com/v2/ws/private";
+    const wsUrl = getExchangeWebSocketUrl("bitget");
 
     try {
       const ws = new WebSocket(wsUrl);

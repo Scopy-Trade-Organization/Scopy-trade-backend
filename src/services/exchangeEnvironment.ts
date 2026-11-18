@@ -2,10 +2,16 @@ import { ExchangeId } from "../types/index.js";
 
 export type ExchangeMode = "testnet" | "live";
 
+/**
+ * Returns the current exchange mode.
+ * Safe default: Only explicitly setting EXCHANGE_MODE=live enables real-money live trading.
+ * If EXCHANGE_MODE is unset, empty, or set to anything other than "live", "testnet" is used.
+ * This prevents accidental real-money trading when configuration is missing.
+ */
 export function getExchangeMode(): ExchangeMode {
   const configured = process.env.EXCHANGE_MODE?.trim().toLowerCase();
-  if (configured === "live" || configured === "testnet") return configured;
-  return process.env.NODE_ENV === "production" ? "live" : "testnet";
+  if (configured === "live") return "live";
+  return "testnet";
 }
 
 export function isTestnet(): boolean {
@@ -34,30 +40,39 @@ export function getExchangeRestUrl(exchange: ExchangeId): string {
     case "okx":
       return configuredUrl("OKX_API_URL", "https://www.okx.com");
     case "bitget":
-      return configuredUrl("BITGET_API_URL", "https://api.bitget.com");
+      return configuredUrl(
+        "BITGET_API_URL",
+        process.env.BITGET_BASE_URL?.trim() || "https://api.bitget.com",
+      );
   }
 }
 
-export function getExchangeWebSocketUrl(
-  exchange: "binance" | "bybit",
-): string {
+export function getExchangeWebSocketUrl(exchange: ExchangeId): string {
   const testnet = isTestnet();
 
-  if (exchange === "binance") {
-    return testnet
-      ? configuredUrl(
-          "BINANCE_FUTURES_TEST_WS_URL",
-          "wss://fstream.binancefuture.com",
-        )
-      : configuredUrl("BINANCE_WS_URL", "wss://fstream.binance.com");
+  switch (exchange) {
+    case "binance":
+      return testnet
+        ? configuredUrl(
+            "BINANCE_FUTURES_TEST_WS_URL",
+            "wss://fstream.binancefuture.com",
+          )
+        : configuredUrl("BINANCE_WS_URL", "wss://fstream.binance.com");
+    case "bybit":
+      return testnet
+        ? configuredUrl(
+            "BYBIT_TEST_WS_URL",
+            "wss://stream-testnet.bybit.com/v5/private",
+          )
+        : configuredUrl("BYBIT_WS_URL", "wss://stream.bybit.com/v5/private");
+    case "bitget":
+      return configuredUrl(
+        "BITGET_WS_URL",
+        "wss://ws.bitget.com/v2/ws/private",
+      );
+    case "okx":
+      return configuredUrl("OKX_WS_URL", "wss://ws.okx.com:8443/ws/v5/private");
   }
-
-  return testnet
-    ? configuredUrl(
-        "BYBIT_TEST_WS_URL",
-        "wss://stream-testnet.bybit.com/v5/private",
-      )
-    : configuredUrl("BYBIT_WS_URL", "wss://stream.bybit.com/v5/private");
 }
 
 export function shouldRebaseTestnetSignals(): boolean {
@@ -66,14 +81,17 @@ export function shouldRebaseTestnetSignals(): boolean {
 }
 
 // ─── Exchange demo/simulated modes ─────────────────────────────────────────────
-// Bitget and OKX expose their paper-trading environments through a request
-// header rather than a separate base URL, so demo selection is a header concern.
-// Both helpers fail safe: OKX defaults to simulated (a real withdrawal only
-// fires when OKX_DEMO_MODE is explicitly "false"), matching the previously
-// hard-coded behaviour while finally making live OKX operations reachable.
+// Bitget and OKX expose paper-trading environments through request headers
+// rather than a separate base URL, so demo selection is a header concern.
+// Both helpers fail safe:
+// - OKX defaults to simulated (a real withdrawal/trade only fires when OKX_DEMO_MODE is "false").
+// - Bitget uses BITGET_DEMO_MODE override if provided; otherwise falls back to isTestnet().
 
 export function isBitgetDemo(): boolean {
-  return process.env.BITGET_DEMO_MODE === "true";
+  const demoOverride = process.env.BITGET_DEMO_MODE?.trim().toLowerCase();
+  if (demoOverride === "true") return true;
+  if (demoOverride === "false") return false;
+  return isTestnet();
 }
 
 export function isOkxDemo(): boolean {

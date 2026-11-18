@@ -6,6 +6,10 @@ import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import {
   placeOrder,
   getCurrentPrice,
+  getExchangeAvailableBalance,
+  getFuturesContractRules,
+  alignToStep,
+  OrderExecutionError,
 } from "../services/tradeService.js";
 import { ExchangeId } from "../types/index.js";
 import { decryptCredentials } from "../services/exchangeConnectionService.js";
@@ -24,11 +28,14 @@ import { queueTradeEmail } from "../services/emailService.js";
 import { getProfitShareSummary } from "../services/profitSharingService.js";
 import { triggerCopiedTradeClosures } from "./copiedTradeUpdateService.js";
 
-
 export type TradeOutcome = { status: number; body: Record<string, any> };
 const tradeOutcome = (status: number, body: Record<string, any>): TradeOutcome => ({ status, body });
 
-export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record<string, any>, isProTrade: boolean): Promise<TradeOutcome> {
+export async function executeTrade(
+  userId: mongoose.Types.ObjectId,
+  body: Record<string, any>,
+  isProTrade: boolean,
+): Promise<TradeOutcome> {
   let orderSubmitted = false;
   try {
     const {
@@ -82,7 +89,7 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
           message: "pair, entry, tp, sl, and direction are required.",
         });
       }
-      if (!['buy', 'sell'].includes(direction)) {
+      if (!["buy", "sell"].includes(direction)) {
         return tradeOutcome(400, {
           success: false,
           message: "direction must be either buy or sell.",
@@ -185,9 +192,6 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
     }
 
     // ── 4. Guard against duplicate trade ─────────────────────────────────────
-    // Futures exchanges maintain a position per symbol on an account. Keeping
-    // one active local trade per pair/connection lets WebSocket and REST
-    // reconciliation unambiguously associate an exchange close with this trade.
     const activePairTrade = await Trade.findOne({
       exchangeConnectionId,
       pair: signal.pair,
@@ -209,13 +213,12 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
     if (existing) {
       return tradeOutcome(409, {
         success: false,
-        message:
-          "You have already copied this pro trade on this exchange.",
+        message: "You have already copied this pro trade on this exchange.",
         trade: { _id: existing._id, status: existing.status },
       });
     }
 
-    // ── 5. Decrypt credentials ───────────────────────────────────────────────
+    // ── 5. Decrypt credentials & verify available exchange funds ─────────────
     const storedCreds = {
       exchange: connection.exchange as ExchangeId,
       apiKey: connection.encryptedApiKey!,
@@ -227,6 +230,39 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
 
     const rawCreds = decryptCredentials(storedCreds);
 
+    let availableFunds: number;
+    try {
+      availableFunds = await getExchangeAvailableBalance(
+        connection.exchange as ExchangeId,
+        rawCreds,
+      );
+    } catch (balErr) {
+      const message =
+        balErr instanceof Error
+          ? balErr.message
+          : "Available exchange balance verification failed.";
+      console.error("[initiateTrade] Balance verification error:", message);
+      return tradeOutcome(502, {
+        message: "Failed to verify available exchange balance.",
+        detail: message,
+      });
+    }
+
+    if (!Number.isFinite(availableFunds) || availableFunds <= 0) {
+      return tradeOutcome(422, {
+        message: "No available futures margin on connected exchange account.",
+      });
+    }
+
+    // Preserve subscription allocation: use allocation for copies, but enforce available funds cap
+    const effectiveBalance = Math.min(parsedBalance, availableFunds);
+    if (effectiveBalance <= 0) {
+      return tradeOutcome(422, {
+        message: "Effective balance for trade sizing is zero or negative.",
+      });
+    }
+
+    // ── 5b. Fetch current market price ───────────────────────────────────────
     let currentPriceResult;
     try {
       currentPriceResult = await getCurrentPrice(
@@ -282,7 +318,24 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
       });
     }
 
-    // ── 6. Position sizing — 2% risk model ───────────────────────────────────
+    // ── 6. Fetch contract specifications & apply 2% risk model ───────────────
+    let contractRules;
+    try {
+      contractRules = await getFuturesContractRules(
+        connection.exchange as ExchangeId,
+        signal.pair,
+      );
+    } catch (rulesErr) {
+      const message =
+        rulesErr instanceof Error
+          ? rulesErr.message
+          : "Contract rules lookup failed.";
+      return tradeOutcome(502, {
+        message: "Failed to retrieve exchange contract rules.",
+        detail: message,
+      });
+    }
+
     const testnetScale = rebaseForTestnet
       ? currentPrice / signalEntryPrice
       : 1;
@@ -291,42 +344,117 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
       : signalEntryPrice;
     const executionTpPrice = parseFloat(signal.tp) * testnetScale;
     const executionSlPrice = parseFloat(signal.sl) * testnetScale;
+
+    // Align prices to exchange price tick
+    const alignedEntry = alignToStep(String(executionEntryPrice), contractRules.tickSize);
+    const alignedTp = alignToStep(String(executionTpPrice), contractRules.tickSize);
+    const alignedSl = alignToStep(String(executionSlPrice), contractRules.tickSize);
+
     const validLevels =
-      Number.isFinite(executionTpPrice) &&
-      Number.isFinite(executionSlPrice) &&
-      executionTpPrice > 0 &&
-      executionSlPrice > 0 &&
+      Number.isFinite(Number(alignedTp)) &&
+      Number.isFinite(Number(alignedSl)) &&
+      Number(alignedTp) > 0 &&
+      Number(alignedSl) > 0 &&
       (signal.direction === "buy"
-        ? executionSlPrice < executionEntryPrice &&
-          executionEntryPrice < executionTpPrice
-        : executionTpPrice < executionEntryPrice &&
-          executionEntryPrice < executionSlPrice);
+        ? Number(alignedSl) < Number(alignedEntry) &&
+          Number(alignedEntry) < Number(alignedTp)
+        : Number(alignedTp) < Number(alignedEntry) &&
+          Number(alignedEntry) < Number(alignedSl));
+
     if (!validLevels) {
       return tradeOutcome(422, {
         message:
           "Signal price levels are invalid for its direction. A long requires SL < entry < TP; a short requires TP < entry < SL.",
       });
     }
-    const priceDistance = Math.abs(executionEntryPrice - executionSlPrice);
 
+    const priceDistance = Math.abs(Number(alignedEntry) - Number(alignedSl));
     if (!Number.isFinite(priceDistance) || priceDistance <= 0) {
       return tradeOutcome(422, {
         message:
-          "Cannot calculate position size: entry and stop-loss prices are too close or identical.",
+          "Cannot calculate position size: entry and stop-loss prices are too close or identical after tick alignment.",
       });
     }
 
-    const riskAmount = parsedBalance * MAX_RISK_PERCENT;
-    const quantity = riskAmount / priceDistance;
-    const parsedQty = parseFloat(quantity.toFixed(6));
+    // 2% risk calculation:
+    // riskAmount = effectiveBalance * MAX_RISK_PERCENT (0.02)
+    // quantity = riskAmount / (abs(entry - stopLoss) * contractMultiplier)
+    const multiplier = Number(contractRules.multiplier);
+    const qtyStep = Number(contractRules.qtyStep);
 
-    if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
+    if (
+      !Number.isFinite(effectiveBalance) || effectiveBalance <= 0 ||
+      !Number.isFinite(priceDistance) || priceDistance <= 0 ||
+      !Number.isFinite(multiplier) || multiplier <= 0 ||
+      !Number.isFinite(qtyStep) || qtyStep <= 0
+    ) {
+      return tradeOutcome(422, {
+        message: "Invalid contract or sizing parameters: balance, price distance, multiplier, or quantity step is invalid.",
+      });
+    }
+
+    const riskAmount = effectiveBalance * MAX_RISK_PERCENT;
+    if (!Number.isFinite(riskAmount) || riskAmount <= 0) {
+      return tradeOutcome(422, {
+        message: "Calculated risk amount is invalid.",
+      });
+    }
+
+    const rawQuantity = riskAmount / (priceDistance * multiplier);
+    if (!Number.isFinite(rawQuantity) || rawQuantity <= 0) {
       return tradeOutcome(422, {
         message: "Calculated order quantity is invalid.",
       });
     }
 
-    // ── 6. Place the order on the exchange ───────────────────────────────────
+    // Safe rounding: round DOWN to lot step to ensure risk never exceeds 2%
+    let stepUnits = Math.floor(rawQuantity / qtyStep + 1e-12);
+    let safeQuantityNum = stepUnits * qtyStep;
+    let safeQuantity = alignToStep(String(safeQuantityNum), contractRules.qtyStep, true);
+
+    // Iteratively ensure actual risk is <= riskAmount (strictly <= without margin for error)
+    while (
+      stepUnits > 0 &&
+      (Number(safeQuantity) * priceDistance * multiplier > riskAmount || Number(safeQuantity) <= 0)
+    ) {
+      stepUnits--;
+      safeQuantityNum = stepUnits * qtyStep;
+      safeQuantity = alignToStep(String(safeQuantityNum), contractRules.qtyStep, true);
+    }
+
+    // Final unconditional risk check on exact exchange-aligned parameters
+    const finalQuantityNum = Number(safeQuantity);
+    const finalPriceDistance = Math.abs(Number(alignedEntry) - Number(alignedSl));
+    const finalActualRisk = finalQuantityNum * finalPriceDistance * multiplier;
+
+    if (
+      !Number.isFinite(finalQuantityNum) ||
+      finalQuantityNum <= 0 ||
+      !Number.isFinite(finalActualRisk) ||
+      finalActualRisk > riskAmount
+    ) {
+      return tradeOutcome(422, {
+        message: "Calculated order quantity violates the 2% maximum risk limit.",
+        actualRisk: finalActualRisk,
+        maxRiskAllowed: riskAmount,
+      });
+    }
+
+    // Verify exchange minimum requirements - NEVER increase quantity if it breaches 2% risk!
+    if (finalQuantityNum < Number(contractRules.minQty)) {
+      return tradeOutcome(422, {
+        message: `Calculated quantity (${safeQuantity}) is below ${connection.exchange} minimum order quantity (${contractRules.minQty}) for ${signal.pair}. Increase allocation or balance to satisfy exchange minimums within the 2% risk limit.`,
+      });
+    }
+
+    const orderNotional = finalQuantityNum * Number(alignedEntry);
+    if (orderNotional < Number(contractRules.minNotional)) {
+      return tradeOutcome(422, {
+        message: `Calculated order notional (${orderNotional.toFixed(2)} USDT) is below ${connection.exchange} minimum notional requirement (${contractRules.minNotional} USDT) for ${signal.pair}. Increase allocation or balance to satisfy exchange minimums within the 2% risk limit.`,
+      });
+    }
+
+    // ── 7. Place the order on the exchange ───────────────────────────────────
     const exchangeClientOrderId = `sc_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     let placed;
     try {
@@ -335,12 +463,40 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
         pair: signal.pair,
         direction: signal.direction as "buy" | "sell",
         clientOrderId: exchangeClientOrderId,
-        quantity: String(parsedQty),
-        entryPrice: String(executionEntryPrice),
-        tp: String(executionTpPrice),
-        sl: String(executionSlPrice),
+        quantity: safeQuantity,
+        entryPrice: alignedEntry,
+        tp: alignedTp,
+        sl: alignedSl,
       });
     } catch (orderErr) {
+      if (orderErr instanceof OrderExecutionError) {
+        console.error(`[initiateTrade] ${orderErr.classification}:`, {
+          exchange: orderErr.exchange,
+          status: orderErr.status,
+          code: orderErr.exchangeCode,
+          clientOrderId: orderErr.clientOrderId,
+          message: orderErr.originalMessage,
+        });
+
+        if (orderErr.classification === "AMBIGUOUS_OUTCOME") {
+          return tradeOutcome(502, {
+            message: "Order placement outcome is ambiguous due to network or exchange interruption. Manual review required.",
+            code: "ORDER_REVIEW_REQUIRED",
+            exchange: orderErr.exchange,
+            clientOrderId: orderErr.clientOrderId,
+            detail: orderErr.originalMessage,
+          });
+        }
+
+        // Confirmed rejection: do not require manual review, do not lock automatic copy queue
+        return tradeOutcome(422, {
+          message: orderErr.message,
+          code: "ORDER_REJECTED",
+          exchange: orderErr.exchange,
+          detail: orderErr.originalMessage,
+        });
+      }
+
       const message =
         orderErr instanceof Error
           ? orderErr.message
@@ -353,51 +509,131 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
       });
     }
 
-    // ── 7. Persist trade record ──────────────────────────────────────────────
+    // ── 8. Persist trade record ──────────────────────────────────────────────
     orderSubmitted = true;
+
+    // Persist signal for pro trade (if signal.save fails, don't abort since order was accepted by exchange)
     if (isProTrade) {
-      await signal.save();
+      try {
+        await signal.save();
+      } catch (signalErr) {
+        console.error("[initiateTrade] Warning: Signal save failed after exchange acceptance:", {
+          exchangeOrderId: placed.orderId,
+          clientOrderId: exchangeClientOrderId,
+          error: signalErr instanceof Error ? signalErr.message : signalErr,
+        });
+      }
     }
 
-    const trade = await Trade.create({
-      userId,
-      pair: signal.pair,
-      direction: signal.direction,
-      tp: placed.execution?.tp ?? String(executionTpPrice),
-      sl: placed.execution?.sl ?? String(executionSlPrice),
-      signalId,
-      tradeOrigin: isProTrade ? "pro" : "copy",
-      sourceTradeId: isProTrade ? null : sourceTradeId,
-      exchangeConnectionId,
-      exchangeOrderId: placed.orderId,
-      exchangeClientOrderId,
-      quantity: placed.execution?.quantity ?? String(parsedQty),
-      entryPrice:
-        placed.execution?.entryPrice ?? String(executionEntryPrice),
-      status: "pending",
-      wsMonitoringActive: false,
-      monitoringStatus: "connecting",
-      monitoringError: null,
-      rawOrderResponse: {
-        order: placed.raw,
-        marketPrice: currentPriceResult.raw,
-        sizing: {
-          balance: parsedBalance,
-          riskPercent: MAX_RISK_PERCENT,
-          riskAmount,
-          priceDistance,
-          currentPrice: currentPriceResult.price,
-          deviation,
-          exchangeMode: getExchangeMode(),
-          signalPricesRebased: rebaseForTestnet,
-          originalSignalPrices: {
-            entry: signal.entry,
-            tp: signal.tp,
-            sl: signal.sl,
+    let trade;
+    try {
+      trade = await Trade.create({
+        userId,
+        pair: signal.pair,
+        direction: signal.direction,
+        tp: placed.execution?.tp ?? alignedTp,
+        sl: placed.execution?.sl ?? alignedSl,
+        signalId,
+        tradeOrigin: isProTrade ? "pro" : "copy",
+        sourceTradeId: isProTrade ? null : sourceTradeId,
+        exchangeConnectionId,
+        exchangeOrderId: placed.orderId,
+        exchangeClientOrderId,
+        quantity: placed.execution?.quantity ?? safeQuantity,
+        entryPrice: placed.execution?.entryPrice ?? alignedEntry,
+        status: "pending",
+        wsMonitoringActive: false,
+        monitoringStatus: "connecting",
+        monitoringError: null,
+        rawOrderResponse: {
+          order: placed.raw,
+          marketPrice: currentPriceResult.raw,
+          sizing: {
+            requestedBalance: parsedBalance,
+            availableFunds,
+            effectiveBalance,
+            riskPercent: MAX_RISK_PERCENT,
+            riskAmount,
+            actualRisk: finalActualRisk,
+            contractMultiplier: multiplier,
+            priceDistance: finalPriceDistance,
+            currentPrice: currentPriceResult.price,
+            deviation,
+            exchangeMode: getExchangeMode(),
+            signalPricesRebased: rebaseForTestnet,
+            originalSignalPrices: {
+              entry: signal.entry,
+              tp: signal.tp,
+              sl: signal.sl,
+            },
           },
         },
-      },
-    });
+      });
+    } catch (persistErr) {
+      console.error("[initiateTrade] CRITICAL: Exchange order submitted but DB persistence failed:", {
+        exchange: connection.exchange,
+        exchangeOrderId: placed.orderId,
+        clientOrderId: exchangeClientOrderId,
+        error: persistErr instanceof Error ? persistErr.message : persistErr,
+      });
+
+      // Avoid creating duplicate trade records if one already exists
+      try {
+        trade = await Trade.findOne({
+          $or: [
+            { exchangeOrderId: placed.orderId },
+            { exchangeClientOrderId },
+          ],
+        });
+      } catch (findErr) {
+        // ignore
+      }
+
+      if (!trade) {
+        try {
+          trade = await Trade.create({
+            userId,
+            pair: signal.pair,
+            direction: signal.direction,
+            tp: placed.execution?.tp ?? alignedTp,
+            sl: placed.execution?.sl ?? alignedSl,
+            signalId,
+            tradeOrigin: isProTrade ? "pro" : "copy",
+            sourceTradeId: isProTrade ? null : sourceTradeId,
+            exchangeConnectionId,
+            exchangeOrderId: placed.orderId,
+            exchangeClientOrderId,
+            quantity: placed.execution?.quantity ?? safeQuantity,
+            entryPrice: placed.execution?.entryPrice ?? alignedEntry,
+            status: "pending",
+            wsMonitoringActive: false,
+            monitoringStatus: "review_required",
+            monitoringError: "Database persistence error after exchange submission; review required.",
+          });
+        } catch (emergencyErr) {
+          console.error("[initiateTrade] CRITICAL PERSISTENCE FAILURE - Emergency persistence failed:", {
+            exchange: connection.exchange,
+            exchangeOrderId: placed.orderId,
+            clientOrderId: exchangeClientOrderId,
+            userId: String(userId),
+            pair: signal.pair,
+            direction: signal.direction,
+            quantity: safeQuantity,
+            entryPrice: alignedEntry,
+            error: emergencyErr instanceof Error ? emergencyErr.message : emergencyErr,
+          });
+        }
+      }
+
+      return tradeOutcome(500, {
+        success: false,
+        code: "ORDER_REVIEW_REQUIRED",
+        message: "Order was placed on exchange, but trade record could not be confirmed. Manual review required.",
+        exchangeOrderId: placed.orderId,
+        clientOrderId: exchangeClientOrderId,
+        exchange: connection.exchange,
+      });
+    }
 
     queueTradeEmail(userId, isProTrade ? "opened" : "copied", {
       pair: trade.pair,
@@ -458,7 +694,9 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
     });
   } catch (err) {
     console.error("[initiateTrade]", err);
-    return tradeOutcome(500, { message: "Internal server error.", ...(orderSubmitted ? { code: "ORDER_REVIEW_REQUIRED" } : {}) });
+    return tradeOutcome(500, {
+      message: "Internal server error.",
+      ...(orderSubmitted ? { code: "ORDER_REVIEW_REQUIRED" } : {}),
+    });
   }
 }
-
