@@ -5,7 +5,6 @@ import {
   ExchangeId,
   EncryptedCredentials,
   AccountInfo,
-  BinanceAccountInfo,
   BybitAccountInfo,
   OkxAccountInfo,
   BitgetAccountInfo,
@@ -22,7 +21,7 @@ axiosRetry(http, {
   retries: 2,
   retryDelay: axiosRetry.exponentialDelay,
   retryCondition: (error) =>
-    axiosRetry.isNetworkError(error) || (error.response?.status ?? 0) >= 500,
+    (error.config?.method?.toLowerCase() === "get") && (axiosRetry.isNetworkError(error) || (error.response?.status ?? 0) >= 500),
 });
 
 function normalizeError(err: unknown): Error {
@@ -117,41 +116,6 @@ type Validator<T extends AccountInfo> = (
   credentials: RawCredentials,
 ) => Promise<T>;
 
-const validateBinance: Validator<BinanceAccountInfo> = async ({
-  apiKey,
-  apiSecret,
-}) => {
-  try {
-    const baseUrl = getExchangeRestUrl("binance");
-    const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
-    const timestamp = timeData.serverTime;
-    const queryString = `timestamp=${timestamp}`;
-    const signature = crypto
-      .createHmac("sha256", apiSecret)
-      .update(queryString)
-      .digest("hex");
-
-    const { data } = await http.get<BinanceAccountInfo & { canTrade: boolean }>(
-      `${baseUrl}/fapi/v2/account`,
-      {
-        params: { timestamp, signature },
-        headers: { "X-MBX-APIKEY": apiKey },
-        timeout: 8000,
-      },
-    );
-    if (!data.canTrade)
-      throw new Error("API key does not have trading permissions enabled.");
-    return {
-      accountType: "USD-M_FUTURES",
-      canTrade: data.canTrade,
-      canWithdraw: false,
-      permissions: ["FUTURES"],
-    };
-  } catch (err) {
-    throw normalizeError(err);
-  }
-};
-
 const validateBybit: Validator<BybitAccountInfo> = async ({
   apiKey,
   apiSecret,
@@ -193,8 +157,7 @@ const validateBybit: Validator<BybitAccountInfo> = async ({
 
     const info = data.result;
 
-    const hasTradePermission =
-      info.permissions?.Derivatives?.includes("DerivativesTrade") ?? false;
+    const hasTradePermission = info.readOnly === 0 && (info.permissions?.Derivatives?.includes("DerivativesTrade") || (info.permissions?.ContractTrade?.includes("Order") && info.permissions?.ContractTrade?.includes("Position")));
 
     if (!hasTradePermission)
       throw new Error(
@@ -230,10 +193,10 @@ const validateOkx: Validator<OkxAccountInfo> = async ({
     interface OkxResponse {
       code: string;
       msg: string;
-      data: Array<{ acctLv: string; posMode: string; uid: string }>;
+      data: Array<{ acctLv: string; posMode: string; uid: string; perm: string }>;
     }
 
-    const { data } = await http.get<OkxResponse>("https://www.okx.com" + path, {
+    const { data } = await http.get<OkxResponse>(getExchangeRestUrl("okx") + path, {
       headers: {
         "OK-ACCESS-KEY": apiKey,
         "OK-ACCESS-SIGN": signature,
@@ -249,6 +212,7 @@ const validateOkx: Validator<OkxAccountInfo> = async ({
     const config = data.data[0];
     if (!config)
       throw new Error("OKX returned an empty configuration response.");
+    if (!config.perm?.split(",").includes("trade")) throw new Error("OKX API key needs Trade permission.");
     return {
       accountLevel: config.acctLv,
       posMode: config.posMode,
@@ -306,17 +270,11 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
     const info = data.data as any;
     if (!info) throw new Error("Bitget returned an empty response.");
 
-    const hasTradePermission =
-      info.authorities && Array.isArray(info.authorities)
-        ? info.authorities.some((a: string) =>
-            ["trade", "TRADE", "spot", "futures", "stow", "coow"].includes(a),
-          )
-        : true;
-
-    if (!hasTradePermission)
-      throw new Error(
-        "API key does not have trading permissions. Enable Spot or Futures trading in Bitget API settings.",
-      );
+    const hasTradePermission = Array.isArray(info.authorities) && info.authorities.includes("coow") && info.authorities.includes("cpow");
+    if (!hasTradePermission) throw new Error("Bitget API key needs futures order and position Read/Write permissions (coow and cpow).");
+    // Verify access to futures assets as well as key metadata. No balance fallback.
+    const { exchangeApi } = await import("./exchangeApiService.js");
+    await exchangeApi("bitget", { apiKey, apiSecret, passphrase })("GET", "/api/v2/mix/account/accounts", { productType: "USDT-FUTURES" });
 
     return {
       userId: info.userId || "bitget-user",
@@ -327,15 +285,6 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
       trader: info.trader || false,
     };
   } catch (error) {
-    if (axios.isAxiosError(error) && error.response) {
-      console.error(
-        "Bitget API Error Response:",
-        JSON.stringify(error.response.data, null, 2),
-      );
-      throw new Error(
-        "Bitget validation failed: " + JSON.stringify(error.response.data),
-      );
-    }
     throw normalizeError(error);
   }
 };
@@ -343,7 +292,6 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
 // ─── Validator Registry ───────────────────────────────────────────────────────
 
 const validators: Record<ExchangeId, Validator<AccountInfo>> = {
-  binance: validateBinance,
   bybit: validateBybit,
   okx: validateOkx,
   bitget: validateBitget,

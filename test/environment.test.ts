@@ -20,10 +20,10 @@ function withEnv(values: Record<string, string | undefined>, run: () => void) {
 
 test("one exchange mode selects matching REST, WebSocket, and simulated-header environments", () => {
   for (const mode of ["testnet", "live"] as const) {
-    withEnv({ EXCHANGE_MODE: mode, BINANCE_API_URL: undefined, BINANCE_FUTURES_TEST_API_URL: undefined, BYBIT_WS_URL: undefined, BYBIT_TEST_WS_URL: undefined }, () => {
+    withEnv({ EXCHANGE_MODE: mode, BYBIT_WS_URL: undefined, BYBIT_TEST_WS_URL: undefined }, () => {
       assert.equal(isBitgetDemo(), mode === "testnet");
       assert.equal(isOkxDemo(), mode === "testnet");
-      assert.equal(getExchangeRestUrl("binance"), mode === "testnet" ? "https://testnet.binancefuture.com" : "https://fapi.binance.com");
+      assert.equal(getExchangeRestUrl("bybit"), mode === "testnet" ? "https://api-testnet.bybit.com" : "https://api.bybit.com");
       assert.equal(getExchangeWebSocketUrl("bybit"), mode === "testnet" ? "wss://stream-testnet.bybit.com/v5/private" : "wss://stream.bybit.com/v5/private");
     });
   }

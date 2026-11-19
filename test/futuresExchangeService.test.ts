@@ -1,0 +1,119 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { getFuturesContext, configureLeverage, refreshAvailableFuturesBalance, futuresSymbol } from "../src/services/futuresExchangeService.js";
+import { calculateTradeRisk, TradeRiskError } from "../src/services/tradeRiskService.js";
+import type { ExchangeId } from "../src/types/index.js";
+import type { ExchangeRequest } from "../src/services/exchangeApiService.js";
+import { exchangeApi } from "../src/services/exchangeApiService.js";
+import { http, validateCredentials } from "../src/services/exchangeConnectionService.js";
+
+const credentials = { apiKey: "test-key", apiSecret: "test-secret", passphrase: "test-passphrase" };
+function fixture(exchange: ExchangeId) {
+  const calls: Array<{ method: string; path: string; values: any }> = [];
+  let leverage = "1", occupied = false, rejectLeverage = false;
+  const responses: Record<string, any> = exchange === "bybit" ? {
+    "/v5/market/instruments-info": { result: { list: [{ symbol: "BTCUSDT", status: "Trading", settleCoin: "USDT", quoteCoin: "USDT", contractType: "LinearPerpetual", lotSizeFilter: { qtyStep: "0.001", minOrderQty: "0.001", maxOrderQty: "100", maxMktOrderQty: "50", minNotionalValue: "5" }, priceFilter: { tickSize: "0.1" }, leverageFilter: { minLeverage: "1", maxLeverage: "100", leverageStep: "1" } }] } },
+    "/v5/account/wallet-balance": { result: { list: [{ totalAvailableBalance: "50", totalEquity: "1000", coin: [{ coin: "USDT", walletBalance: "1000", equity: "1000", locked: "0", totalPositionIM: "950", totalOrderIM: "0" }] }] } },
+    "/v5/account/info": { result: { marginMode: "REGULAR_MARGIN" } },
+    "/v5/account/fee-rate": { result: { list: [{ takerFeeRate: "0.0006" }] } },
+    "/v5/market/risk-limit": { result: { list: [{ symbol: "BTCUSDT", riskLimitValue: "1000000", maxLeverage: "100", maintenanceMargin: "0.005", initialMargin: "0.01" }] } },
+    "/v5/order/realtime": { result: { list: [] } },
+  } : exchange === "okx" ? {
+    "/api/v5/public/instruments": { data: [{ instId: "BTC-USDT-SWAP", state: "live", ctType: "linear", settleCcy: "USDT", ctValCcy: "BTC", ctVal: "0.01", ctMult: "1", lotSz: "0.01", minSz: "0.01", maxLmtSz: "10000", maxMktSz: "1000", tickSz: "0.1", lever: "100" }] },
+    "/api/v5/account/balance": { data: [{ details: [{ ccy: "USDT", eq: "1000", availEq: "50" }] }] },
+    "/api/v5/account/config": { data: [{ posMode: "net_mode", acctLv: "2" }] },
+    "/api/v5/account/trade-fee": { data: [{ takerU: "-0.0006" }] },
+    "/api/v5/public/position-tiers": { data: [{ maxSz: "10000", maxLever: "100", mmr: "0.005", imr: "0.01" }] },
+    "/api/v5/trade/orders-pending": { data: [] }, "/api/v5/trade/orders-algo-pending": { data: [] },
+  } : {
+    "/api/v2/mix/market/contracts": { data: [{ symbol: "BTCUSDT", symbolStatus: "normal", symbolType: "perpetual", quoteCoin: "USDT", supportMarginCoins: ["USDT"], sizeMultiplier: "0.001", minTradeNum: "0.001", maxOrderQty: "100", maxMarketOrderQty: "50", minTradeUSDT: "5", priceEndStep: "1", pricePlace: "1", takerFeeRate: "0.0006", minLever: "1", maxLever: "100", openCostUpRatio: "0.1" }] },
+    "/api/v2/mix/market/query-position-lever": { data: [{ endUnit: "1000000", leverage: "100", keepMarginRate: "0.005" }] },
+    "/api/v2/mix/order/orders-pending": { data: { entrustedList: [] } },
+    "/api/v2/mix/order/orders-plan-pending": { data: { entrustedList: [] } },
+  };
+  const request: ExchangeRequest = async (method, path, values = {}) => {
+    calls.push({ method, path, values });
+    if (method === "POST") {
+      if (rejectLeverage) throw new TradeRiskError("LEVERAGE_REJECTED", "Exchange refused leverage.");
+      leverage = values.buyLeverage || values.lever || values.leverage;
+      return {};
+    }
+    if (path === "/v5/position/list") return { result: { list: [{ positionIdx: 0, size: occupied ? "1" : "0", leverage }] } };
+    if (path === "/api/v5/account/positions") return { data: occupied ? [{ pos: "1" }] : [] };
+    if (path === "/api/v5/account/leverage-info") return { data: [{ lever: leverage, mgnMode: "isolated" }] };
+    if (path === "/api/v2/mix/position/single-position") return { data: occupied ? [{ total: "1", posMode: "one_way_mode" }] : [] };
+    if (path === "/api/v2/mix/account/account") return { data: { available: "1", crossedMaxAvailable: "50", isolatedMaxAvailable: "40", accountEquity: "1000", posMode: "one_way_mode", assetMode: "single", marginMode: "crossed", crossedMarginLeverage: leverage, isolatedLongLever: leverage, isolatedShortLever: leverage } };
+    if (!(path in responses)) throw new Error(`Unexpected request: ${path}`);
+    return responses[path];
+  };
+  return { request, calls, responses, occupy: () => { occupied = true; }, reject: () => { rejectLeverage = true; } };
+}
+for (const exchange of ["bybit", "okx", "bitget"] as const) test(`${exchange}: actual opening balance, native units and its own leverage API`, async () => {
+  const f = fixture(exchange);
+  const context = await getFuturesContext(exchange, credentials, "BTCUSDT", f.request);
+  assert.equal(context.availableBalance, "50");
+  assert.equal(context.accountBalance, "1000");
+  const sizing = calculateTradeRisk({ exchange, ...context, entry: "64755.1", sl: "64949.3", tp: "64000", direction: "sell" });
+  await configureLeverage(exchange, credentials, context, sizing, f.request);
+  const mutation = f.calls.find(call => call.method === "POST")!;
+  assert.equal(mutation.path, exchange === "bybit" ? "/v5/position/set-leverage" : exchange === "okx" ? "/api/v5/account/set-leverage" : "/api/v2/mix/account/set-leverage");
+  if (exchange === "bybit") assert.equal(mutation.values.buyLeverage, mutation.values.sellLeverage);
+  if (exchange === "okx") { assert.equal(mutation.values.mgnMode, "isolated"); assert.equal(mutation.values.instId, "BTC-USDT-SWAP"); }
+  if (exchange === "bitget") assert.equal(mutation.values.productType, "USDT-FUTURES");
+  assert.equal(await refreshAvailableFuturesBalance(exchange, credentials, context, f.request), "50");
+  f.occupy();
+  await assert.rejects(configureLeverage(exchange, credentials, context, sizing, f.request), /already has a position/);
+  assert.equal(f.calls.filter(call => call.method === "POST").length, 1);
+});
+
+test("Bybit isolated balance subtracts position margin, order margin and locked funds", async () => {
+  const f = fixture("bybit");
+  f.responses["/v5/account/info"].result.marginMode = "ISOLATED_MARGIN";
+  assert.equal((await getFuturesContext("bybit", credentials, "BTCUSDT", f.request)).availableBalance, "50");
+  f.responses["/v5/account/wallet-balance"].result.list[0].coin[0].totalOrderIM = undefined;
+  await assert.rejects(getFuturesContext("bybit", credentials, "BTCUSDT", f.request), /Order margin.*unavailable/);
+});
+
+test("unknown portfolio or hedge modes are rejected without silently changing account modes", async () => {
+  const f = fixture("okx");
+  f.responses["/api/v5/account/config"].data[0].posMode = "long_short_mode";
+  await assert.rejects(getFuturesContext("okx", credentials, "BTCUSDT", f.request), /one-way/);
+  assert.equal(f.calls.filter(call => call.method === "POST").length, 0);
+  assert.equal(futuresSymbol("okx", "BTC/USDT"), "BTC-USDT-SWAP");
+});
+
+test("exchange transport signs all three formats and uses demo headers only in testnet", async t => {
+  const previous = process.env.EXCHANGE_MODE;
+  try {
+    t.mock.method(http, "get", async () => ({ data: { retCode: 0, time: 123456789 } }));
+    let options: any;
+    t.mock.method(http, "request", async (value: any) => { options = value; return { data: value.url.includes("bybit") ? { retCode: 0 } : { code: value.url.includes("okx") ? "0" : "00000", data: [] } }; });
+    for (const mode of ["testnet", "live"]) {
+      process.env.EXCHANGE_MODE = mode;
+      for (const exchange of ["bybit", "okx", "bitget"] as const) {
+        await exchangeApi(exchange, credentials)("POST", "/test", { leverage: "5" });
+        assert.equal(options["axios-retry"].retries, 0);
+        assert.equal(options.headers[exchange === "bybit" ? "X-BAPI-API-KEY" : exchange === "okx" ? "OK-ACCESS-KEY" : "ACCESS-KEY"], credentials.apiKey);
+        if (exchange !== "bybit") assert.equal(options.headers[exchange === "okx" ? "x-simulated-trading" : "paptrading"], mode === "testnet" ? "1" : undefined);
+      }
+    }
+  } finally { if (previous === undefined) delete process.env.EXCHANGE_MODE; else process.env.EXCHANGE_MODE = previous; }
+});
+
+test("connection validation requires derivatives permissions, including Bitget positions", async t => {
+  let bybitPermission = true, okxPermission = true, bitgetPermission = true, futuresRead = 0;
+  t.mock.method(http, "get", async (url: string) => ({
+    data: url.endsWith("/v5/market/time") ? { retCode: 0, time: Date.now() }
+      : url.includes("/v5/user/query-api") ? { retCode: 0, result: { readOnly: 0, permissions: { ContractTrade: bybitPermission ? ["Order", "Position"] : ["Order"] } } }
+      : url.includes("/api/v5/account/config") ? { code: "0", data: [{ perm: okxPermission ? "read_only,trade" : "read_only", acctLv: "2", posMode: "net_mode" }] }
+      : { code: "00000", data: { userId: "123", authorities: bitgetPermission ? ["coow", "cpow"] : ["stow", "coow"] } },
+  }));
+  t.mock.method(http, "request", async () => { futuresRead++; return { data: { code: "00000", data: [] } }; });
+  for (const exchange of ["bybit", "okx", "bitget"] as const) await validateCredentials(exchange, credentials);
+  assert.equal(futuresRead, 1);
+  bybitPermission = false; okxPermission = false; bitgetPermission = false;
+  await assert.rejects(validateCredentials("bybit", credentials), /derivatives trading permission/);
+  await assert.rejects(validateCredentials("okx", credentials), /Trade permission/);
+  await assert.rejects(validateCredentials("bitget", credentials), /futures order and position/);
+  assert.equal(futuresRead, 1);
+});

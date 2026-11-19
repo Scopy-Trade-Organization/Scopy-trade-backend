@@ -39,8 +39,8 @@ There are no demo payout balances or modes.
 
 The provider API key must allow chain parameters and Energy estimation or
 constant-contract simulation as well as transaction creation, broadcasting, and
-solidified receipts. The backend also needs access to Binance's public
-`TRXUSDT` price endpoint for fee conversion.
+solidified receipts. The backend also needs access to OKX's public
+`TRX-USDT` spot ticker endpoint for fee conversion.
 
 Wallet verification uses an address-bound email OTP. Adding or changing a payout
 wallet starts a 24-hour withdrawal hold. Pro accounts must be active and verified.
@@ -60,7 +60,7 @@ The dashboard and OTP email display these amounts before confirmation.
 Quotes expire after ten minutes and use live TRON Energy estimates, current
 chain resource prices (with contract simulation when the estimation endpoint is
 disabled), a 25% Energy allowance, and a 1,024-byte bandwidth budget.
-TRX costs are converted to USDT using Binance's public live TRX/USDT price,
+TRX costs are converted to USDT using OKX's public live TRX/USDT spot price,
 rounded up to micro-units and locked to the quote. Estimation or pricing errors
 prevent approval; there is no free-fee fallback. The quote must leave a positive
 payout. The Energy budget remains capped at 100 TRX.

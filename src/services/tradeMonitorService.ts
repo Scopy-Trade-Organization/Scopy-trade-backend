@@ -1,9 +1,9 @@
+import { enforceStoredTradeProtection } from "./tradeProtectionService.js";
 /**
  * tradeMonitorService.ts
  *
  * Manages per-trade WebSocket connections to exchanges for real-time monitoring.
- * Supports every exchange currently enabled for trading: Binance USD-M
- * Futures and Bybit linear futures.
+ * Supports Bybit, OKX and Bitget USDT futures.
  *
  * Architecture:
  * - One WebSocket connection per exchange per user (shared across trades)
@@ -17,15 +17,8 @@ import { EventEmitter } from "events";
 import { Trade } from "../models/tradeModel.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import { decryptCredentials } from "./exchangeConnectionService.js";
-import { http } from "./exchangeConnectionService.js";
-import { processTradeClose } from "./profitSharingService.js";
 import { ExchangeId } from "../types/index.js";
-import {
-  getExchangeRestUrl,
-  getExchangeWebSocketUrl,
-  isOkxDemo,
-} from "./exchangeEnvironment.js";
-import { attachBinanceTpSl, getOrderStatus } from "./tradeService.js";
+import { getExchangeWebSocketUrl } from "./exchangeEnvironment.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -73,7 +66,6 @@ type MonitoringStatus =
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const MAX_RECONNECT_DELAY_MS = 60000;
-const BINANCE_LISTENKEY_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
 const BITGET_PING_INTERVAL_MS = 30000;
 const RECONCILIATION_INTERVAL_MS = 60 * 1000;
 
@@ -81,8 +73,6 @@ const RECONCILIATION_INTERVAL_MS = 60 * 1000;
 
 export class TradeMonitorService extends EventEmitter {
   private connections: Map<string, ExchangeWsConnection> = new Map();
-  private binanceListenKeys: Map<string, string> = new Map(); // connectionId → listenKey
-  private binanceListenKeyTimers: Map<string, NodeJS.Timeout> = new Map();
   private isShuttingDown = false;
   private reconciliationTimer: NodeJS.Timeout | null = null;
   private reconciliationRunning = false;
@@ -99,13 +89,15 @@ export class TradeMonitorService extends EventEmitter {
    * already active for this user+exchange combination.
    */
   async startMonitoring(tradeId: string): Promise<void> {
-    const trade = await Trade.findById(tradeId).lean();
+    let trade = await Trade.findById(tradeId).lean();
     if (!trade) {
       throw new Error(`Trade ${tradeId} not found.`);
     }
 
     if (!trade.exchangeOrderId) {
-      throw new Error(`Trade ${tradeId} has no exchange order ID.`);
+      await enforceStoredTradeProtection(tradeId);
+      trade = await Trade.findById(tradeId).lean();
+      if (!trade?.exchangeOrderId || !["pending", "filled"].includes(trade.status)) throw new Error("Exchange order confirmation requires review; no entry was retried.");
     }
 
     const connection = await ExchangeConnection.findById(
@@ -230,8 +222,8 @@ export class TradeMonitorService extends EventEmitter {
     }
 
     // Streams only deliver events produced after they connect. Reconcile once
-    // so downtime cannot leave an order in a stale state; ongoing monitoring
-    // remains entirely push-based.
+    // so downtime cannot leave an order in a stale state. Periodic REST checks
+    // also verify protection if a stream event is missed.
     await this.reconcileEntryOrder(wsConn!, monitoredTrade);
 
     console.log(
@@ -278,7 +270,6 @@ export class TradeMonitorService extends EventEmitter {
   async resumeActiveMonitoring(): Promise<void> {
     const activeTrades = await Trade.find({
       status: { $in: ["pending", "filled"] },
-      exchangeOrderId: { $ne: null },
     }).lean();
 
     console.log(
@@ -316,7 +307,6 @@ export class TradeMonitorService extends EventEmitter {
     try {
       const trades = await Trade.find({
         status: { $in: ["pending", "filled"] },
-        exchangeOrderId: { $ne: null },
       }).lean();
 
       for (const trade of trades) {
@@ -379,416 +369,9 @@ export class TradeMonitorService extends EventEmitter {
       this.closeConnection(connKey);
     }
 
-    // Clear Binance listenKey timers
-    for (const [, timer] of this.binanceListenKeyTimers) {
-      clearInterval(timer);
-    }
-    this.binanceListenKeyTimers.clear();
-    this.binanceListenKeys.clear();
-
     console.log("[TradeMonitor] Shutdown complete.");
   }
 
-  // ─── Binance Futures WebSocket ──────────────────────────────────────────
-
-  private async connectBinance(wsConn: ExchangeWsConnection): Promise<void> {
-    const { apiKey } = wsConn.credentials;
-    const baseUrl = getExchangeRestUrl("binance");
-    const wsUrl = getExchangeWebSocketUrl("binance");
-
-    try {
-      // 1. Create listenKey via REST
-      const { data: listenKeyData } = await http.post(
-        `${baseUrl}/fapi/v1/listenKey`,
-        null,
-        {
-          headers: { "X-MBX-APIKEY": apiKey },
-        },
-      );
-
-      const listenKey = listenKeyData.listenKey;
-      if (!listenKey) {
-        throw new Error("Binance returned no listenKey.");
-      }
-
-      this.binanceListenKeys.set(wsConn.connectionId, listenKey);
-
-      // 2. Connect to user data stream
-      const ws = new WebSocket(`${wsUrl}/ws/${listenKey}`);
-      wsConn.ws = ws;
-
-      ws.on("open", () => {
-        console.log(
-          `[TradeMonitor][Binance] WS connected for user ${wsConn.userId}`,
-        );
-        wsConn.isConnected = true;
-        wsConn.reconnectAttempts = 0;
-        void this.setConnectionMonitoringState(wsConn, "connected");
-
-        // Keep listenKey alive every 30 minutes
-        const refreshTimer = setInterval(async () => {
-          try {
-            await http.put(`${baseUrl}/fapi/v1/listenKey`, null, {
-              headers: { "X-MBX-APIKEY": apiKey },
-            });
-          } catch (err: any) {
-            console.error(
-              "[TradeMonitor][Binance] Failed to refresh listenKey:",
-              err,
-            );
-          }
-        }, BINANCE_LISTENKEY_REFRESH_MS);
-
-        this.binanceListenKeyTimers.set(wsConn.connectionId, refreshTimer);
-      });
-
-      ws.on("message", async (data: WebSocket.Data) => {
-        try {
-          const msg = JSON.parse(data.toString());
-          if (msg.e === "ALGO_UPDATE") {
-            await this.handleBinanceAlgoMessage(wsConn, msg);
-          } else {
-            await this.handleBinanceMessage(wsConn, msg);
-          }
-        } catch (err: any) {
-          console.error(
-            "[TradeMonitor][Binance] Error processing message:",
-            err,
-          );
-        }
-      });
-
-      ws.on("error", (err) => {
-        console.error("[TradeMonitor][Binance] WS error:", err);
-        void this.setConnectionMonitoringState(
-          wsConn,
-          "reconnecting",
-          err instanceof Error ? err.message : String(err),
-        );
-      });
-
-      ws.on("close", () => {
-        console.log(
-          `[TradeMonitor][Binance] WS disconnected for user ${wsConn.userId}`,
-        );
-        wsConn.isConnected = false;
-        wsConn.ws = null;
-
-        if (!this.isShuttingDown && wsConn.activeTrades.size > 0) {
-          void this.setConnectionMonitoringState(
-            wsConn,
-            "reconnecting",
-            "Exchange WebSocket disconnected.",
-          );
-        }
-
-        // Clean up listenKey timer
-        const timer = this.binanceListenKeyTimers.get(wsConn.connectionId);
-        if (timer) {
-          clearInterval(timer);
-          this.binanceListenKeyTimers.delete(wsConn.connectionId);
-        }
-
-        // Reconnect if there are still active trades
-        if (wsConn.activeTrades.size > 0) {
-          this.scheduleReconnect(wsConn, () => this.connectBinance(wsConn));
-        }
-      });
-    } catch (err: any) {
-      console.error("[TradeMonitor][Binance] Connection error:", err);
-      await this.setConnectionMonitoringState(
-        wsConn,
-        "reconnecting",
-        err instanceof Error ? err.message : String(err),
-      );
-      if (wsConn.activeTrades.size > 0) {
-        this.scheduleReconnect(wsConn, () => this.connectBinance(wsConn));
-      }
-      throw err;
-    }
-  }
-
-  private async handleBinanceMessage(
-    wsConn: ExchangeWsConnection,
-    msg: any,
-  ): Promise<void> {
-    // Binance Futures user data stream event types
-    if (msg.e !== "ORDER_TRADE_UPDATE") return;
-
-    const order = msg.o;
-    if (!order) return;
-
-    const orderId = String(order.i);
-    let monitored = wsConn.activeTrades.get(orderId);
-    let isProtectionOrder =
-      Boolean(monitored && orderId !== monitored.exchangeOrderId) ||
-      order.ot === "TAKE_PROFIT_MARKET" || order.ot === "STOP_MARKET";
-    if (!monitored && isProtectionOrder) {
-      const clientOrderId = String(order.c || "");
-      monitored = [...wsConn.activeTrades.values()].find(
-        (trade) =>
-          (trade.exchangeClientOrderId &&
-            (clientOrderId === `${trade.exchangeClientOrderId}_tp` ||
-              clientOrderId === `${trade.exchangeClientOrderId}_sl`)) ||
-          (!trade.exchangeClientOrderId &&
-            trade.pair.replace(/\//g, "").toUpperCase() ===
-              String(order.s || "").toUpperCase()),
-      );
-      if (monitored) {
-        monitored.protectionTransport ??= "legacy";
-        monitored.protectionOrderIds ??= new Set();
-        monitored.protectionOrderIds.add(orderId);
-        monitored.protectionExitTypes ??= new Map();
-        monitored.protectionExitTypes.set(
-          orderId,
-          order.ot === "TAKE_PROFIT_MARKET" ? "tp" : "sl",
-        );
-        wsConn.activeTrades.set(orderId, monitored);
-      }
-    }
-    if (!monitored) return;
-    isProtectionOrder =
-      isProtectionOrder || orderId !== monitored.exchangeOrderId;
-
-    const statusMap: Record<string, string> = {
-      NEW: "pending",
-      PARTIALLY_FILLED: "pending",
-      FILLED: "filled",
-      CANCELED: "cancelled",
-      REJECTED: "failed",
-      EXPIRED: "cancelled",
-    };
-
-    const newStatus = statusMap[order.X] || "pending";
-    const filledPrice = order.ap || order.L || null; // average price or last fill price
-
-    // Emit real-time update to frontend
-    this.emit("tradeUpdate", {
-      tradeId: monitored.tradeId,
-      exchangeOrderId: orderId,
-      exchange: "binance",
-      status: newStatus,
-      filledPrice,
-      filledQuantity: order.z || null,
-      timestamp: new Date(order.T || Date.now()),
-    });
-
-    // Update trade in DB
-    const update: Record<string, unknown> = {
-      lastCheckedAt: new Date(),
-    };
-
-    if (newStatus === "filled" && !isProtectionOrder) {
-      update.status = "filled";
-      update.entryFillPrice = filledPrice;
-      await this.ensureBinanceProtection(wsConn, monitored);
-      console.log(
-        `[TradeMonitor][Binance] Trade ${monitored.tradeId} entry FILLED at ${filledPrice}`,
-      );
-    } else if (
-      orderId === monitored.exchangeOrderId &&
-      (newStatus === "cancelled" || newStatus === "failed")
-    ) {
-      update.status = newStatus;
-      update.wsMonitoringActive = false;
-      update.monitoringStatus = "disconnected";
-      for (const [trackedOrderId, trade] of wsConn.activeTrades) {
-        if (trade.tradeId === monitored.tradeId) {
-          wsConn.activeTrades.delete(trackedOrderId);
-        }
-      }
-      console.log(
-        `[TradeMonitor][Binance] Trade ${monitored.tradeId} ${newStatus}`,
-      );
-    }
-
-    const allowedStatuses =
-      newStatus === "cancelled" || newStatus === "failed"
-        ? ["pending"]
-        : ["pending", "filled"];
-    await Trade.updateOne(
-      { _id: monitored.tradeId, status: { $in: allowedStatuses } },
-      { $set: update },
-    );
-    if (
-      orderId === monitored.exchangeOrderId &&
-      (newStatus === "cancelled" || newStatus === "failed") &&
-      wsConn.activeTrades.size === 0
-    ) {
-      this.closeConnection(wsConn.connectionId);
-    }
-
-    // Check for position closure (TP/SL orders hitting)
-    // Binance sends separate ORDER_TRADE_UPDATE events for TP/SL orders
-    if (
-      newStatus === "filled" &&
-      isProtectionOrder
-    ) {
-      const closedVia =
-        monitored.protectionExitTypes?.get(orderId) ??
-        (order.ot === "TAKE_PROFIT_MARKET" ? "tp" : "sl");
-      const exitPrice = filledPrice || order.ap || order.p;
-
-      const originalTrade = monitored;
-
-      if (originalTrade && exitPrice) {
-        try {
-          const siblingProtectionIds = [
-            ...(originalTrade.protectionOrderIds ?? []),
-          ].filter((protectionOrderId) => protectionOrderId !== orderId);
-          await Promise.allSettled(
-            siblingProtectionIds.map((protectionOrderId) =>
-              this.cancelBinanceOrder(
-                wsConn,
-                String(order.s),
-                protectionOrderId,
-                originalTrade.protectionTransport ?? "algo",
-              ),
-            ),
-          );
-          const result = await processTradeClose(
-            originalTrade.tradeId,
-            exitPrice,
-            closedVia as "tp" | "sl",
-          );
-
-          this.emit("tradeClosed", result);
-          for (const [trackedOrderId, trade] of wsConn.activeTrades) {
-            if (trade.tradeId === originalTrade.tradeId) {
-              wsConn.activeTrades.delete(trackedOrderId);
-            }
-          }
-          console.log(
-            `[TradeMonitor][Binance] Trade ${originalTrade.tradeId} closed via ${closedVia}`,
-          );
-
-          if (wsConn.activeTrades.size === 0) {
-            this.closeConnection(wsConn.connectionId);
-          }
-        } catch (err: any) {
-          console.error(
-            `[TradeMonitor][Binance] Error processing trade close:`,
-            err,
-          );
-        }
-      }
-    }
-  }
-
-  private async handleBinanceAlgoMessage(
-    wsConn: ExchangeWsConnection,
-    msg: any,
-  ): Promise<void> {
-    const order = msg.o;
-    if (!order) return;
-
-    const algoId = String(order.aid || "");
-    const clientAlgoId = String(order.caid || "");
-    let monitored = wsConn.activeTrades.get(algoId);
-    if (!monitored) {
-      monitored = [...wsConn.activeTrades.values()].find(
-        (trade) =>
-          trade.exchangeClientOrderId &&
-          (clientAlgoId === `${trade.exchangeClientOrderId}_tp` ||
-            clientAlgoId === `${trade.exchangeClientOrderId}_sl`),
-      );
-    }
-    if (!monitored) return;
-
-    const closedVia: "tp" | "sl" =
-      order.o === "TAKE_PROFIT_MARKET" ? "tp" : "sl";
-    monitored.protectionOrderIds ??= new Set();
-    monitored.protectionTransport = "algo";
-    monitored.protectionOrderIds.add(algoId);
-    monitored.protectionExitTypes ??= new Map();
-    monitored.protectionExitTypes.set(algoId, closedVia);
-    wsConn.activeTrades.set(algoId, monitored);
-
-    const actualOrderId = String(order.ai || "");
-    if (actualOrderId) {
-      monitored.protectionExitTypes.set(actualOrderId, closedVia);
-      wsConn.activeTrades.set(actualOrderId, monitored);
-    }
-
-    const algoStatus = String(order.X || "");
-    const averagePrice = String(order.ap || "");
-    if (
-      algoStatus === "FINISHED" &&
-      Number(averagePrice) > 0
-    ) {
-      const siblingProtectionIds = [
-        ...(monitored.protectionOrderIds ?? []),
-      ].filter((protectionOrderId) => protectionOrderId !== algoId);
-      await Promise.allSettled(
-        siblingProtectionIds.map((protectionOrderId) =>
-          this.cancelBinanceOrder(
-            wsConn,
-            String(order.s || ""),
-            protectionOrderId,
-            monitored.protectionTransport ?? "algo",
-          ),
-        ),
-      );
-      const result = await processTradeClose(
-        monitored.tradeId,
-        averagePrice,
-        closedVia,
-      );
-      this.emit("tradeClosed", result);
-      for (const [trackedOrderId, trade] of wsConn.activeTrades) {
-        if (trade.tradeId === monitored.tradeId) {
-          wsConn.activeTrades.delete(trackedOrderId);
-        }
-      }
-      if (wsConn.activeTrades.size === 0) {
-        this.closeConnection(wsConn.connectionId);
-      }
-    } else if (
-      algoStatus === "REJECTED" ||
-      algoStatus === "EXPIRED"
-    ) {
-      console.error(
-        `[TradeMonitor][Binance] ${closedVia.toUpperCase()} protection ${algoStatus.toLowerCase()} for trade ${monitored.tradeId}: ${order.rm || "no reason supplied"}`,
-      );
-    }
-  }
-
-  // ─── Bitget Futures WebSocket ───────────────────────────────────────────
-
-  private async cancelBinanceOrder(
-    wsConn: ExchangeWsConnection,
-    symbol: string,
-    protectionOrderId: string,
-    transport: "algo" | "legacy",
-  ): Promise<void> {
-    const baseUrl = getExchangeRestUrl("binance");
-    const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
-    const query =
-      transport === "algo"
-        ? new URLSearchParams({
-            algoId: protectionOrderId,
-            timestamp: String(timeData.serverTime),
-          }).toString()
-        : new URLSearchParams({
-            symbol,
-            orderId: protectionOrderId,
-            timestamp: String(timeData.serverTime),
-          }).toString();
-    const signature = crypto
-      .createHmac("sha256", wsConn.credentials.apiSecret)
-      .update(query)
-      .digest("hex");
-    await http.delete(
-      `${baseUrl}/fapi/v1/${transport === "algo" ? "algoOrder" : "order"}`,
-      {
-        params: {
-          ...Object.fromEntries(new URLSearchParams(query)),
-          signature,
-        },
-        headers: { "X-MBX-APIKEY": wsConn.credentials.apiKey },
-      },
-    );
-  }
 
   private async connectBybit(wsConn: ExchangeWsConnection): Promise<void> {
     const { apiKey, apiSecret } = wsConn.credentials;
@@ -922,8 +505,7 @@ export class TradeMonitorService extends EventEmitter {
         (trade) =>
           (trade.exchangeClientOrderId &&
             parentOrderLinkId === trade.exchangeClientOrderId) ||
-          (!trade.exchangeClientOrderId &&
-            trade.pair.replace(/\//g, "").toUpperCase() === symbol),
+          (trade.pair.replace(/\//g, "").toUpperCase() === symbol && (order.reduceOnly || order.closeOnTrigger || order.stopOrderType)),
       );
       if (
         monitored &&
@@ -955,22 +537,10 @@ export class TradeMonitorService extends EventEmitter {
         order.stopOrderType === "StopLoss");
 
     if (isExit && filledPrice) {
-      const tpDistance = Math.abs(Number(filledPrice) - Number(monitored.tp));
-      const slDistance = Math.abs(Number(filledPrice) - Number(monitored.sl));
-      const closedVia =
-        order.stopOrderType === "TakeProfit"
-          ? "tp"
-          : order.stopOrderType === "StopLoss"
-            ? "sl"
-            : tpDistance < slDistance
-              ? "tp"
-              : "sl";
-      const result = await processTradeClose(
-        monitored.tradeId,
-        String(filledPrice),
-        closedVia,
-      );
-      this.emit("tradeClosed", result);
+      await enforceStoredTradeProtection(monitored.tradeId);
+      const closedTrade = await Trade.findById(monitored.tradeId).lean();
+      if (closedTrade?.status !== "closed") return;
+      this.emit("tradeClosed", { tradeId: monitored.tradeId, exitPrice: closedTrade.exitPrice });
       for (const [trackedOrderId, trade] of wsConn.activeTrades) {
         if (trade.tradeId === monitored.tradeId) {
           wsConn.activeTrades.delete(trackedOrderId);
@@ -982,46 +552,7 @@ export class TradeMonitorService extends EventEmitter {
       return;
     }
 
-    const update: Record<string, unknown> = {
-      lastCheckedAt: new Date(),
-      rawStatusResponse: order,
-    };
-    if (status === "filled") {
-      update.status = "filled";
-      update.entryFillPrice = filledPrice;
-    } else if (status === "cancelled" || status === "failed") {
-      update.status = status;
-      update.wsMonitoringActive = false;
-      update.monitoringStatus = "disconnected";
-      for (const [trackedOrderId, trade] of wsConn.activeTrades) {
-        if (trade.tradeId === monitored.tradeId) {
-          wsConn.activeTrades.delete(trackedOrderId);
-        }
-      }
-    }
-    const allowedStatuses =
-      status === "cancelled" || status === "failed"
-        ? ["pending"]
-        : ["pending", "filled"];
-    await Trade.updateOne(
-      { _id: monitored.tradeId, status: { $in: allowedStatuses } },
-      { $set: update },
-    );
-    this.emit("tradeUpdate", {
-      tradeId: monitored.tradeId,
-      exchangeOrderId: orderId,
-      exchange: "bybit",
-      status,
-      filledPrice,
-      filledQuantity: order.cumExecQty || null,
-      timestamp: new Date(Number(order.updatedTime) || Date.now()),
-    });
-    if (
-      (status === "cancelled" || status === "failed") &&
-      wsConn.activeTrades.size === 0
-    ) {
-      this.closeConnection(wsConn.connectionId);
-    }
+    await this.reconcileEntryOrder(wsConn, monitored);
   }
 
   private async reconcileEntryOrder(
@@ -1029,73 +560,18 @@ export class TradeMonitorService extends EventEmitter {
     monitored: MonitoredTrade,
   ): Promise<void> {
     try {
-      const result = await getOrderStatus(
-        wsConn.exchange,
-        wsConn.credentials,
-        monitored.pair,
-        monitored.exchangeOrderId,
-      );
-      const update: Record<string, unknown> = {
-        lastCheckedAt: new Date(),
-        rawStatusResponse: result.raw,
-        monitoringError: null,
-      };
-
-      if (result.status === "filled") {
-        update.status = "filled";
-        if (result.filledPrice) {
-          update.entryFillPrice = result.filledPrice;
-        }
-        if (wsConn.exchange === "binance") {
-          await this.ensureBinanceProtection(
-            wsConn,
-            monitored,
-            monitored.initialStatus !== "filled",
-          );
-          await this.reconcileBinanceProtection(wsConn, monitored);
-        }
-      } else if (
-        result.status === "cancelled" ||
-        result.status === "failed"
-      ) {
-        update.status = result.status;
-        update.wsMonitoringActive = false;
-        update.monitoringStatus = "disconnected";
-        for (const [orderId, trade] of wsConn.activeTrades) {
-          if (trade.tradeId === monitored.tradeId) {
-            wsConn.activeTrades.delete(orderId);
-          }
-        }
+      const protectedTrade = await enforceStoredTradeProtection(monitored.tradeId);
+      const current = await Trade.findById(monitored.tradeId).lean();
+      if (!current) return;
+      if (!["pending", "filled"].includes(current.status)) {
+        await this.stopMonitoring(monitored.tradeId);
+        this.emit("tradeUpdate", { tradeId: monitored.tradeId, status: current.status, timestamp: new Date() });
+        return;
       }
-
-      const allowedStatuses =
-        result.status === "cancelled" || result.status === "failed"
-          ? ["pending"]
-          : ["pending", "filled"];
-      await Trade.updateOne(
-        { _id: monitored.tradeId, status: { $in: allowedStatuses } },
-        { $set: update },
-      );
-      this.emit("tradeUpdate", {
-        tradeId: monitored.tradeId,
-        exchangeOrderId: monitored.exchangeOrderId,
-        exchange: wsConn.exchange,
-        status: result.status,
-        filledPrice: result.filledPrice,
-        filledQuantity: null,
-        timestamp: new Date(),
-      });
-      this.emit("monitoringUpdate", {
-        tradeId: monitored.tradeId,
-        wsMonitoringActive: wsConn.isConnected,
-        monitoringStatus: wsConn.isConnected ? "connected" : "reconnecting",
-        monitoringError: null,
-        lastCheckedAt: update.lastCheckedAt,
-      });
-
-      if (wsConn.activeTrades.size === 0) {
-        this.closeConnection(wsConn.connectionId);
-      }
+      if (!protectedTrade) return;
+      await Trade.updateOne({ _id: monitored.tradeId }, { $set: { lastCheckedAt: new Date(), monitoringError: null } });
+      this.emit("tradeUpdate", { tradeId: monitored.tradeId, exchangeOrderId: monitored.exchangeOrderId,
+        exchange: wsConn.exchange, status: current.status, filledPrice: current.entryFillPrice, timestamp: new Date() });
     } catch (err) {
       // A failed snapshot does not disable the live private stream.
       const message = err instanceof Error ? err.message : String(err);
@@ -1116,273 +592,10 @@ export class TradeMonitorService extends EventEmitter {
     }
   }
 
-  private async ensureBinanceProtection(
-    wsConn: ExchangeWsConnection,
-    monitored: MonitoredTrade,
-    allowCreate = true,
-  ): Promise<void> {
-    if (
-      monitored.protectionSetupStarted ||
-      (allowCreate && (monitored.protectionOrderIds?.size ?? 0) >= 2)
-    ) {
-      return;
-    }
-
-    monitored.protectionSetupStarted = true;
-    try {
-      const existingProtection =
-        await this.findBinanceProtectionOrders(wsConn, monitored);
-      const existingProtectionIds = existingProtection.ids;
-      if (existingProtectionIds.length >= 2) {
-        monitored.protectionOrderIds = new Set(existingProtectionIds);
-        monitored.protectionTransport = existingProtection.transport;
-        monitored.protectionExitTypes = new Map([
-          [existingProtectionIds[0]!, "tp"],
-          [existingProtectionIds[1]!, "sl"],
-        ]);
-        for (const orderId of existingProtectionIds) {
-          wsConn.activeTrades.set(orderId, monitored);
-        }
-        await Trade.updateOne(
-          { _id: monitored.tradeId },
-          {
-            $set: {
-              exchangeProtectionOrderIds: existingProtectionIds,
-              exchangeProtectionOrderTransport:
-                existingProtection.transport,
-            },
-          },
-        );
-        return;
-      }
-
-      if (!allowCreate) {
-        console.warn(
-          `[TradeMonitor][Binance] Trade ${monitored.tradeId} was already filled before startup but has ${existingProtectionIds.length} open protection orders; refusing to create replacement orders without a confirmed open position.`,
-        );
-        return;
-      }
-
-      // Recover cleanly from a previous partial TP/SL setup.
-      if (existingProtectionIds.length === 1) {
-        const symbol = monitored.pair.replace(/\//g, "").toUpperCase();
-        await this.cancelBinanceOrder(
-          wsConn,
-          symbol,
-          existingProtectionIds[0]!,
-          existingProtection.transport,
-        );
-      }
-
-      const protection = await attachBinanceTpSl({
-        credentials: wsConn.credentials,
-        pair: monitored.pair,
-        direction: monitored.direction,
-        ...(monitored.exchangeClientOrderId
-          ? { clientOrderId: monitored.exchangeClientOrderId }
-          : {}),
-        quantity: monitored.quantity,
-        entryPrice: monitored.entryPrice,
-        tp: monitored.tp,
-        sl: monitored.sl,
-        orderId: monitored.exchangeOrderId,
-      });
-      monitored.protectionOrderIds = new Set([
-        protection.tpOrderId,
-        protection.slOrderId,
-      ]);
-      monitored.protectionExitTypes = new Map([
-        [protection.tpOrderId, "tp"],
-        [protection.slOrderId, "sl"],
-      ]);
-      monitored.protectionTransport = "algo";
-      wsConn.activeTrades.set(protection.tpOrderId, monitored);
-      wsConn.activeTrades.set(protection.slOrderId, monitored);
-      await Trade.updateOne(
-        { _id: monitored.tradeId },
-        {
-          $set: {
-            exchangeProtectionOrderIds: [
-              protection.tpOrderId,
-              protection.slOrderId,
-            ],
-            exchangeProtectionOrderTransport: "algo",
-          },
-        },
-      );
-    } catch (err) {
-      monitored.protectionSetupStarted = false;
-      console.error(
-        `[TradeMonitor][Binance] Failed to attach TP/SL for ${monitored.tradeId}:`,
-        err,
-      );
-    }
-  }
-
-  /**
-   * A user-data websocket can be disconnected at the exact moment a Binance
-   * conditional order fills.  The entry-order snapshot alone cannot detect
-   * that case, so inspect each persisted TP/SL algo order during reconciliation.
-   */
-  private async reconcileBinanceProtection(
-    wsConn: ExchangeWsConnection,
-    monitored: MonitoredTrade,
-  ): Promise<void> {
-    const protectionIds = [...(monitored.protectionOrderIds ?? [])];
-    if (!protectionIds.length) return;
-
-    const baseUrl = getExchangeRestUrl("binance");
-    const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
-
-    for (const algoId of protectionIds) {
-      const query = new URLSearchParams({
-        algoId,
-        timestamp: String(timeData.serverTime),
-      }).toString();
-      const signature = crypto
-        .createHmac("sha256", wsConn.credentials.apiSecret)
-        .update(query)
-        .digest("hex");
-      const { data } = await http.get(`${baseUrl}/fapi/v1/algoOrder`, {
-        params: {
-          ...Object.fromEntries(new URLSearchParams(query)),
-          signature,
-        },
-        headers: { "X-MBX-APIKEY": wsConn.credentials.apiKey },
-      });
-
-      const algoStatus = String(data.algoStatus ?? data.status ?? "").toUpperCase();
-      if (algoStatus !== "FINISHED") continue;
-
-      let exitPrice = String(
-        data.actualPrice ?? data.avgPrice ?? data.activatePrice ?? "",
-      );
-      if ((!Number.isFinite(Number(exitPrice)) || Number(exitPrice) <= 0) && data.actualOrderId) {
-        const executedOrder = await getOrderStatus(
-          "binance",
-          wsConn.credentials,
-          monitored.pair,
-          String(data.actualOrderId),
-        );
-        exitPrice = executedOrder.filledPrice ?? "";
-      }
-      if (!Number.isFinite(Number(exitPrice)) || Number(exitPrice) <= 0) {
-        continue;
-      }
-
-      const closedVia = monitored.protectionExitTypes?.get(algoId) ?? "manual";
-      const siblingIds = protectionIds.filter((id) => id !== algoId);
-      await Promise.allSettled(
-        siblingIds.map((id) =>
-          this.cancelBinanceOrder(wsConn, monitored.pair.replace(/\//g, ""), id, "algo"),
-        ),
-      );
-      const result = await processTradeClose(monitored.tradeId, exitPrice, closedVia);
-      this.emit("tradeClosed", result);
-      for (const [trackedOrderId, trade] of wsConn.activeTrades) {
-        if (trade.tradeId === monitored.tradeId) {
-          wsConn.activeTrades.delete(trackedOrderId);
-        }
-      }
-      console.log(
-        `[TradeMonitor][Binance] Reconciled trade ${monitored.tradeId} closed via ${closedVia}`,
-      );
-      return;
-    }
-  }
-
-  private async findBinanceProtectionOrders(
-    wsConn: ExchangeWsConnection,
-    monitored: MonitoredTrade,
-  ): Promise<{ ids: string[]; transport: "algo" | "legacy" }> {
-    const baseUrl = getExchangeRestUrl("binance");
-    const symbol = monitored.pair.replace(/\//g, "").toUpperCase();
-    const { data: timeData } = await http.get(`${baseUrl}/fapi/v1/time`);
-    const query = new URLSearchParams({
-      symbol,
-      timestamp: String(timeData.serverTime),
-    }).toString();
-    const signature = crypto
-      .createHmac("sha256", wsConn.credentials.apiSecret)
-      .update(query)
-      .digest("hex");
-    const requestConfig = {
-      params: {
-        ...Object.fromEntries(new URLSearchParams(query)),
-        signature,
-      },
-      headers: { "X-MBX-APIKEY": wsConn.credentials.apiKey },
-    };
-    const [{ data: algoData }, { data: legacyData }] = await Promise.all([
-      http.get(`${baseUrl}/fapi/v1/openAlgoOrders`, requestConfig),
-      http.get(`${baseUrl}/fapi/v1/openOrders`, requestConfig),
-    ]);
-    const algoOrders = Array.isArray(algoData)
-      ? algoData
-      : algoData
-        ? [algoData]
-        : [];
-    const legacyOrders = Array.isArray(legacyData)
-      ? legacyData
-      : legacyData
-        ? [legacyData]
-        : [];
-    const expectedClientIds = monitored.exchangeClientOrderId
-      ? new Set([
-          `${monitored.exchangeClientOrderId}_tp`,
-          `${monitored.exchangeClientOrderId}_sl`,
-        ])
-      : null;
-
-    const matchOrders = (orders: any[], transport: "algo" | "legacy") =>
-      orders
-        .filter((order: any) => {
-          const orderType =
-            transport === "algo" ? order.orderType : order.type;
-          if (
-            orderType !== "TAKE_PROFIT_MARKET" &&
-            orderType !== "STOP_MARKET"
-          ) {
-            return false;
-          }
-          if (expectedClientIds) {
-            const clientId =
-              transport === "algo"
-                ? order.clientAlgoId
-                : order.clientOrderId;
-            return expectedClientIds.has(String(clientId || ""));
-          }
-          const stopPrice = Number(
-            transport === "algo" ? order.triggerPrice : order.stopPrice,
-          );
-          return (
-            stopPrice === Number(monitored.tp) ||
-            stopPrice === Number(monitored.sl)
-          );
-        })
-        .sort((left: any, right: any) => {
-          const rank = (order: any) =>
-            (transport === "algo" ? order.orderType : order.type) ===
-            "TAKE_PROFIT_MARKET"
-              ? 0
-              : 1;
-          return rank(left) - rank(right);
-        })
-        .map((order: any) =>
-          String(transport === "algo" ? order.algoId : order.orderId),
-        );
-
-    const algoIds = matchOrders(algoOrders, "algo");
-    if (algoIds.length) return { ids: algoIds, transport: "algo" };
-    return { ids: matchOrders(legacyOrders, "legacy"), transport: "legacy" };
-  }
-
   private async connectOkx(wsConn: ExchangeWsConnection): Promise<void> {
     const { apiKey, apiSecret, passphrase } = wsConn.credentials;
     if (!passphrase) throw new Error("OKX requires a passphrase for monitoring.");
-    const url = isOkxDemo()
-      ? "wss://wspap.okx.com:8443/ws/v5/private"
-      : "wss://ws.okx.com:8443/ws/v5/private";
+    const url = getExchangeWebSocketUrl("okx");
     const ws = new WebSocket(url);
     wsConn.ws = ws;
     ws.on("open", () => {
@@ -1421,21 +634,11 @@ export class TradeMonitorService extends EventEmitter {
   private async handleOkxOrder(wsConn: ExchangeWsConnection, order: any): Promise<void> {
     const orderId = String(order.ordId || "");
     const monitored = wsConn.activeTrades.get(orderId) ?? [...wsConn.activeTrades.values()].find((trade) =>
-      trade.pair.replace(/\//g, "").toUpperCase() === String(order.instId || "").replace(/-/g, "").toUpperCase(),
+      trade.pair.replace(/\//g, "").toUpperCase() === String(order.instId || "").replace(/-/g, "").replace(/SWAP$/, "").toUpperCase(),
     );
     if (!monitored) return;
-    const state = String(order.state || "");
-    const price = String(order.avgPx || order.fillPx || order.px || "");
-    if (state === "filled" && orderId !== monitored.exchangeOrderId && Number(price) > 0) {
-      const closedVia = Math.abs(Number(price) - Number(monitored.tp)) < Math.abs(Number(price) - Number(monitored.sl)) ? "tp" : "sl";
-      const result = await processTradeClose(monitored.tradeId, price, closedVia);
-      this.emit("tradeClosed", result);
-      for (const [id, trade] of wsConn.activeTrades) if (trade.tradeId === monitored.tradeId) wsConn.activeTrades.delete(id);
-      return;
-    }
-    const status = state === "filled" ? "filled" : ["canceled", "mmp_canceled"].includes(state) ? "cancelled" : "pending";
-    await Trade.updateOne({ _id: monitored.tradeId, status: { $in: ["pending", "filled"] } }, { $set: { status, entryFillPrice: status === "filled" ? price : undefined, lastCheckedAt: new Date(), rawStatusResponse: order } });
-    this.emit("tradeUpdate", { tradeId: monitored.tradeId, exchangeOrderId: orderId, exchange: "okx", status, filledPrice: price || null, filledQuantity: order.accFillSz || null, timestamp: new Date(Number(order.uTime) || Date.now()) });
+    if (orderId !== monitored.exchangeOrderId && !(order.reduceOnly === true || order.reduceOnly === "true")) return;
+    await this.reconcileEntryOrder(wsConn, monitored);
   }
 
   private async connectBitget(wsConn: ExchangeWsConnection): Promise<void> {
@@ -1446,7 +649,7 @@ export class TradeMonitorService extends EventEmitter {
     }
 
     const wsUrl =
-      process.env.BITGET_WS_URL || "wss://ws.bitget.com/v2/ws/private";
+      getExchangeWebSocketUrl("bitget");
 
     try {
       const ws = new WebSocket(wsUrl);
@@ -1591,103 +794,12 @@ export class TradeMonitorService extends EventEmitter {
         const orderId = order.ordId || order.orderId;
         if (!orderId) continue;
 
-        const monitored = wsConn.activeTrades.get(orderId);
+        const monitored = wsConn.activeTrades.get(orderId) ?? [...wsConn.activeTrades.values()].find(trade =>
+          trade.pair.replace(/[-/]/g, "").toUpperCase() === String(order.instId || order.symbol || "").replace(/[-/]/g, "").toUpperCase() &&
+          (order.reduceOnly === true || order.reduceOnly === "YES" || order.tradeSide === "close"));
         if (!monitored) continue;
 
-        const statusMap: Record<string, string> = {
-          live: "pending",
-          new: "pending",
-          partially_filled: "pending",
-          partial_fill: "pending",
-          filled: "filled",
-          full_fill: "filled",
-          cancelled: "cancelled",
-          canceled: "cancelled",
-        };
-
-        const rawStatus = (order.status || order.state || "").toLowerCase();
-        const newStatus = statusMap[rawStatus] || "pending";
-        const filledPrice = order.avgPx || order.priceAvg || null;
-
-        // Emit real-time update
-        this.emit("tradeUpdate", {
-          tradeId: monitored.tradeId,
-          exchangeOrderId: orderId,
-          exchange: "bitget",
-          status: newStatus,
-          filledPrice,
-          filledQuantity: order.accBaseVolume || order.fillSz || null,
-          timestamp: new Date(
-            parseInt(order.uTime || order.cTime || String(Date.now())),
-          ),
-        });
-
-        // Update DB
-        const update: Record<string, unknown> = {
-          lastCheckedAt: new Date(),
-        };
-
-        if (newStatus === "filled") {
-          // Check if this is the entry order or a TP/SL closure
-          const tradeSide = order.tradeSide || order.posSide || "";
-
-          if (tradeSide === "close" || order.reduceOnly === true) {
-            // This is a position closure (TP or SL hit)
-            const exitPrice = filledPrice || order.price;
-            const triggerPrice = parseFloat(order.triggerPrice || "0");
-            const tp = parseFloat(monitored.tp);
-            const sl = parseFloat(monitored.sl);
-
-            // Determine if TP or SL based on trigger price proximity
-            let closedVia: "tp" | "sl" | "manual" = "manual";
-            if (triggerPrice > 0) {
-              const distToTp = Math.abs(triggerPrice - tp);
-              const distToSl = Math.abs(triggerPrice - sl);
-              closedVia = distToTp < distToSl ? "tp" : "sl";
-            }
-
-            if (exitPrice) {
-              try {
-                const result = await processTradeClose(
-                  monitored.tradeId,
-                  exitPrice,
-                  closedVia,
-                );
-
-                this.emit("tradeClosed", result);
-                wsConn.activeTrades.delete(orderId);
-                console.log(
-                  `[TradeMonitor][Bitget] Trade ${monitored.tradeId} closed via ${closedVia}`,
-                );
-
-                if (wsConn.activeTrades.size === 0) {
-                  this.closeConnection(wsConn.connectionId);
-                }
-              } catch (err: any) {
-                console.error(
-                  `[TradeMonitor][Bitget] Error processing trade close:`,
-                  err,
-                );
-              }
-            }
-          } else {
-            // Entry order filled
-            update.status = "filled";
-            update.entryFillPrice = filledPrice;
-            console.log(
-              `[TradeMonitor][Bitget] Trade ${monitored.tradeId} entry FILLED at ${filledPrice}`,
-            );
-          }
-        } else if (newStatus === "cancelled" || newStatus === "failed") {
-          update.status = newStatus;
-          update.wsMonitoringActive = false;
-          wsConn.activeTrades.delete(orderId);
-          console.log(
-            `[TradeMonitor][Bitget] Trade ${monitored.tradeId} ${newStatus}`,
-          );
-        }
-
-        await Trade.updateOne({ _id: monitored.tradeId }, { $set: update });
+        await this.reconcileEntryOrder(wsConn, monitored);
       }
     }
   }

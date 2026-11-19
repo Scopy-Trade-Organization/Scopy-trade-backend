@@ -1,3 +1,5 @@
+import { ProtectionFailure, recordProtectionFailure } from "../services/tradeProtectionService.js";
+import { TradeRiskError, validateAmendmentRisk } from "../services/tradeRiskService.js";
 import { Request, Response } from "express";
 import mongoose from "mongoose";
 import AuditLog from "../models/auditLogModel.js";
@@ -262,15 +264,11 @@ export const updateProTrade = async (req: Request, res: Response) => {
         },
       });
     }
-    if (connection.exchange === "okx" && (tpChanged || slChanged)) {
-      return res.status(422).json({
-        success: false,
-        message: "OKX protection amendments are not yet supported; only a pending entry price can be changed.",
-      });
-    }
-
+    const sizing = validateAmendmentRisk(trade, String(entryLocked ? effectiveEntry : requestedEntry), requestedTp, requestedSl);
     const amended = await amendTradeOrder(connection.exchange as ExchangeId, {
       credentials,
+      sizing, marginMode: trade.marginMode || (connection.exchange === "okx" ? "isolated" : "crossed"),
+      ...(trade.exchangeClientOrderId ? { clientOrderId: trade.exchangeClientOrderId } : {}),
       pair: trade.pair,
       direction: trade.direction as "buy" | "sell",
       quantity: trade.quantity,
@@ -287,6 +285,7 @@ export const updateProTrade = async (req: Request, res: Response) => {
         : {}),
     });
 
+    trade.sizing = sizing;
     trade.entryPrice = amended.entryPrice;
     trade.tp = amended.tp;
     trade.sl = amended.sl;
@@ -355,10 +354,10 @@ export const updateProTrade = async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    console.error("Error updating pro trade:", error);
-    return res.status(502).json({
-      success: false,
-      message: "Failed to update trade parameters.",
+    if (error instanceof ProtectionFailure) await recordProtectionFailure(String(req.params.tradeId), error);
+    return res.status(error instanceof TradeRiskError && !(error instanceof ProtectionFailure) ? 422 : 502).json({
+      success: false, code: error instanceof TradeRiskError ? error.code : "AMENDMENT_FAILED",
+      message: error instanceof TradeRiskError ? error.message : "Failed to update trade parameters.",
     });
   }
 };
@@ -406,6 +405,7 @@ export const closeProTrade = async (req: Request, res: Response) => {
       quantity: trade.quantity,
       orderId: trade.exchangeOrderId,
       status: closeStatus,
+      ...(trade.sizing ? { sizing: trade.sizing } : {}),
     });
 
     const monitor = getTradeMonitorService();
@@ -418,14 +418,8 @@ export const closeProTrade = async (req: Request, res: Response) => {
       trade.monitoringStatus = "disconnected";
       await trade.save();
     } else {
-      // Bybit can report a zero position when native TP/SL closed the entry
-      // before this request. No historical exit price is available from the
-      // position endpoint, so retain the entry price rather than recording a
-      // misleading current market price and charging an inaccurate PnL.
-      const exitPrice = result.alreadyClosed
-        ? trade.entryFillPrice || trade.entryPrice
-        : result.exitPrice || live.filledPrice || trade.entryFillPrice || trade.entryPrice;
-      await processTradeClose(String(trade._id), exitPrice, "manual");
+      await Trade.updateOne({ _id: trade._id }, { $set: { ...(result.closedQuantity ? { quantity: result.closedQuantity } : {}), ...(result.entryFillPrice ? { entryFillPrice: result.entryFillPrice } : {}) } });
+      await processTradeClose(String(trade._id), result.exitPrice!, "manual");
     }
 
     // Deliberately do not await copy closures. The pro close has succeeded and the propagation has been triggered.
@@ -445,16 +439,13 @@ export const closeProTrade = async (req: Request, res: Response) => {
     });
     return res.status(200).json({
       success: true,
-      message: result.alreadyClosed
-        ? "Bybit reports no open position for this trade. Its local status has been synchronized as closed."
-        : result.status === "closed"
+      message: result.status === "closed"
         ? "Trade closed. Copied trades are being closed in the background."
         : "Pending trade cancelled. Copied trades are being closed in the background.",
       trade: updated,
     });
   } catch (error) {
-    console.error("Error closing pro trade:", error);
-    return res.status(502).json({ success: false, message: "Failed to close pro trade." });
+    return res.status(502).json({ success: false, code: error instanceof TradeRiskError ? error.code : "CLOSE_FAILED", message: error instanceof TradeRiskError ? error.message : "Failed to close pro trade." });
   }
 };
 

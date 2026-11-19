@@ -331,7 +331,7 @@ test("automatic copy worker checks settlement independently immediately before e
   const subscriptionId = new mongoose.Types.ObjectId(), connectionId = new mongoose.Types.ObjectId();
   await User.collection.insertOne({ _id: proId, role: "ProTrader", status: "active", email: `${proId}@example.com`, traderID: String(proId) });
   const startedAt = new Date(Date.now() - 5000);
-  await Trade.collection.insertOne({ _id: sourceId, userId: proId, status: "filled", createdAt: new Date(), pair: "BTCUSDT", tradeOrigin: "pro", signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
+  await Trade.collection.insertOne({ _id: sourceId, userId: proId, status: "filled", protectionStatus: "confirmed", createdAt: new Date(), pair: "BTCUSDT", tradeOrigin: "pro", signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
   await CopySubscription.collection.insertOne({ _id: subscriptionId, copierId: f.userId, proTraderId: proId, exchangeConnectionId: connectionId, active: true, allocation: 100, startedAt });
   const job = await CopyExecution.create({ sourceTradeId: sourceId, subscriptionId, copierId: f.userId, exchangeConnectionId: connectionId, status: "queued", availableAt: new Date(0) });
   let executions = 0;

@@ -1,3 +1,4 @@
+import { Trade } from "./models/tradeModel.js";
 import express from "express";
 import compression from "compression";
 import "dotenv/config";
@@ -47,6 +48,7 @@ const wsServer = new TradeWebSocketServer(server);
 const tradeMonitor = getTradeMonitorService();
 
 export async function initializeTradeMonitoring(): Promise<void> {
+  await Trade.createIndexes();
   await tradeMonitor.resumeActiveMonitoring();
   tradeMonitor.startBackgroundReconciliation();
   await resumePendingProfitCredits();
