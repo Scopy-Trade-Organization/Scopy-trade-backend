@@ -59,7 +59,7 @@ test("hash fallback accepts memo-less payments without wallet signatures", () =>
 
 let replica: MongoMemoryReplSet;
 before(async () => {
-  replica = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+  replica = await MongoMemoryReplSet.create({ replSet: { count: 1 }, instanceOpts: [{ launchTimeout: 60_000 }] });
   await mongoose.connect(replica.getUri());
   await Promise.all([Transaction.init(), Notification.init(), Earning.init(), CopyExecution.init(), CopyExecutionLock.init(), CopyNotification.init()]);
   process.env.SYSTEM_WALLET_ADDRESS = wallet;

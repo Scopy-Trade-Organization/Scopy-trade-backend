@@ -14,20 +14,20 @@ function fixture(exchange: ExchangeId) {
   const responses: Record<string, any> = exchange === "bybit" ? {
     "/v5/market/instruments-info": { result: { list: [{ symbol: "BTCUSDT", status: "Trading", settleCoin: "USDT", quoteCoin: "USDT", contractType: "LinearPerpetual", lotSizeFilter: { qtyStep: "0.001", minOrderQty: "0.001", maxOrderQty: "100", maxMktOrderQty: "50", minNotionalValue: "5" }, priceFilter: { tickSize: "0.1" }, leverageFilter: { minLeverage: "1", maxLeverage: "100", leverageStep: "1" } }] } },
     "/v5/account/wallet-balance": { result: { list: [{ totalAvailableBalance: "50", totalEquity: "1000", coin: [{ coin: "USDT", walletBalance: "1000", equity: "1000", locked: "0", totalPositionIM: "950", totalOrderIM: "0" }] }] } },
-    "/v5/account/info": { result: { marginMode: "REGULAR_MARGIN" } },
+    "/v5/account/info": { result: { marginMode: "ISOLATED_MARGIN" } },
     "/v5/account/fee-rate": { result: { list: [{ takerFeeRate: "0.0006" }] } },
-    "/v5/market/risk-limit": { result: { list: [{ symbol: "BTCUSDT", riskLimitValue: "1000000", maxLeverage: "100", maintenanceMargin: "0.005", initialMargin: "0.01" }] } },
+    "/v5/market/risk-limit": { result: { list: [{ symbol: "BTCUSDT", isLowestRisk: 1, riskLimitValue: "1000000", maxLeverage: "100", maintenanceMargin: "0.005", mmDeduction: "0", initialMargin: "0.01" }] } },
     "/v5/order/realtime": { result: { list: [] } },
   } : exchange === "okx" ? {
     "/api/v5/public/instruments": { data: [{ instId: "BTC-USDT-SWAP", state: "live", ctType: "linear", settleCcy: "USDT", ctValCcy: "BTC", ctVal: "0.01", ctMult: "1", lotSz: "0.01", minSz: "0.01", maxLmtSz: "10000", maxMktSz: "1000", tickSz: "0.1", lever: "100" }] },
     "/api/v5/account/balance": { data: [{ details: [{ ccy: "USDT", eq: "1000", availEq: "50" }] }] },
     "/api/v5/account/config": { data: [{ posMode: "net_mode", acctLv: "2" }] },
     "/api/v5/account/trade-fee": { data: [{ takerU: "-0.0006" }] },
-    "/api/v5/public/position-tiers": { data: [{ maxSz: "10000", maxLever: "100", mmr: "0.005", imr: "0.01" }] },
+    "/api/v5/public/position-tiers": { data: [{ minSz: "0", maxSz: "10000", maxLever: "100", mmr: "0.005", imr: "0.01" }] },
     "/api/v5/trade/orders-pending": { data: [] }, "/api/v5/trade/orders-algo-pending": { data: [] },
   } : {
     "/api/v2/mix/market/contracts": { data: [{ symbol: "BTCUSDT", symbolStatus: "normal", symbolType: "perpetual", quoteCoin: "USDT", supportMarginCoins: ["USDT"], sizeMultiplier: "0.001", minTradeNum: "0.001", maxOrderQty: "100", maxMarketOrderQty: "50", minTradeUSDT: "5", priceEndStep: "1", pricePlace: "1", takerFeeRate: "0.0006", minLever: "1", maxLever: "100", openCostUpRatio: "0.1" }] },
-    "/api/v2/mix/market/query-position-lever": { data: [{ endUnit: "1000000", leverage: "100", keepMarginRate: "0.005" }] },
+    "/api/v2/mix/market/query-position-lever": { data: [{ startUnit: "0", endUnit: "1000000", leverage: "100", keepMarginRate: "0.005" }] },
     "/api/v2/mix/order/orders-pending": { data: { entrustedList: [] } },
     "/api/v2/mix/order/orders-plan-pending": { data: { entrustedList: [] } },
   };
@@ -42,7 +42,7 @@ function fixture(exchange: ExchangeId) {
     if (path === "/api/v5/account/positions") return { data: occupied ? [{ pos: "1" }] : [] };
     if (path === "/api/v5/account/leverage-info") return { data: [{ lever: leverage, mgnMode: "isolated" }] };
     if (path === "/api/v2/mix/position/single-position") return { data: occupied ? [{ total: "1", posMode: "one_way_mode" }] : [] };
-    if (path === "/api/v2/mix/account/account") return { data: { available: "1", crossedMaxAvailable: "50", isolatedMaxAvailable: "40", accountEquity: "1000", posMode: "one_way_mode", assetMode: "single", marginMode: "crossed", crossedMarginLeverage: leverage, isolatedLongLever: leverage, isolatedShortLever: leverage } };
+    if (path === "/api/v2/mix/account/account") return { data: { available: "1", crossedMaxAvailable: "50", isolatedMaxAvailable: "50", accountEquity: "1000", posMode: "one_way_mode", assetMode: "single", marginMode: "isolated", crossedMarginLeverage: leverage, isolatedLongLever: leverage, isolatedShortLever: leverage } };
     if (!(path in responses)) throw new Error(`Unexpected request: ${path}`);
     return responses[path];
   };
@@ -72,6 +72,38 @@ test("Bybit isolated balance subtracts position margin, order margin and locked 
   assert.equal((await getFuturesContext("bybit", credentials, "BTCUSDT", f.request)).availableBalance, "50");
   f.responses["/v5/account/wallet-balance"].result.list[0].coin[0].totalOrderIM = undefined;
   await assert.rejects(getFuturesContext("bybit", credentials, "BTCUSDT", f.request), /Order margin.*unavailable/);
+});
+
+for (const exchange of ["bybit", "okx", "bitget"] as const) test(`${exchange}: exchange API failures cannot yield an assumed-safe context`, async () => {
+  const f = fixture(exchange);
+  const request: ExchangeRequest = async (method, path, values, allowed) => {
+    if (path.includes("risk-limit") || path.includes("position-tiers") || path.includes("query-position-lever")) throw new Error("Margin tier API unavailable");
+    return f.request(method, path, values, allowed);
+  };
+  await assert.rejects(getFuturesContext(exchange, credentials, "BTCUSDT", request), /Margin tier API unavailable/);
+  assert.equal(f.calls.filter(call => call.method === "POST").length, 0);
+});
+
+test("Bybit and Bitget reject cross margin rather than use isolated formulas", async () => {
+  const bybit = fixture("bybit");
+  bybit.responses["/v5/account/info"].result.marginMode = "REGULAR_MARGIN";
+  await assert.rejects(getFuturesContext("bybit", credentials, "BTCUSDT", bybit.request), /requires isolated/);
+  const bitget = fixture("bitget");
+  const request: ExchangeRequest = async (...args) => {
+    const result = await bitget.request(...args);
+    if (args[1] === "/api/v2/mix/account/account") result.data.marginMode = "crossed";
+    return result;
+  };
+  await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", request), /requires isolated/);
+});
+
+test("incomplete Bybit and OKX tier responses cannot establish liquidation safety", async () => {
+  const bybit = fixture("bybit");
+  delete bybit.responses["/v5/market/risk-limit"].result.list[0].isLowestRisk;
+  await assert.rejects(getFuturesContext("bybit", credentials, "BTCUSDT", bybit.request), /lowest maintenance tier/);
+  const okx = fixture("okx");
+  delete okx.responses["/api/v5/public/position-tiers"].data[0].minSz;
+  await assert.rejects(getFuturesContext("okx", credentials, "BTCUSDT", okx.request), /Tier minimum contracts.*unavailable/);
 });
 
 test("unknown portfolio or hedge modes are rejected without silently changing account modes", async () => {

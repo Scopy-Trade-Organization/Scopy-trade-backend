@@ -35,6 +35,8 @@ const busy = () =>
     "EXISTING_EXPOSURE",
     "This symbol already has a position, entry order or protection order on the exchange. Close or cancel it before opening another Scopytrade trade.",
   );
+const unsupportedCross = () => new TradeRiskError("UNSUPPORTED_MARGIN_MODE",
+  "Liquidation safety requires isolated margin. Cross account-wide exposure cannot be verified by this planner; select isolated margin on the exchange.");
 function array(value: any, name: string): any[] {
   if (!Array.isArray(value))
     throw new TradeRiskError(
@@ -142,10 +144,14 @@ async function bybitContext(
       "UNSUPPORTED_INSTRUMENT",
       "Bybit requires an active linear USDT perpetual instrument.",
     );
+  const riskRows = array(limits.result?.list, "Bybit risk tiers").filter(r => r.symbol === symbol)
+    .sort((a, b) => decimal(a.riskLimitValue, "Tier limit").cmp(decimal(b.riskLimitValue, "Tier limit")));
+  if (riskRows[0]?.isLowestRisk !== 1) throw new TradeRiskError("LIQUIDATION_UNVERIFIABLE", "Bybit did not return the lowest maintenance tier; liquidation cannot be verified.");
   const account = wallet.result?.list?.[0],
     mode = settings.result?.marginMode;
   if (!account || !["REGULAR_MARGIN", "ISOLATED_MARGIN"].includes(mode))
     throw rejectMode();
+  if (mode !== "ISOLATED_MARGIN") throw unsupportedCross();
   // A single USDT collateral pool makes USD/USDT available margin unambiguous.
   if (
     array(account.coin, "Bybit balances").some(
@@ -221,10 +227,10 @@ async function bybitContext(
         "Maximum leverage",
       ),
       leverageStep: amount(info.leverageFilter?.leverageStep, "Leverage step"),
-      tiers: array(limits.result?.list, "Bybit risk tiers")
-        .filter((r) => r.symbol === symbol)
+      tiers: riskRows
         .map((r) => ({
           maximumNotional: amount(r.riskLimitValue, "Tier position limit"),
+          maintenanceDeduction: amount(r.mmDeduction, "Bybit maintenance deduction", true),
           maximumLeverage: amount(r.maxLeverage, "Tier leverage"),
           maintenanceRate: amount(
             r.maintenanceMargin,
@@ -319,6 +325,7 @@ async function okxContext(
       maximumLeverage: amount(info.lever, "Maximum leverage"),
       leverageStep: "1",
       tiers: array(limits.data, "OKX margin tiers").map((r) => ({
+        minimumOrderQuantity: amount(r.minSz, "Tier minimum contracts", true),
         maximumOrderQuantity: amount(r.maxSz, "Tier contract limit"),
         maximumLeverage: amount(r.maxLever, "Tier leverage"),
         maintenanceRate: amount(r.mmr, "Maintenance rate", true),
@@ -361,6 +368,7 @@ async function bitgetContext(
     !["crossed", "isolated"].includes(account.marginMode)
   )
     throw rejectMode();
+  if (account.marginMode !== "isolated") throw unsupportedCross();
   const available =
     account.marginMode === "crossed"
       ? account.crossedMaxAvailable
@@ -397,6 +405,7 @@ async function bitgetContext(
       ),
       tiers: array(limits.data, "Bitget margin tiers").map((r) => ({
         maximumNotional: amount(r.endUnit, "Tier position limit"),
+        minimumNotional: amount(r.startUnit, "Bitget tier start", true),
         maximumLeverage: amount(r.leverage, "Tier leverage"),
         maintenanceRate: amount(r.keepMarginRate, "Maintenance rate", true),
       })),
@@ -410,6 +419,7 @@ export async function getFuturesContext(
   pair: string,
   request = exchangeApi(exchange, credentials),
 ) {
+  if (!["bybit", "okx", "bitget"].includes(exchange)) throw new TradeRiskError("UNSUPPORTED_EXCHANGE", "Exchange is not supported for futures planning.");
   const symbol = futuresSymbol(exchange, pair);
   await assertSymbolFree(exchange, request, symbol);
   return exchange === "bybit"

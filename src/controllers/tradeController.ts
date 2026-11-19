@@ -1,3 +1,5 @@
+import { planTrade, type PlanningDependencies } from "../services/tradePlanningService.js";
+import { D, TradeRiskError } from "../services/tradeRiskService.js";
 import { executeTrade } from "../services/tradeExecutionService.js";
 import { triggerAutomaticCopies } from "../services/automaticCopyService.js";
 import { Request, Response } from "express";
@@ -7,20 +9,15 @@ import { Trade } from "../models/tradeModel.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import {
   getExchangeBalance,
-  getCurrentPrice,
 } from "../services/tradeService.js";
 import { ExchangeId } from "../types/index.js";
 import { decryptCredentials } from "../services/exchangeConnectionService.js";
-import { getTradeMonitorService } from "../services/tradeMonitorService.js";
 import {
   getExchangeMode,
-  shouldRebaseTestnetSignals,
 } from "../services/exchangeEnvironment.js";
 import {
   SUPPORTED_PAIRS,
   SUPPORTED_TRADE_EXCHANGES,
-  MAX_RISK_PERCENT,
-  DEFAULT_MAX_ENTRY_DEVIATION,
 } from "../constants.js";
 import { withCurrentMarketPrices } from "../services/tradeMarketPriceService.js";
 import { getProfitShareSummary } from "../services/profitSharingService.js";
@@ -281,15 +278,19 @@ function resolveTradeResult(
  * Returns the preview so the frontend can display lot size, risk, and reward before user confirms.
  */
 export async function previewTrade(req: Request, res: Response) {
+  return previewTradeWithDependencies(req, res);
+}
+
+export async function previewTradeWithDependencies(req: Request, res: Response, dependencies: PlanningDependencies = {}) {
   try {
     const userId = req.user as mongoose.Types.ObjectId;
-    const { sourceTradeId, exchangeConnectionId, balance } = req.body;
+    const { sourceTradeId, exchangeConnectionId } = req.body;
 
     // ── 1. Input validation ──────────────────────────────────────────────────
-    if (!sourceTradeId || !exchangeConnectionId || !balance) {
+    if (!sourceTradeId || !exchangeConnectionId) {
       return res.status(400).json({
         success: false,
-        message: "sourceTradeId, exchangeConnectionId, and balance are required.",
+        message: "sourceTradeId and exchangeConnectionId are required.",
       });
     }
 
@@ -303,18 +304,10 @@ export async function previewTrade(req: Request, res: Response) {
       });
     }
 
-    const parsedBalance = parseFloat(balance);
-    if (isNaN(parsedBalance) || parsedBalance <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "balance must be a positive number.",
-      });
-    }
-
-    // ── 2. Fetch & validate signal ───────────────────────────────────────────
     const sourceTrade = await Trade.findOne({
       _id: sourceTradeId,
       tradeOrigin: "pro",
+      protectionStatus: "confirmed",
       status: { $in: ["pending", "filled"] },
     }).lean();
     if (!sourceTrade) {
@@ -386,67 +379,13 @@ export async function previewTrade(req: Request, res: Response) {
     };
     const rawCreds = decryptCredentials(storedCreds);
 
-    let currentPriceResult;
-    try {
-      currentPriceResult = await getCurrentPrice(
-        connection.exchange as ExchangeId,
-        signal.pair,
-      );
-    } catch (priceErr) {
-      const message =
-        priceErr instanceof Error
-          ? priceErr.message
-          : "Current price lookup failed.";
-      return res.status(502).json({
-        success: false,
-        message: "Failed to fetch current market price.",
-        detail: message,
-      });
+    if (await Trade.exists({ exchangeConnectionId, pair: normalizedPair, status: { $in: ["pending", "filled"] } })) {
+      return res.status(409).json({ success: false, code: "EXISTING_EXPOSURE", message: "An active trade already exists for this symbol on the connected account." });
     }
-
-    // ── 5. Calculate 2% risk position sizing ─────────────────────────────────
-    const entryPrice = parseFloat(signal.entry);
-    const currentPrice = parseFloat(currentPriceResult.price);
-
-    if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
-      return res.status(422).json({
-        success: false,
-        message: "Signal entry price is invalid.",
-      });
-    }
-
-    const previewRebased = shouldRebaseTestnetSignals();
-    const previewScale = previewRebased ? currentPrice / entryPrice : 1;
-    const previewEntry = previewRebased ? currentPrice : entryPrice;
-    const slPrice = parseFloat(signal.sl) * previewScale;
-    const tpPrice = parseFloat(signal.tp) * previewScale;
-    const priceDistance = Math.abs(previewEntry - slPrice);
-    if (!Number.isFinite(priceDistance) || priceDistance <= 0) {
-      return res.status(422).json({
-        success: false,
-        message: "Cannot calculate position size: entry and stop-loss prices are too close or identical.",
-      });
-    }
-
-    const riskAmount = parsedBalance * MAX_RISK_PERCENT;
-    const calculatedLotSize = parseFloat((riskAmount / priceDistance).toFixed(6));
-
-    if (!Number.isFinite(calculatedLotSize) || calculatedLotSize <= 0) {
-      return res.status(422).json({
-        success: false,
-        message: "Calculated lot size is invalid.",
-      });
-    }
-
-    // Risk/reward calculations
-    const distanceToTP = Math.abs(tpPrice - previewEntry);
-    const estimatedLossIfSL = priceDistance * calculatedLotSize;
-    const estimatedProfitIfTP = distanceToTP * calculatedLotSize;
-    const riskRewardRatio =
-      priceDistance > 0 ? parseFloat((distanceToTP / priceDistance).toFixed(2)) : 0;
-
-    // Deviation check (informational — not blocking in preview)
-    const deviation = Math.abs(currentPrice - entryPrice) / entryPrice;
+    const { sizing, context, currentMarketPrice, signalPricesRebased: previewRebased, deviation, maxDeviation } =
+      await planTrade(connection.exchange as ExchangeId, rawCreds, signal, dependencies);
+    const profit = new D(sizing.takeProfitPrice).minus(sizing.entryPrice).abs().mul(sizing.positionQuantity)
+      .minus(sizing.estimatedOpeningFee).minus(new D(sizing.takeProfitPrice).mul(sizing.positionQuantity).mul(sizing.takerFeeRate));
 
     return res.status(200).json({
       success: true,
@@ -454,31 +393,37 @@ export async function previewTrade(req: Request, res: Response) {
         pair: signal.pair,
         direction: signal.direction,
         exchange: connection.exchange,
-        entryPrice: String(previewEntry),
-        stopLoss: String(slPrice),
-        takeProfit: String(tpPrice),
+        entryPrice: sizing.entryPrice,
+        stopLoss: sizing.stopLossPrice,
+        takeProfit: sizing.takeProfitPrice,
         originalSignalPrices: previewRebased
           ? { entry: signal.entry, stopLoss: signal.sl, takeProfit: signal.tp }
           : null,
         signalPricesRebased: previewRebased,
         exchangeMode: getExchangeMode(),
-        currentMarketPrice: currentPriceResult.price,
-        balance: String(parsedBalance),
-        riskPercent: MAX_RISK_PERCENT,
-        riskAmount: riskAmount.toFixed(2),
-        priceDistance: priceDistance.toFixed(2),
-        calculatedLotSize: String(calculatedLotSize),
-        estimatedLossIfSL: estimatedLossIfSL.toFixed(2),
-        estimatedProfitIfTP: estimatedProfitIfTP.toFixed(2),
-        riskRewardRatio: String(riskRewardRatio),
-        deviation: Number(deviation.toFixed(6)),
-        maxDeviation: DEFAULT_MAX_ENTRY_DEVIATION,
-        deviationWarning:
-          !previewRebased && deviation > DEFAULT_MAX_ENTRY_DEVIATION,
+        currentMarketPrice,
+        balance: sizing.availableBalance,
+        riskPercent: sizing.riskPercent,
+        riskAmount: sizing.riskAmount,
+        priceDistance: sizing.priceDistance,
+        calculatedLotSize: sizing.positionQuantity,
+        estimatedLossIfSL: sizing.estimatedRiskAmount,
+        estimatedProfitIfTP: profit.toFixed(),
+        riskRewardRatio: profit.div(sizing.estimatedRiskAmount).toFixed(2),
+        positionQuantity: sizing.positionQuantity,
+        orderQuantity: sizing.orderQuantity,
+        positionNotional: sizing.positionNotional,
+        leverage: sizing.leverage,
+        initialMargin: sizing.initialMargin,
+        marginMode: context.marginMode,
+        sizing,
+        deviation,
+        maxDeviation,
+        deviationWarning: false,
       },
     });
   } catch (err) {
-    console.error("[previewTrade]", err);
-    return res.status(500).json({ success: false, message: "Internal server error." });
+    if (err instanceof TradeRiskError) return res.status(err.code === "EXCHANGE_UNAVAILABLE" ? 502 : err.code === "ENTRY_DEVIATION" ? 409 : 422).json({ success: false, code: err.code, message: err.message });
+    return res.status(502).json({ success: false, code: "PREVIEW_UNAVAILABLE", message: "Could not verify the exchange balance, rules or market data. No trade was prepared." });
   }
 }

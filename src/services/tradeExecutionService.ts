@@ -1,4 +1,5 @@
-import { calculateTradeRisk, TradeRiskError, D } from "./tradeRiskService.js";
+import { planTrade } from "./tradePlanningService.js";
+import { TradeRiskError, D } from "./tradeRiskService.js";
 import { getFuturesContext, configureLeverage, refreshAvailableFuturesBalance } from "./futuresExchangeService.js";
 import { verifyOrRecoverProtection, ProtectionFailure } from "./tradeProtectionService.js";
 import { processTradeClose } from "./profitSharingService.js";
@@ -16,12 +17,10 @@ import { decryptCredentials } from "../services/exchangeConnectionService.js";
 import { getTradeMonitorService } from "../services/tradeMonitorService.js";
 import {
   getExchangeMode,
-  shouldRebaseTestnetSignals,
 } from "../services/exchangeEnvironment.js";
 import {
   SUPPORTED_PAIRS,
   SUPPORTED_TRADE_EXCHANGES,
-  DEFAULT_MAX_ENTRY_DEVIATION,
 } from "../constants.js";
 import { queueTradeEmail } from "../services/emailService.js";
 import { getProfitShareSummary } from "../services/profitSharingService.js";
@@ -244,73 +243,8 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
 
     const rawCreds = decryptCredentials(storedCreds);
 
-    let currentPriceResult;
-    try {
-      currentPriceResult = await (dependencies.getCurrentPrice ?? getCurrentPrice)(
-        connection.exchange as ExchangeId,
-        signal.pair,
-      );
-    } catch (priceErr) {
-      const message =
-        priceErr instanceof Error
-          ? priceErr.message
-          : "Current price lookup failed.";
-      console.error("[initiateTrade] Price lookup error:", message);
-      return tradeOutcome(502, {
-        message: "Failed to fetch current market price.",
-        detail: message,
-      });
-    }
-
-    const signalEntryPrice = parseFloat(signal.entry);
-    const currentPrice = parseFloat(currentPriceResult.price);
-
-    if (!Number.isFinite(signalEntryPrice) || signalEntryPrice <= 0) {
-      return tradeOutcome(422, {
-        message: "Signal entry price is invalid.",
-      });
-    }
-
-    if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
-      return tradeOutcome(502, {
-        message: "Exchange returned an invalid current price.",
-      });
-    }
-
-    const configuredMaxDeviation = parseFloat(
-      process.env.TRADE_ENTRY_DEVIATION_LIMIT ?? "",
-    );
-    const maxDeviation =
-      Number.isFinite(configuredMaxDeviation) && configuredMaxDeviation > 0
-        ? configuredMaxDeviation
-        : DEFAULT_MAX_ENTRY_DEVIATION;
-    const deviation =
-      Math.abs(currentPrice - signalEntryPrice) / signalEntryPrice;
-    const rebaseForTestnet = shouldRebaseTestnetSignals();
-
-    if (!rebaseForTestnet && deviation > maxDeviation) {
-      return tradeOutcome(409, {
-        message: "Current market price is too far from the signal entry price.",
-        pair: signal.pair,
-        entryPrice: signal.entry,
-        currentPrice: currentPriceResult.price,
-        deviation: Number(deviation.toFixed(6)),
-        maxDeviation,
-      });
-    }
-
-    // ── 6. Position sizing — 2% risk model ───────────────────────────────────
-    // Keep original decimal strings through rebasing, ticks, quantity and fees.
-    const testnetScale = rebaseForTestnet ? new D(currentPriceResult.price).div(signal.entry) : new D(1);
-    const executionEntryPrice = rebaseForTestnet ? currentPriceResult.price : String(signal.entry);
-    const executionTpPrice = new D(signal.tp).mul(testnetScale).toFixed();
-    const executionSlPrice = new D(signal.sl).mul(testnetScale).toFixed();
-
     const exchange = connection.exchange as ExchangeId;
-    const context = await (dependencies.getFuturesContext ?? getFuturesContext)(exchange, rawCreds, normalizedPair);
-    const sizing = calculateTradeRisk({ exchange, availableBalance: context.availableBalance, accountBalance: context.accountBalance,
-      entry: String(executionEntryPrice), sl: String(executionSlPrice), tp: String(executionTpPrice), direction: signal.direction,
-      takerFeeRate: context.takerFeeRate, rules: context.rules });
+    const { sizing, context, signalPricesRebased: rebaseForTestnet } = await planTrade(exchange, rawCreds, signal, dependencies);
     await (dependencies.configureLeverage ?? configureLeverage)(exchange, rawCreds, context, sizing);
     const availableAtSubmission = await (dependencies.refreshAvailableFuturesBalance ?? refreshAvailableFuturesBalance)(exchange, rawCreds, context);
     if (new D(sizing.estimatedRiskAmount).gt(new D(availableAtSubmission).mul("0.02")) || new D(sizing.initialMargin).plus(sizing.marginReserve).gt(availableAtSubmission)) {
@@ -439,7 +373,7 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
       return tradeOutcome(502, { success: false, message: safeMessage, code: rejected ? err.code : "ORDER_REVIEW_REQUIRED",
         tradeId: String(attempt._id), clientOrderId: attempt.exchangeClientOrderId });
     }
-    if (err instanceof TradeRiskError) return tradeOutcome(err.code === "EXCHANGE_UNAVAILABLE" ? 502 : 422, { success: false, code: err.code, message: err.message });
+    if (err instanceof TradeRiskError) return tradeOutcome(err.code === "EXCHANGE_UNAVAILABLE" ? 502 : err.code === "ENTRY_DEVIATION" ? 409 : 422, { success: false, code: err.code, message: err.message });
     return tradeOutcome(503, { success: false, message: "Trade preparation is unavailable. Check the connected futures account and try again." });
   } finally {
     if (lockedConnectionId && lockToken) await ExchangeConnection.updateOne({ _id: lockedConnectionId, executionLockToken: lockToken },

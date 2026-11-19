@@ -4,8 +4,8 @@ import { calculateTradeRisk, validateAmendmentRisk, D, type InstrumentRules } fr
 
 export const btcRules: InstrumentRules = { symbol: "BTCUSDT", quantityStep: "0.001", minimumQuantity: "0.001", maximumQuantity: "100",
   minimumNotional: "5", priceTickSize: "0.1", contractSize: "1", minimumLeverage: "1", maximumLeverage: "100", leverageStep: "1",
-  tiers: [{ maximumNotional: "100000", maximumLeverage: "100", maintenanceRate: "0.005", initialMarginRate: "0.01" }] };
-const sample = { exchange: "bybit", availableBalance: "50", accountBalance: "50", entry: "64755.1", sl: "64949.3", tp: "64000", direction: "sell" as const, takerFeeRate: "0.0006", rules: btcRules };
+  tiers: [{ maximumNotional: "100000", maximumLeverage: "100", maintenanceRate: "0.005", initialMarginRate: "0.01", maintenanceDeduction: "0" }] };
+const sample = { exchange: "bybit", marginMode: "isolated", availableBalance: "50", accountBalance: "50", entry: "64755.1", sl: "64949.3", tp: "64000", direction: "sell" as const, takerFeeRate: "0.0006", rules: btcRules };
 
 for (const balance of ["50", "100", "250", "500", "1000"]) test(`$${balance}: stop loss plus both fees stays within 2%`, () => {
   const result = calculateTradeRisk({ ...sample, availableBalance: balance, accountBalance: balance });

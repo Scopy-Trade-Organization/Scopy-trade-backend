@@ -1,3 +1,5 @@
+> Final audit corrections and current limitations: [final audit](futures-risk-management-final-audit.md). This supersedes the original cross-margin and liquidation-budgeting descriptions below.
+
 # Futures risk management and exchange implementation
 
 This document explains the changes in plain English. It covers the backend and
@@ -423,10 +425,9 @@ The automated backend suite covers:
 - Amendment risk limits and the existing settlement, earning and withdrawal tests.
 
 Run backend checks with `npm test` and `npm run build`.
-The backend has no configured lint script; TypeScript compilation is its current
-static check. The frontend has ESLint and a production build.
+The backend now has `npm run lint` for source, tests and scripts, alongside TypeScript compilation. The frontend has ESLint and a production build.
 
-Validation result: 78 backend tests passed, the backend TypeScript build passed,
+Original implementation validation (before the final audit): 78 backend tests passed, the backend TypeScript build passed,
 the frontend production build passed, and ESLint passed for all changed frontend
 files with no errors or warnings.
 

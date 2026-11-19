@@ -8,9 +8,12 @@ export class TradeRiskError extends Error {
 export interface MarginTier {
   maximumNotional?: string;
   maximumOrderQuantity?: string;
+  minimumOrderQuantity?: string;
   maximumLeverage: string;
   maintenanceRate: string;
   initialMarginRate?: string;
+  maintenanceDeduction?: string;
+  minimumNotional?: string;
 }
 export interface InstrumentRules {
   symbol: string;
@@ -42,6 +45,7 @@ function tick(value: string, step: string, up: boolean) {
 export function calculateTradeRisk(input: {
   exchange: string; availableBalance: string; accountBalance: string; entry: string; sl: string; tp: string;
   direction: "buy" | "sell"; takerFeeRate: string; rules: InstrumentRules;
+  marginMode: string;
 }) {
   const { rules, direction } = input;
   if (direction !== "buy" && direction !== "sell") throw new TradeRiskError("INVALID_DIRECTION", "Choose buy or sell.");
@@ -90,11 +94,14 @@ export function calculateTradeRisk(input: {
   const leverage = D.max(minimum, notional.mul(openingBufferRate.plus(1)).div(usableMargin)).minus(minimum).div(step).ceil().mul(step).plus(minimum);
   const initialMargin = D.max(notional.div(leverage), notional.mul(decimal(tier.initialMarginRate ?? "0", "Initial margin rate", true)));
   const totalReserve = marginReserve.plus(initialMargin.mul(openingBufferRate));
-  if (leverage.gt(maximum) || initialMargin.plus(totalReserve).gt(available) ||
-      initialMargin.mul("0.9").lt(stopLoss.plus(maintenance).plus(closingFee))) {
-    throw new TradeRiskError("INSUFFICIENT_MARGIN", "Insufficient available margin for this trade at permitted leverage, with the stop loss safely ahead of the estimated liquidation boundary.");
+  if (leverage.gt(maximum) || initialMargin.plus(totalReserve).gt(available)) {
+    throw new TradeRiskError("INSUFFICIENT_MARGIN", "Insufficient available margin for this trade at permitted leverage after fees and maintenance reserves.");
   }
+  const liquidation = validateLiquidationSafety({ exchange: input.exchange, marginMode: input.marginMode,
+    direction, entry: entryPrice, stop: stopLossPrice, quantity: quantity.toFixed(),
+    orderQuantity, initialMargin: initialMargin.toFixed(), takerFeeRate: feeRate.toFixed(), rules });
   return {
+    ...liquidation, marginMode: input.marginMode,
     accountBalance: input.accountBalance, availableBalance: available.toFixed(), riskPercent: MAX_RISK_PERCENT,
     riskAmount: riskAmount.toFixed(), theoreticalQuantityBeforeFees: theoreticalQuantity.toFixed(),
     estimatedRiskAmount: estimatedRisk.toFixed(), estimatedOpeningFee: openingFee.toFixed(), estimatedClosingFee: closingFee.toFixed(),
@@ -105,6 +112,58 @@ export function calculateTradeRisk(input: {
   };
 }
 export type RiskSnapshot = ReturnType<typeof calculateTradeRisk>;
+
+/** Isolated, new one-way linear positions only. Official formulas and limits are
+ * documented in docs/futures-risk-management-final-audit.md. Never infer cross
+ * account safety from the collateral allocated to a single order. */
+export function validateLiquidationSafety(input: {
+  exchange: string; marginMode: string; direction: "buy" | "sell";
+  entry: string; stop: string; quantity: string; orderQuantity: string;
+  initialMargin: string; takerFeeRate: string; rules: InstrumentRules;
+}) {
+  if (input.marginMode !== "isolated") throw new TradeRiskError("UNSUPPORTED_MARGIN_MODE",
+    `${input.exchange}: liquidation safety requires isolated margin. Cross and portfolio account-wide liquidation cannot be verified by this planner.`);
+  if (!["bybit", "okx", "bitget"].includes(input.exchange)) throw new TradeRiskError("UNSUPPORTED_EXCHANGE", "No verified liquidation model exists for this exchange.");
+  const e = decimal(input.entry, "Liquidation entry"), q = decimal(input.quantity, "Liquidation quantity");
+  const m = decimal(input.initialMargin, "Liquidation initial margin"), f = decimal(input.takerFeeRate, "Liquidation fee", true);
+  const sign = input.direction === "buy" ? new D(1) : new D(-1);
+  const stop = decimal(input.stop, "Liquidation stop");
+  const buffer = decimal(process.env.LIQUIDATION_SAFETY_BUFFER_RATE ?? "0.1", "Liquidation safety buffer");
+  if (buffer.gte(1)) throw new TradeRiskError("INVALID_EXCHANGE_RULES", "Liquidation safety buffer must be greater than zero and less than one.");
+  // Deduct both trading fees from collateral as an additional conservative reserve.
+  // Bybit's bankruptcy closing-fee terms cancel in its published no-extra-margin formula.
+  const collateral = m.minus(q.mul(e.plus(stop)).mul(f));
+  const candidates: Decimal[] = [];
+  const tiers = [...input.rules.tiers].sort((a, b) => new D(a.maximumOrderQuantity ?? a.maximumNotional!).cmp(b.maximumOrderQuantity ?? b.maximumNotional!));
+  let lower = new D(0);
+  for (const tier of tiers) {
+    const rate = decimal(tier.maintenanceRate, "Liquidation maintenance rate", true);
+    if (rate.plus(f).gte(1)) throw new TradeRiskError("INVALID_EXCHANGE_RULES", "Liquidation maintenance and fee rates are invalid.");
+    const upper = decimal(tier.maximumOrderQuantity ?? tier.maximumNotional!, "Liquidation tier limit");
+    let deduction = new D(0);
+    if (input.exchange === "bybit") deduction = decimal(tier.maintenanceDeduction!, "Bybit maintenance deduction", true);
+    if (input.exchange === "bitget") {
+      // Classic v2 tiers do not expose MM deductions. Only the verified first
+      // tier (starting at zero, zero deduction) is supported; never guess higher tiers.
+      if (!lower.isZero() || tier.minimumNotional !== "0" || q.mul(e).gt(upper)) break;
+    }
+    const effectiveRate = input.exchange === "bybit" ? rate : rate.plus(f);
+    const boundary = q.mul(e).minus(sign.mul(collateral.plus(deduction)))
+      .div(q.mul(new D(1).minus(sign.mul(effectiveRate))));
+    const tierValue = tier.maximumOrderQuantity ? new D(input.orderQuantity) : q.mul(D.max(0, boundary));
+    const minimum = tier.minimumOrderQuantity ?? tier.minimumNotional;
+    const tierLower = minimum === undefined ? lower : decimal(minimum, "Liquidation tier minimum", true);
+    if (tierValue.gte(tierLower) && tierValue.lte(upper)) candidates.push(D.max(0, boundary));
+    lower = upper;
+  }
+  if (!candidates.length) throw new TradeRiskError("LIQUIDATION_UNVERIFIABLE", `${input.exchange}: no verified maintenance tier covers the estimated liquidation boundary (Bitget Classic supports the first tier only).`);
+  const boundary = input.direction === "buy" ? D.max(...candidates) : D.min(...candidates);
+  const clearance = stop.minus(boundary).mul(sign);
+  const required = D.max(e.minus(stop).abs().mul(buffer), decimal(input.rules.priceTickSize, "Liquidation price tick"));
+  if (collateral.lte(0) || clearance.lte(required)) throw new TradeRiskError("UNSAFE_LIQUIDATION", `${input.exchange}: stop loss is too close to or beyond the estimated liquidation boundary, including the safety buffer.`);
+  return { estimatedLiquidationPrice: boundary.toFixed(), liquidationSafetyBufferRate: buffer.toFixed(),
+    liquidationClearance: clearance.toFixed(), liquidationModel: `${input.exchange}-isolated-linear`, liquidationFeeReserve: q.mul(e.plus(stop)).mul(f).toFixed() };
+}
 
 /** An amendment cannot expand the original cash-risk or reserved margin budget. */
 export function validateAmendmentRisk(trade: any, entry: string, tp: string, sl: string): RiskSnapshot {
@@ -120,7 +179,10 @@ export function validateAmendmentRisk(trade: any, entry: string, tp: string, sl:
   const risk = fill.minus(plan.stopLossPrice).abs().mul(qty).plus(fill.plus(plan.stopLossPrice).mul(qty).mul(previous.takerFeeRate));
   const margin = fill.mul(qty).div(trade.leverage || previous.leverage);
   if (risk.gt(previous.riskAmount) || margin.gt(previous.initialMargin)) throw new TradeRiskError("AMENDMENT_RISK_LIMIT", "This amendment would exceed the trade's original 2% risk or margin budget. Tighten the stop loss or close the trade instead.");
-  return { ...previous, entryPrice: plan.entryPrice, takeProfitPrice: plan.takeProfitPrice, stopLossPrice: plan.stopLossPrice,
+  const liquidation = validateLiquidationSafety({ exchange: previous.exchange, marginMode: previous.marginMode,
+    direction: trade.direction, entry: plan.entryPrice, stop: plan.stopLossPrice, quantity: qty.toFixed(), orderQuantity: previous.orderQuantity,
+    initialMargin: margin.toFixed(), takerFeeRate: previous.takerFeeRate, rules: previous.exchangeInstrumentRules });
+  return { ...previous, ...liquidation, entryPrice: plan.entryPrice, takeProfitPrice: plan.takeProfitPrice, stopLossPrice: plan.stopLossPrice,
     estimatedRiskAmount: risk.toFixed(), estimatedOpeningFee: fill.mul(qty).mul(previous.takerFeeRate).toFixed(), estimatedClosingFee: new D(plan.stopLossPrice).mul(qty).mul(previous.takerFeeRate).toFixed(),
     priceDistance: fill.minus(plan.stopLossPrice).abs().toFixed(), initialMargin: margin.toFixed(), positionNotional: fill.mul(qty).toFixed() };
 }

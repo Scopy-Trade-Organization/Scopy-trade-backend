@@ -10,13 +10,14 @@ import User from "../src/models/userModel.js";
 import { encryptCredentials } from "../src/services/exchangeConnectionService.js";
 import { D, TradeRiskError, type InstrumentRules } from "../src/services/tradeRiskService.js";
 import { ProtectionFailure } from "../src/services/tradeProtectionService.js";
+import { previewTradeWithDependencies } from "../src/controllers/tradeController.js";
 
 const rules: InstrumentRules = { symbol: "BTCUSDT", quantityStep: "0.0001", minimumQuantity: "0.0001", maximumQuantity: "100",
   minimumNotional: "5", priceTickSize: "0.1", contractSize: "1", minimumLeverage: "1", maximumLeverage: "100", leverageStep: "1",
-  tiers: [{ maximumNotional: "1000000", maximumLeverage: "100", maintenanceRate: "0.005", initialMarginRate: "0.01" }] };
+  tiers: [{ maximumNotional: "1000000", maximumLeverage: "100", maintenanceRate: "0.005", initialMarginRate: "0.01", maintenanceDeduction: "0" }] };
 let database: MongoMemoryReplSet;
 before(async () => {
-  database = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+  database = await MongoMemoryReplSet.create({ replSet: { count: 1 }, instanceOpts: [{ launchTimeout: 60_000 }] });
   await mongoose.connect(database.getUri());
   await Promise.all([Trade.init(), ExchangeConnection.init()]);
   process.env.EXCHANGE_ENCRYPTION_KEY = "1".repeat(64);
@@ -33,7 +34,7 @@ async function fixture(balance = "50") {
   let entries = 0, checks = 0, configured = false, submitted: any;
   const dependencies: ExecutionDependencies = {
     getCurrentPrice: async () => ({ price: "64755.1", raw: {} }),
-    getFuturesContext: async () => ({ availableBalance: balance, accountBalance: "9999", takerFeeRate: "0.0006", marginMode: "cross", rules }),
+    getFuturesContext: async () => ({ availableBalance: balance, accountBalance: "9999", takerFeeRate: "0.0006", marginMode: "isolated", rules }),
     configureLeverage: async () => { configured = true; },
     refreshAvailableFuturesBalance: async () => balance,
     placeOrder: async (_exchange, params) => {
@@ -78,6 +79,62 @@ test("copier quantity uses its own live balance and stop distance, not the pro p
     quantities.push(result.body.trade.quantity);
   }
   assert.ok(new D(quantities[1]!).gt(quantities[0]!));
+});
+
+test("preview ignores submitted balances, uses the copier's exchange balance and matches execution without mutations", async () => {
+  const pro = await fixture("1000");
+  const source = await executeTrade(pro.userId, pro.body, true, pro.dependencies);
+  assert.equal(source.status, 201);
+  for (const balance of ["50", "100"]) {
+    const copier = await fixture(balance);
+    let configurations = 0;
+    const configure = copier.dependencies.configureLeverage!;
+    copier.dependencies.configureLeverage = async (...args) => { configurations++; await configure(...args); };
+    const body = { sourceTradeId: source.body.trade._id, exchangeConnectionId: String(copier.connection._id) };
+    let preview: any;
+    for (const submitted of [undefined, -1, "tampered", 1e12]) {
+      let status = 0, response: any;
+      const res = { status(code: number) { status = code; return this; }, json(value: any) { response = value; return this; } };
+      await previewTradeWithDependencies({ user: copier.userId, body: { ...body, balance: submitted } } as any, res as any, copier.dependencies);
+      assert.equal(status, 200, JSON.stringify(response));
+      assert.equal(response.preview.balance, balance);
+      assert.equal(response.preview.riskAmount, new D(balance).mul("0.02").toFixed());
+      assert.ok(new D(response.preview.estimatedLossIfSL).lte(response.preview.riskAmount));
+      if (preview) assert.deepEqual(response.preview.sizing, preview.sizing);
+      preview = response.preview;
+    }
+    assert.equal(configurations, 0);
+    assert.equal(copier.entries(), 0);
+    assert.equal(copier.checks(), 0);
+    assert.equal(await Trade.countDocuments({ userId: copier.userId }), 0);
+    const executed = await executeTrade(copier.userId, body, false, copier.dependencies);
+    assert.equal(executed.status, 201, JSON.stringify(executed.body));
+    const { riskPercent, availableBalanceAtSubmission, ...sizing } = executed.body.trade.sizing;
+    const { riskPercent: previewPercent, ...previewSizing } = preview.sizing;
+    assert.deepEqual(sizing, previewSizing);
+    assert.equal(configurations, 1);
+  }
+});
+
+test("preview rejects failed exchange data and unsafe or unsupported plans without placing orders", async () => {
+  const pro = await fixture("1000");
+  const source = await executeTrade(pro.userId, pro.body, true, pro.dependencies);
+  for (const scenario of ["api", "cross", "minimum", "unsafe", "deviation"] as const) {
+    const f = await fixture();
+    const original = f.dependencies.getFuturesContext!;
+    if (scenario === "api") f.dependencies.getFuturesContext = async () => { throw new Error("API unavailable: sensitive upstream detail"); };
+    if (scenario === "cross") f.dependencies.getFuturesContext = async (...args) => ({ ...await original(...args), marginMode: "cross" });
+    if (scenario === "minimum") f.dependencies.getFuturesContext = async (...args) => { const c = await original(...args); return { ...c, rules: { ...c.rules, minimumQuantity: "1" } }; };
+    if (scenario === "unsafe") f.dependencies.getFuturesContext = async (...args) => { const c = await original(...args); return { ...c, rules: { ...c.rules, minimumLeverage: "100", tiers: [{ ...c.rules.tiers[0]!, maintenanceRate: "0.009" }] } }; };
+    if (scenario === "deviation") f.dependencies.getCurrentPrice = async () => ({ price: "100", raw: {} });
+    let status = 0, response: any;
+    const res = { status(code: number) { status = code; return this; }, json(value: any) { response = value; return this; } };
+    await previewTradeWithDependencies({ user: f.userId, body: { sourceTradeId: source.body.trade._id, exchangeConnectionId: String(f.connection._id) } } as any, res as any, f.dependencies);
+    assert.equal(status, scenario === "api" ? 502 : scenario === "deviation" ? 409 : 422);
+    assert.equal(response.success, false);
+    assert.equal(response.preview, undefined);
+    assert.equal(f.entries(), 0);
+  }
 });
 test("leverage refusal, changed available margin and exchange minimum failures submit no entry", async () => {
   const scenarios: Array<(f: Awaited<ReturnType<typeof fixture>>) => void> = [
