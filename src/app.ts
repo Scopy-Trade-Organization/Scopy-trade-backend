@@ -34,6 +34,7 @@ const limiter = rateLimit({
 
 const allowedOrigins = [
   process.env.FRONTEND_URL,
+  "https://www.scopytrade.com",
   process.env.FRONTEND_LOCALHOST,
 ].filter(Boolean) as string[];
 
@@ -72,7 +73,8 @@ process.on("SIGINT", gracefulShutdown);
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      if (!origin || allowedOrigins.includes(origin))
+        return callback(null, true);
       return callback(new Error("CORS origin denied"));
     },
     credentials: true,
@@ -110,4 +112,3 @@ app.use("/api/temporary", temporaryWithdrawalRouter);
 
 export { server };
 export default app;
-
