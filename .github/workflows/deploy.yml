@@ -1,0 +1,75 @@
+
+name: Deploy SCopyTrade Backend
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: scopytrade-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Prepare SSH connection
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+          chmod 600 ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/known_hosts
+
+          ssh-keygen -F "[$VPS_HOST]:$VPS_PORT" -f ~/.ssh/known_hosts
+
+      - name: Deploy to production VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh \
+            -p "$VPS_PORT" \
+            -i ~/.ssh/id_ed25519 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$VPS_USER@$VPS_HOST" 'bash -se' <<'REMOTE'
+          set -Eeuo pipefail
+
+          cd /var/www/scopytrade-backend/production
+
+          echo "Fetching latest main branch..."
+          git pull --ff-only origin main
+
+          echo "Installing production dependencies..."
+          npm ci
+
+          echo "Building backend..."
+          npm run build
+
+          echo "Restarting PM2 application..."
+          pm2 restart scopytrade-backend
+
+          echo "Checking local API health..."
+          curl --fail --silent --show-error \
+            --retry 10 \
+            --retry-delay 3 \
+            --retry-connrefused \
+            http://127.0.0.1:3000/api
+
+          echo
+          echo "Deployment completed successfully."
+          REMOTE
