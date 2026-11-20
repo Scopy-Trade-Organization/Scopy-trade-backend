@@ -33,7 +33,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/known_hosts
 
-          ssh-keygen -F "[$VPS_HOST]:$VPS_PORT" -f ~/.ssh/known_hosts
+          ssh-keygen -F "$VPS_HOST" -f ~/.ssh/known_hosts
 
       - name: Deploy to production VPS
         env:
