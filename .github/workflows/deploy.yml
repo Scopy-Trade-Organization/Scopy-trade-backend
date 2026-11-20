@@ -14,7 +14,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Prepare SSH connection
@@ -35,7 +35,7 @@ jobs:
 
           ssh-keygen -F "$VPS_HOST" -f ~/.ssh/known_hosts
 
-      - name: Deploy to production VPS
+      - name: Deploy with automatic rollback
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
@@ -47,12 +47,106 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             "$VPS_USER@$VPS_HOST" 'bash -se' <<'REMOTE'
+
           set -Eeuo pipefail
 
-          cd /var/www/scopytrade-backend/production
+          APP_DIR="/var/www/scopytrade-backend/production"
+          BACKUP_ROOT="/var/www/scopytrade-backend/deploy-backups"
+
+          cd "$APP_DIR"
 
           echo "Fetching latest main branch..."
           git pull --ff-only origin main
+
+          echo "Preparing deployment backup..."
+
+          BACKUP_DIR="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
+
+          mkdir -p "$BACKUP_DIR"
+
+          cp -a dist node_modules "$BACKUP_DIR/"
+
+          echo "Backup created: $BACKUP_DIR"
+
+          rollback() {
+            ORIGINAL_STATUS=$?
+
+            trap - ERR
+            set +e
+
+            echo "======================================"
+            echo "DEPLOYMENT FAILED - STARTING ROLLBACK"
+            echo "======================================"
+
+            echo "Preparing previous build and dependencies..."
+
+            rm -rf "$APP_DIR/dist.rollback" "$APP_DIR/node_modules.rollback"
+
+            if ! cp -a "$BACKUP_DIR/dist" "$APP_DIR/dist.rollback"; then
+              echo "ERROR: Could not prepare previous build."
+              exit "$ORIGINAL_STATUS"
+            fi
+
+            if ! cp -a "$BACKUP_DIR/node_modules" "$APP_DIR/node_modules.rollback"; then
+              echo "ERROR: Could not prepare previous dependencies."
+              exit "$ORIGINAL_STATUS"
+            fi
+
+            rm -rf "$APP_DIR/dist.failed" "$APP_DIR/node_modules.failed"
+
+            if ! mv "$APP_DIR/dist" "$APP_DIR/dist.failed"; then
+              echo "ERROR: Could not move failed build."
+              exit "$ORIGINAL_STATUS"
+            fi
+
+            if ! mv "$APP_DIR/node_modules" "$APP_DIR/node_modules.failed"; then
+              mv "$APP_DIR/dist.failed" "$APP_DIR/dist"
+              echo "ERROR: Could not move failed dependencies."
+              exit "$ORIGINAL_STATUS"
+            fi
+
+            if ! mv "$APP_DIR/dist.rollback" "$APP_DIR/dist"; then
+              mv "$APP_DIR/dist.failed" "$APP_DIR/dist"
+              mv "$APP_DIR/node_modules.failed" "$APP_DIR/node_modules"
+              echo "ERROR: Could not restore previous build."
+              exit "$ORIGINAL_STATUS"
+            fi
+
+            if ! mv "$APP_DIR/node_modules.rollback" "$APP_DIR/node_modules"; then
+              rm -rf "$APP_DIR/dist"
+              mv "$APP_DIR/dist.failed" "$APP_DIR/dist"
+              mv "$APP_DIR/node_modules.failed" "$APP_DIR/node_modules"
+              echo "ERROR: Could not restore previous dependencies."
+              exit "$ORIGINAL_STATUS"
+            fi
+
+            rm -rf "$APP_DIR/dist.failed" "$APP_DIR/node_modules.failed"
+
+            echo "Restarting previous application..."
+            pm2 restart scopytrade-backend
+
+            echo "Checking restored API..."
+
+            if curl --fail --silent --show-error \
+              --retry 10 \
+              --retry-delay 3 \
+              --retry-connrefused \
+              --max-time 10 \
+              http://127.0.0.1:3000/api; then
+
+              echo
+              echo "ROLLBACK SUCCESSFUL - Previous application restored."
+
+            else
+              echo
+              echo "WARNING: Previous files restored, but API health check failed."
+              pm2 logs scopytrade-backend --lines 40 --nostream
+            fi
+
+            exit "$ORIGINAL_STATUS"
+          }
+
+          trap rollback ERR
 
           echo "Installing production dependencies..."
           npm ci
@@ -60,16 +154,35 @@ jobs:
           echo "Building backend..."
           npm run build
 
-          echo "Restarting PM2 application..."
+          echo "Restarting application..."
           pm2 restart scopytrade-backend
 
-          echo "Checking local API health..."
+          echo "Checking API health..."
           curl --fail --silent --show-error \
             --retry 10 \
             --retry-delay 3 \
             --retry-connrefused \
+            --max-time 10 \
             http://127.0.0.1:3000/api
 
           echo
-          echo "Deployment completed successfully."
+          echo "Deployment successful!"
+
+          trap - ERR
+
+          echo "Cleaning old backups..."
+
+          find "$BACKUP_ROOT" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -printf '%T@ %p\n' |
+            sort -nr |
+            tail -n +4 |
+            cut -d' ' -f2- |
+            while IFS= read -r OLD_BACKUP; do
+              rm -rf -- "$OLD_BACKUP"
+            done || echo "Warning: backup cleanup was incomplete."
+
+          echo "Previous deployment backups retained."
           REMOTE
