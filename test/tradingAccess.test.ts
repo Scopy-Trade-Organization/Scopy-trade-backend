@@ -1,0 +1,101 @@
+import test, { before, after } from "node:test";
+import assert from "node:assert/strict";
+import express from "express";
+import cookieParser from "cookie-parser";
+import mongoose from "mongoose";
+import type { AddressInfo } from "node:net";
+import { MongoMemoryReplSet } from "mongodb-memory-server";
+import User from "../src/models/userModel.js";
+import { Trade } from "../src/models/tradeModel.js";
+import { CopySubscription, CopyExecution, CopyExecutionLock } from "../src/models/copySubscriptionModel.js";
+import proRouter from "../src/routes/proTraderDashboardRoutes.js";
+import copyRouter from "../src/routes/copyTraderDashboardRoutes.js";
+import { signAccessToken } from "../src/helpers/jwtHelper.js";
+import { drainCopyQueue, enqueueAutomaticCopies } from "../src/services/automaticCopyService.js";
+
+let database: MongoMemoryReplSet;
+let server: ReturnType<express.Express["listen"]>;
+let baseUrl: string;
+const originalSecret = process.env.JWT_SECRET, originalExpiry = process.env.JWT_EXPIRES_IN;
+before(async () => {
+  database = await MongoMemoryReplSet.create({ replSet: { count: 1 }, instanceOpts: [{ launchTimeout: 60_000 }] });
+  await mongoose.connect(database.getUri());
+  await Promise.all([User.init(), CopySubscription.init(), CopyExecution.init(), CopyExecutionLock.init()]);
+  process.env.JWT_SECRET = "trading-access-tests-only-32-character-secret";
+  process.env.JWT_EXPIRES_IN = "15m";
+  const app = express();
+  app.use(express.json(), cookieParser());
+  app.use("/pro", proRouter);
+  app.use("/copy", copyRouter);
+  server = app.listen(0, "127.0.0.1");
+  await new Promise<void>(resolve => server.once("listening", resolve));
+  baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+after(async () => {
+  if (server) await new Promise<void>((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve());
+    server.closeAllConnections();
+  });
+  await mongoose.disconnect();
+  await database?.stop();
+  if (originalSecret === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = originalSecret;
+  if (originalExpiry === undefined) delete process.env.JWT_EXPIRES_IN; else process.env.JWT_EXPIRES_IN = originalExpiry;
+});
+async function user(role: "ProTrader" | "CopyTrader", status?: string) {
+  const _id = new mongoose.Types.ObjectId();
+  await User.collection.insertOne({ _id, email: `${_id}@example.com`, firstName: "Test", lastName: "Trader", traderID: String(_id), role, ...(status ? { status } : {}), sessionVersion: 0, settlementOwedUnits: 0 });
+  return { _id, cookie: `user_token=${signAccessToken(String(_id), "user", 0)}` };
+}
+function request(path: string, cookie: string, method = "POST") {
+  return fetch(baseUrl + path, { method, headers: { Cookie: cookie, "Content-Type": "application/json" }, ...(method === "POST" ? { body: JSON.stringify({ status: "live" }) } : {}) });
+}
+
+test("new trading endpoints require current live status; existing management stays accessible", async () => {
+  for (const status of ["active", "waitlist", "suspended", undefined]) {
+    const pro = await user("ProTrader", status), copier = await user("CopyTrader", status);
+    for (const [path, cookie] of [["/pro/trades", pro.cookie], ["/copy/traders/invalid/copy", copier.cookie]]) {
+      const response = await request(path!, cookie!);
+      assert.equal(response.status, 403, `${path}: ${status}`);
+      assert.equal((await response.json()).code, "TRADING_NOT_ENABLED");
+    }
+    assert.equal((await request("/pro/trades", pro.cookie, "GET")).status, 200);
+    assert.equal((await request(`/copy/traders/${pro._id}/copy`, copier.cookie, "DELETE")).status, 200);
+    // A missing trade returns 404, demonstrating management is not blocked by status.
+    assert.equal((await request(`/pro/trades/${new mongoose.Types.ObjectId()}/close`, pro.cookie)).status, 404);
+  }
+});
+
+test("live users pass access checks and a database downgrade takes effect with the same session", async () => {
+  const pro = await user("ProTrader", "live"), copier = await user("CopyTrader", "live");
+  assert.equal((await request("/pro/trades", pro.cookie)).status, 400);
+  assert.equal((await request("/copy/traders/invalid/copy", copier.cookie)).status, 400);
+  await User.updateMany({ _id: { $in: [pro._id, copier._id] } }, { $set: { status: "active" } });
+  assert.equal((await request("/pro/trades", pro.cookie)).status, 403);
+  assert.equal((await request("/copy/traders/invalid/copy", copier.cookie)).status, 403);
+});
+
+test("discovery and profiles include live pro traders", async () => {
+  const pro = await user("ProTrader", "live"), copier = await user("CopyTrader", "live");
+  const discovery = await request("/copy/traders", copier.cookie, "GET");
+  assert.equal(discovery.status, 200);
+  assert.ok((await discovery.json()).traders.some((trader: { _id: string }) => trader._id === String(pro._id)));
+  assert.equal((await request(`/copy/traders/${pro._id}`, copier.cookie, "GET")).status, 200);
+});
+
+test("queued copies execute only when both the copier and source trader are still live", async () => {
+  for (const [copierStatus, proStatus] of [["live", "live"], ["active", "live"], ["waitlist", "live"], ["suspended", "live"], ["live", "active"], ["live", "suspended"]]) {
+    const copier = await user("CopyTrader", "live"), pro = await user("ProTrader", "live");
+    const sourceId = new mongoose.Types.ObjectId(), connectionId = new mongoose.Types.ObjectId();
+    const subscription = await CopySubscription.create({ copierId: copier._id, proTraderId: pro._id, exchangeConnectionId: connectionId, allocation: 100, startedAt: new Date(Date.now() - 5000) });
+    await Trade.collection.insertOne({ _id: sourceId, userId: pro._id, signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId(), status: "filled", protectionStatus: "confirmed", createdAt: new Date(), pair: "BTCUSDT", tradeOrigin: "pro" });
+    await enqueueAutomaticCopies(String(sourceId));
+    await User.updateOne({ _id: copier._id }, { $set: { status: copierStatus } });
+    await User.updateOne({ _id: pro._id }, { $set: { status: proStatus } });
+    let executions = 0;
+    await drainCopyQueue({ executeTrade: async () => { executions++; return { status: 201, body: {} }; } });
+    const allowed = copierStatus === "live" && proStatus === "live";
+    assert.equal(executions, allowed ? 1 : 0);
+    const job = await CopyExecution.findOne({ subscriptionId: subscription._id }).lean();
+    assert.equal(job?.status, allowed ? "completed" : "failed");
+  }
+});

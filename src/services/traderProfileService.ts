@@ -33,13 +33,13 @@ export async function getCopiers(proTraderId: mongoose.Types.ObjectId, now = new
       exchange: connection?.exchange, label: connection?.label,
       copiedTrades: stat.copiedTrades, monthlyTrades: stat.monthlyTrades, monthlyFees: stat.monthlyFees, realizedPnl: stat.realizedPnl,
       balanceQualified, balanceFresh,
-      rankActive: copier?.status === "active" && balanceQualified && stat.monthlyTrades >= 15 && stat.monthlyFees >= 10,
+      rankActive: (copier?.status === "active" || copier?.status === "live") && balanceQualified && stat.monthlyTrades >= 15 && stat.monthlyFees >= 10,
     };
   });
 }
 
 export async function traderProfile(proTraderId: mongoose.Types.ObjectId, viewerId?: mongoose.Types.ObjectId) {
-  const user = await User.findOne({ _id: proTraderId, role: "ProTrader", status: "active" }).select("firstName lastName traderID profilePhoto createdAt").lean();
+  const user = await User.findOne({ _id: proTraderId, role: "ProTrader", status: { $in: ["active", "live"] } }).select("firstName lastName traderID profilePhoto createdAt").lean();
   if (!user) return null;
   const [copiers, closed, activeTrades, subscription] = await Promise.all([
     getCopiers(proTraderId),
@@ -77,7 +77,7 @@ export function initializeTraderRanks() {
     if (running) return;
     running = true;
     try {
-      for await (const user of User.find({ role: "ProTrader", status: "active" }).select("_id").lean().cursor()) {
+      for await (const user of User.find({ role: "ProTrader", status: { $in: ["active", "live"] } }).select("_id").lean().cursor()) {
         await traderProfile(user._id);
       }
     } finally { running = false; }

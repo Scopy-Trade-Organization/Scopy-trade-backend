@@ -84,8 +84,8 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
             await CopyExecution.updateOne({ _id: job._id }, { $set: { status: "skipped", reason: "Subscription was stopped before execution.", completedAt: new Date() } });
             continue;
           }
-          if (!await User.exists({ _id: job.copierId, role: "CopyTrader", status: "active" })) throw new Error("Your account is currently unavailable for copying. Contact support.");
-          if (!await User.exists({ _id: source.userId, role: "ProTrader", status: "active" })) throw new Error("This pro trader is currently unavailable for copying.");
+          if (!await User.exists({ _id: job.copierId, role: "CopyTrader", status: "live" })) throw new Error("Your account is not currently enabled for trading. Only live accounts can copy new trades.");
+          if (!await User.exists({ _id: source.userId, role: "ProTrader", status: "live" })) throw new Error("This pro trader is not currently enabled for trading.");
           if (!["pending", "filled"].includes(source.status)) throw new Error("The pro trader's position closed before your copy could be opened.");
           if (source.protectionStatus !== "confirmed") throw new Error("The pro trader's stop-loss protection is not confirmed. This trade cannot be copied.");
           const existingTrade = await Trade.findOne({ sourceTradeId: job.sourceTradeId, exchangeConnectionId: job.exchangeConnectionId }).select("status protectionStatus").lean();

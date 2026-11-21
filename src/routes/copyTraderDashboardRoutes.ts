@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { discoverTraders, getTraderProfile, startCopying, stopCopying, mySubscriptions, notifications, readNotification } from "../controllers/traderFlowController.js";
 import rateLimit from "express-rate-limit";
+import { requireLiveTrading } from "../middleware/requireLiveTrading.js";
 import {
   userAuthenticate,
   requireRole,
@@ -20,7 +21,7 @@ copyTraderDashboardRouter.use(requireRole(["CopyTrader"]));
 const copyLimit = rateLimit({ windowMs: 60_000, limit: 20 });
 copyTraderDashboardRouter.get("/traders", discoverTraders);
 copyTraderDashboardRouter.get("/traders/:traderId", getTraderProfile);
-copyTraderDashboardRouter.post("/traders/:traderId/copy", copyLimit, startCopying);
+copyTraderDashboardRouter.post("/traders/:traderId/copy", requireLiveTrading, copyLimit, startCopying);
 copyTraderDashboardRouter.delete("/traders/:traderId/copy", stopCopying);
 copyTraderDashboardRouter.get("/subscriptions", mySubscriptions);
 copyTraderDashboardRouter.get("/notifications", notifications);

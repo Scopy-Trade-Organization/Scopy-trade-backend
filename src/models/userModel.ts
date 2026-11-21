@@ -64,8 +64,8 @@ const userSchema = new Schema(
     },
     status: {
       type: String,
-      enum: ["active", "suspended", "waitlist"],
-      default: "waitlist",
+      enum: ["active", "suspended", "waitlist", "live"],
+      default: "active",
     },
     isVerified: {
       type: Boolean,
@@ -87,12 +87,26 @@ const userSchema = new Schema(
     },
     withdrawalAddressChangedAt: { type: Date, default: null },
     // Unpaid copier settlement fees, in USDT micro-units.
-    settlementOwedUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
+    settlementOwedUnits: {
+      type: Number,
+      default: 0,
+      min: 0,
+      validate: Number.isSafeInteger,
+    },
     // Available pro-trader earnings after withdrawal reservations, in USDT micro-units.
-    proBalanceUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
-    proNetworkFeeOwedUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
+    proBalanceUnits: {
+      type: Number,
+      default: 0,
+      min: 0,
+      validate: Number.isSafeInteger,
+    },
+    proNetworkFeeOwedUnits: {
+      type: Number,
+      default: 0,
+      min: 0,
+      validate: Number.isSafeInteger,
+    },
     financeOtpSentAt: { type: Date, default: null },
-
   },
   { timestamps: true },
 );

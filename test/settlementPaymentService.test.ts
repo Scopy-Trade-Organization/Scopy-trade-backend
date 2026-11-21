@@ -441,8 +441,9 @@ test("scanner retries an incomplete page without advancing its checkpoint", asyn
 
 test("automatic copy worker checks settlement independently immediately before execution", async () => {
   const f = await fixture(), proId = new mongoose.Types.ObjectId(), sourceId = new mongoose.Types.ObjectId();
+  await User.updateOne({ _id: f.userId }, { $set: { status: "live" } });
   const subscriptionId = new mongoose.Types.ObjectId(), connectionId = new mongoose.Types.ObjectId();
-  await User.collection.insertOne({ _id: proId, role: "ProTrader", status: "active", email: `${proId}@example.com`, traderID: String(proId) });
+  await User.collection.insertOne({ _id: proId, role: "ProTrader", status: "live", email: `${proId}@example.com`, traderID: String(proId) });
   const startedAt = new Date(Date.now() - 5000);
   await Trade.collection.insertOne({ _id: sourceId, userId: proId, status: "filled", protectionStatus: "confirmed", createdAt: new Date(), pair: "BTCUSDT", tradeOrigin: "pro", signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
   await CopySubscription.collection.insertOne({ _id: subscriptionId, copierId: f.userId, proTraderId: proId, exchangeConnectionId: connectionId, active: true, allocation: 100, startedAt });

@@ -120,16 +120,6 @@ export const registerUser = async (
         });
       }
 
-      // Temporarily collect unverified registrations directly on the waitlist.
-      if (existingUser.status === "suspended") {
-        return res.status(403).json({
-          status: "fail",
-          message: "Your account has been suspended. Please contact support.",
-        });
-      }
-      existingUser.status = "waitlist";
-      await existingUser.save();
-
       // Temporarily disabled: signup OTP generation and email delivery.
       // const code = await issueOtp({
       //   email: existingUser.email,
