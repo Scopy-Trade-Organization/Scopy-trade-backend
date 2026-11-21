@@ -1,3 +1,4 @@
+import { initializeSettlements } from "./services/settlementPaymentService.js";
 import { initializeProFinance } from "./services/proFinanceService.js";
 import { initializeAutomaticCopying } from "./services/automaticCopyService.js";
 import { initializeTraderRanks } from "./services/traderProfileService.js";
@@ -18,6 +19,7 @@ try {
   await mongoose.connect(MONGO_URI);
   console.log("MongoDB Connected Successfully");
   await initializeProFinance();
+  await initializeSettlements();
   await initializeTradeMonitoring();
   initializeAutomaticCopying();
   initializeTraderRanks();

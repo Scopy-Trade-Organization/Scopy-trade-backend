@@ -18,7 +18,7 @@ export interface RegisterRequestBody {
 
 // ─── Supported Exchanges ───────────────────────────────────────────────────────
 
-export type ExchangeId = "binance" | "bybit" | "okx" | "bitget";
+export type ExchangeId = "bybit" | "okx" | "bitget";
 
 export interface ExchangeMeta {
   name: string;
@@ -27,11 +27,6 @@ export interface ExchangeMeta {
 }
 
 export const SUPPORTED_EXCHANGES: Record<ExchangeId, ExchangeMeta> = {
-  binance: {
-    name: "Binance",
-    requiresPassphrase: false,
-    fields: ["apiKey", "apiSecret"],
-  },
   bybit: {
     name: "Bybit",
     requiresPassphrase: false,
@@ -68,13 +63,6 @@ export interface EncryptedCredentials {
 
 // ─── Exchange Account Info (returned after validation) ────────────────────────
 
-export interface BinanceAccountInfo {
-  accountType: string;
-  canTrade: boolean;
-  canWithdraw: boolean;
-  permissions: string[];
-}
-
 export interface BybitAccountInfo {
   accountType: string;
   permissions: Record<string, string[]>;
@@ -97,7 +85,6 @@ export interface BitgetAccountInfo {
 }
 
 export type AccountInfo =
-  | BinanceAccountInfo
   | BybitAccountInfo
   | OkxAccountInfo
   | BitgetAccountInfo;

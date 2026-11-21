@@ -1,3 +1,4 @@
+import { getProfitShareSummary } from "./profitSharingService.js";
 import mongoose from "mongoose";
 import { CopyExecution, CopyExecutionLock, CopyNotification, CopySubscription } from "../models/copySubscriptionModel.js";
 import { Trade } from "../models/tradeModel.js";
@@ -26,7 +27,7 @@ export async function refreshConnectionBalance(connectionId: mongoose.Types.Obje
 
 export async function enqueueAutomaticCopies(sourceTradeId: string) {
   const source = await Trade.findOne({ _id: sourceTradeId, tradeOrigin: "pro" }).lean();
-  if (!source || source.copyFanoutAt) return;
+  if (!source || source.copyFanoutAt || source.protectionStatus !== "confirmed") return;
   const subscriptions = await CopySubscription.find({ proTraderId: source.userId, active: true, startedAt: { $lte: source.createdAt } }).lean();
   if (subscriptions.length) await CopyExecution.bulkWrite(subscriptions.map(subscription => ({ updateOne: {
     filter: { sourceTradeId: source._id, exchangeConnectionId: subscription.exchangeConnectionId },
@@ -65,10 +66,11 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
     // Recover interrupted work conservatively: never blindly repeat an exchange order.
     const interrupted = await CopyExecution.find({ status: "processing", startedAt: { $lt: new Date(Date.now() - 10 * 60_000) } }).lean();
     for (const job of interrupted) {
-      const existing = await Trade.exists({ sourceTradeId: job.sourceTradeId, exchangeConnectionId: job.exchangeConnectionId });
+      const existing = await Trade.findOne({ sourceTradeId: job.sourceTradeId, exchangeConnectionId: job.exchangeConnectionId }).select("status protectionStatus").lean();
+      const confirmed = existing?.protectionStatus === "confirmed" && !["failed", "cancelled"].includes(existing.status);
       const reason = "Order confirmation was interrupted. Check your exchange order history and contact support before retrying.";
-      await CopyExecution.updateOne({ _id: job._id, status: "processing" }, { $set: { status: existing ? "completed" : "failed", reason: existing ? null : reason, completedAt: new Date() } });
-      if (!existing) await notifyFailure(job, reason);
+      await CopyExecution.updateOne({ _id: job._id, status: "processing" }, { $set: { status: confirmed ? "completed" : "failed", reason: confirmed ? null : reason, completedAt: new Date() } });
+      if (!confirmed) await notifyFailure(job, reason);
     }
     const outcomes = await Promise.allSettled(Array.from({ length: 8 }, async () => {
       for (let i = 0; i < 25; i++) {
@@ -77,7 +79,7 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
         let locked = false, retainLock = false;
         try {
           const subscription = await CopySubscription.findOne({ _id: job.subscriptionId, active: true }).lean();
-          const source = await Trade.findById(job.sourceTradeId).select("userId status createdAt").lean();
+          const source = await Trade.findById(job.sourceTradeId).select("userId status protectionStatus createdAt").lean();
           if (!subscription || !source || subscription.startedAt > source.createdAt) {
             await CopyExecution.updateOne({ _id: job._id }, { $set: { status: "skipped", reason: "Subscription was stopped before execution.", completedAt: new Date() } });
             continue;
@@ -85,7 +87,13 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
           if (!await User.exists({ _id: job.copierId, role: "CopyTrader", status: "active" })) throw new Error("Your account is currently unavailable for copying. Contact support.");
           if (!await User.exists({ _id: source.userId, role: "ProTrader", status: "active" })) throw new Error("This pro trader is currently unavailable for copying.");
           if (!["pending", "filled"].includes(source.status)) throw new Error("The pro trader's position closed before your copy could be opened.");
-          if (await Trade.exists({ sourceTradeId: job.sourceTradeId, exchangeConnectionId: job.exchangeConnectionId })) {
+          if (source.protectionStatus !== "confirmed") throw new Error("The pro trader's stop-loss protection is not confirmed. This trade cannot be copied.");
+          const existingTrade = await Trade.findOne({ sourceTradeId: job.sourceTradeId, exchangeConnectionId: job.exchangeConnectionId }).select("status protectionStatus").lean();
+          if (existingTrade) {
+            if (existingTrade.protectionStatus !== "confirmed" || ["failed", "cancelled"].includes(existingTrade.status)) {
+              retainLock = existingTrade.protectionStatus === "review";
+              throw new Error("An earlier copy attempt failed or needs exchange review. No duplicate entry was submitted.");
+            }
             await CopyExecution.updateOne({ _id: job._id }, { $set: { status: "completed", completedAt: new Date() } });
             continue;
           }
@@ -101,16 +109,13 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
             }
             throw new Error("Another automatic order is processing or needs review on this exchange account. Check your order history or contact support.");
           }
-          let balance: number;
-          try { balance = await (dependencies.refreshConnectionBalance ?? refreshConnectionBalance)(job.exchangeConnectionId, job.copierId); }
-          catch { throw new Error("Your exchange balance could not be verified. Check your connection and API permissions in Exchange Settings."); }
-          if (balance < subscription.allocation) throw new Error(`Insufficient connected balance: this subscription requires ${subscription.allocation} USDT. Reduce the allocation or fund your account.`);
           // Recheck immediately before execution so stopping a queued subscription takes effect.
           if (!await CopySubscription.exists({ _id: job.subscriptionId, active: true, startedAt: subscription.startedAt })) {
             await CopyExecution.updateOne({ _id: job._id }, { $set: { status: "skipped", completedAt: new Date() } });
             continue;
           }
-          const result = await (dependencies.executeTrade ?? executeTrade)(job.copierId, { sourceTradeId: String(job.sourceTradeId), exchangeConnectionId: String(job.exchangeConnectionId), balance: subscription.allocation }, false);
+          if ((await getProfitShareSummary(job.copierId)).settlementRequired) throw new Error("Settle your outstanding profit share in your dashboard before copying new trades.");
+          const result = await (dependencies.executeTrade ?? executeTrade)(job.copierId, { sourceTradeId: String(job.sourceTradeId), exchangeConnectionId: String(job.exchangeConnectionId) }, false);
           retainLock = result.body.code === "ORDER_REVIEW_REQUIRED";
           if (result.status !== 201) throw new Error(safeFailure(result));
           await CopyExecution.updateOne({ _id: job._id }, { $set: { status: "completed", completedAt: new Date() } });
@@ -139,7 +144,7 @@ export function triggerAutomaticCopies(sourceTradeId: string): void {
 export function initializeAutomaticCopying() {
   const recover = async () => {
     // Recover fan-out missed between persisting a pro order and scheduling its helper.
-    const sources = await Trade.find({ tradeOrigin: "pro", copyFanoutAt: null }).sort({ createdAt: 1 }).select("_id").limit(500).lean();
+    const sources = await Trade.find({ tradeOrigin: "pro", copyFanoutAt: null, protectionStatus: "confirmed", status: { $in: ["pending", "filled"] } }).sort({ createdAt: 1 }).select("_id").limit(500).lean();
     for (const source of sources) await enqueueAutomaticCopies(String(source._id));
     await drainCopyQueue();
   };

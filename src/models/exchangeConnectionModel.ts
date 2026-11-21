@@ -13,7 +13,7 @@ const exchangeConnectionSchema = new Schema(
     exchange: {
       type: String,
       required: true,
-      enum: ["binance", "bybit", "okx", "bitget"] as ExchangeId[],
+      enum: ["bybit", "okx", "bitget"] as ExchangeId[],
       lowercase: true,
     },
 
@@ -45,6 +45,8 @@ const exchangeConnectionSchema = new Schema(
     lastTestedAt: { type: Date, default: null },
     balanceUsdt: { type: Number, default: null },
     balanceCheckedAt: { type: Date, default: null },
+    executionLockToken: { type: String, default: null },
+    executionLockUntil: { type: Date, default: null },
     lastTestStatus: {
       type: String,
       enum: ["ok", "failed", null],

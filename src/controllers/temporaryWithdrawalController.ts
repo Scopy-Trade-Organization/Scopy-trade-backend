@@ -4,9 +4,7 @@ import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import { Signal } from "../models/signalModel.js";
 import { Trade } from "../models/tradeModel.js";
 import User from "../models/userModel.js";
-import { Settlement } from "../models/settlementModel.js";
 import {
-  approveProfitShareWithdrawal,
   processTradeClose,
 } from "../services/profitSharingService.js";
 
@@ -343,51 +341,7 @@ export async function simulateSuccessfulTradeClose(
   }
 }
 
-/** Runs real signed credential/balance preflight, then simulates transfer success. */
-export async function simulateProfitShareWithdrawal(
-  req: Request,
-  res: Response,
-) {
-  try {
-    const userId = req.user as mongoose.Types.ObjectId;
-    const exchangeConnectionId = String(req.body.exchangeConnectionId || "");
-    const requestId = String(req.body.requestId || "");
-    if (!mongoose.isValidObjectId(exchangeConnectionId)) {
-      return res.status(400).json({
-        success: false,
-        message: "A valid exchangeConnectionId is required.",
-      });
-    }
-    if (!REQUEST_ID_PATTERN.test(requestId)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "requestId must contain 1-64 letters, numbers, underscores, or hyphens.",
-      });
-    }
-    const result = await approveProfitShareWithdrawal(
-      userId,
-      exchangeConnectionId,
-      { requestId, simulateSuccess: true },
-    );
-    const settlement = await Settlement.findOne({ userId, requestId })
-      .select("-destinationAddress")
-      .lean();
-    return res.status(200).json({
-      success: true,
-      idempotent: result.idempotent,
-      message:
-        "The signed exchange preflight passed and the withdrawal was simulated as completed; no funds moved.",
-      settlement,
-    });
-  } catch (error) {
-    console.error("[temporary settlement simulation]", error);
-    return res.status(422).json({
-      success: false,
-      message:
-        error instanceof Error
-          ? error.message
-          : "Settlement simulation failed.",
-    });
-  }
+/** Deprecated: no simulator may mark a wallet settlement paid without chain proof. */
+export async function simulateProfitShareWithdrawal(_req: Request, res: Response) {
+  return res.status(410).json({ success: false, message: "Exchange withdrawal settlement was removed. Use the dashboard invoice and payment verification." });
 }

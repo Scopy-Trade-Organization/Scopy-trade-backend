@@ -30,14 +30,7 @@ executionSchema.index({ status: 1, createdAt: 1 });
 executionSchema.index({ status: 1, failureNotifiedAt: 1 });
 export const CopyExecution = model("CopyExecution", executionSchema);
 
-const notificationSchema = new Schema({
-  userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
-  executionId: { type: Schema.Types.ObjectId, ref: "CopyExecution", required: true, unique: true },
-  title: { type: String, required: true },
-  message: { type: String, required: true },
-  readAt: { type: Date, default: null },
-}, { timestamps: true });
-export const CopyNotification = model("CopyNotification", notificationSchema);
+export { Notification as CopyNotification } from "./notificationModel.js";
 
 // No automatic expiry: a crashed exchange request must be reconciled before reuse.
 const lockSchema = new Schema({

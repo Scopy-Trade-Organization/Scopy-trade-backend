@@ -1,3 +1,4 @@
+import { Trade } from "./models/tradeModel.js";
 import express from "express";
 import compression from "compression";
 import "dotenv/config";
@@ -20,13 +21,13 @@ import proTraderDashboardRouter from "./routes/proTraderDashboardRoutes.js";
 import copyTraderDashboardRouter from "./routes/copyTraderDashboardRoutes.js";
 import temporaryWithdrawalRouter from "./routes/temporaryWithdrawalRoutes.js";
 import { resumePendingProfitCredits } from "./services/profitSharingService.js";
-import { backfillMissingTradeIds } from "./models/tradeModel.js";
 // import "./config/passport.js";
 
 // Rate limiting configuration
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 70,
+  skip: (req) => req.method === "GET",
   message: "Too many requests from this IP, please try again later",
   standardHeaders: "draft-8",
   legacyHeaders: false,
@@ -48,7 +49,7 @@ const wsServer = new TradeWebSocketServer(server);
 const tradeMonitor = getTradeMonitorService();
 
 export async function initializeTradeMonitoring(): Promise<void> {
-  await backfillMissingTradeIds();
+  await Trade.createIndexes();
   await tradeMonitor.resumeActiveMonitoring();
   tradeMonitor.startBackgroundReconciliation();
   await resumePendingProfitCredits();
@@ -92,6 +93,8 @@ app.use("/api", cookieParser());
 app.use("/api", express.urlencoded({ extended: false, limit: "100kb" }));
 app.use("/api", helmet({ crossOriginResourcePolicy: { policy: "same-site" } }));
 app.use("/api", limiter);
+// Dashboard polling has its own budget and cannot exhaust the mutation budget.
+app.use("/api", rateLimit({ windowMs: 15 * 60 * 1000, limit: 1200, skip: req => req.method !== "GET", standardHeaders: "draft-8", legacyHeaders: false }));
 app.use((req, res, next) => {
   req.body = sanitize(req.body);
   req.params = sanitize(req.params);

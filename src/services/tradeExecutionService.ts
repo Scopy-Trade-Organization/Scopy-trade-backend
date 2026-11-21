@@ -1,3 +1,8 @@
+import { planTrade } from "./tradePlanningService.js";
+import { TradeRiskError, D } from "./tradeRiskService.js";
+import { getFuturesContext, configureLeverage, refreshAvailableFuturesBalance } from "./futuresExchangeService.js";
+import { verifyOrRecoverProtection, ProtectionFailure } from "./tradeProtectionService.js";
+import { processTradeClose } from "./profitSharingService.js";
 import { randomUUID } from "crypto";
 import mongoose from "mongoose";
 import { Signal } from "../models/signalModel.js";
@@ -12,13 +17,10 @@ import { decryptCredentials } from "../services/exchangeConnectionService.js";
 import { getTradeMonitorService } from "../services/tradeMonitorService.js";
 import {
   getExchangeMode,
-  shouldRebaseTestnetSignals,
 } from "../services/exchangeEnvironment.js";
 import {
   SUPPORTED_PAIRS,
   SUPPORTED_TRADE_EXCHANGES,
-  MAX_RISK_PERCENT,
-  DEFAULT_MAX_ENTRY_DEVIATION,
 } from "../constants.js";
 import { queueTradeEmail } from "../services/emailService.js";
 import { getProfitShareSummary } from "../services/profitSharingService.js";
@@ -28,13 +30,24 @@ import { triggerCopiedTradeClosures } from "./copiedTradeUpdateService.js";
 export type TradeOutcome = { status: number; body: Record<string, any> };
 const tradeOutcome = (status: number, body: Record<string, any>): TradeOutcome => ({ status, body });
 
-export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record<string, any>, isProTrade: boolean): Promise<TradeOutcome> {
+export interface ExecutionDependencies {
+  getFuturesContext?: typeof getFuturesContext;
+  configureLeverage?: typeof configureLeverage;
+  refreshAvailableFuturesBalance?: typeof refreshAvailableFuturesBalance;
+  placeOrder?: typeof placeOrder;
+  getCurrentPrice?: typeof getCurrentPrice;
+  verifyOrRecoverProtection?: typeof verifyOrRecoverProtection;
+  startMonitoring?: (id: string) => Promise<void>;
+}
+export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record<string, any>, isProTrade: boolean, dependencies: ExecutionDependencies = {}): Promise<TradeOutcome> {
   let orderSubmitted = false;
+  let lockToken: string | undefined;
+  let attempt: any;
+  let lockedConnectionId: string | undefined;
   try {
     const {
       sourceTradeId,
       exchangeConnectionId,
-      balance,
       pair,
       tp,
       sl,
@@ -44,12 +57,12 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
     } = body;
 
     // ── 1. Input validation ──────────────────────────────────────────────────
-    if (!exchangeConnectionId || !balance || (!isProTrade && !sourceTradeId)) {
+    if (!exchangeConnectionId || (!isProTrade && !sourceTradeId)) {
       return tradeOutcome(400, {
         success: false,
         message: isProTrade
-          ? "exchangeConnectionId and balance are required."
-          : "sourceTradeId, exchangeConnectionId, and balance are required.",
+          ? "exchangeConnectionId is required."
+          : "sourceTradeId and exchangeConnectionId are required.",
       });
     }
 
@@ -60,14 +73,6 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
       return tradeOutcome(400, {
         success: false,
         message: "Invalid ID format.",
-      });
-    }
-
-    const parsedBalance = parseFloat(balance);
-    if (isNaN(parsedBalance) || parsedBalance <= 0) {
-      return tradeOutcome(400, {
-        success: false,
-        message: "balance must be a positive number.",
       });
     }
 
@@ -103,6 +108,7 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
       const sourceTrade = await Trade.findOne({
         _id: sourceTradeId,
         tradeOrigin: "pro",
+        protectionStatus: "confirmed",
         status: { $in: ["pending", "filled"] },
       }).lean();
 
@@ -133,7 +139,7 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
         return tradeOutcome(402, {
           success: false,
           code: "PROFIT_SHARE_DUE",
-          message: `Approve the ${Number(profitShare.pendingAmount).toFixed(2)} USDT platform profit-share withdrawal before copying another trade.`,
+          message: `Settle the ${Number(profitShare.pendingAmount).toFixed(2)} USDT profit share in your dashboard before copying another trade.`,
           profitShare,
         });
       }
@@ -170,7 +176,7 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
 
     if (!connection) {
       return tradeOutcome(404, {
-        success: true,
+        success: false,
         message:
           "Exchange connection not found or does not belong to your account.",
       });
@@ -190,7 +196,7 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
     // reconciliation unambiguously associate an exchange close with this trade.
     const activePairTrade = await Trade.findOne({
       exchangeConnectionId,
-      pair: signal.pair,
+      pair: normalizedPair,
       status: { $in: ["pending", "filled"] },
     }).lean();
 
@@ -215,6 +221,16 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
       });
     }
 
+    lockToken = randomUUID();
+    const locked = await ExchangeConnection.findOneAndUpdate({ _id: connection._id, userId, isActive: true,
+      $or: [{ executionLockUntil: null }, { executionLockUntil: { $lte: new Date() } }],
+    }, { $set: { executionLockToken: lockToken, executionLockUntil: new Date(Date.now() + 5 * 60_000) } });
+    if (!locked) return tradeOutcome(409, { success: false, code: "EXECUTION_BUSY", message: "Another trade is being prepared on this exchange account. Try again shortly." });
+    lockedConnectionId = String(connection._id);
+    // Recheck after acquiring the account lock; the first lookup is only an early hint.
+    if (await Trade.exists({ exchangeConnectionId: connection._id, pair: normalizedPair, status: { $in: ["pending", "filled"] } })) {
+      return tradeOutcome(409, { success: false, message: "An active trade already exists for this symbol on the connected account." });
+    }
     // ── 5. Decrypt credentials ───────────────────────────────────────────────
     const storedCreds = {
       exchange: connection.exchange as ExchangeId,
@@ -227,188 +243,63 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
 
     const rawCreds = decryptCredentials(storedCreds);
 
-    let currentPriceResult;
-    try {
-      currentPriceResult = await getCurrentPrice(
-        connection.exchange as ExchangeId,
-        signal.pair,
-      );
-    } catch (priceErr) {
-      const message =
-        priceErr instanceof Error
-          ? priceErr.message
-          : "Current price lookup failed.";
-      console.error("[initiateTrade] Price lookup error:", message);
-      return tradeOutcome(502, {
-        message: "Failed to fetch current market price.",
-        detail: message,
-      });
+    const exchange = connection.exchange as ExchangeId;
+    const { sizing, context, signalPricesRebased: rebaseForTestnet } = await planTrade(exchange, rawCreds, signal, dependencies);
+    await (dependencies.configureLeverage ?? configureLeverage)(exchange, rawCreds, context, sizing);
+    const availableAtSubmission = await (dependencies.refreshAvailableFuturesBalance ?? refreshAvailableFuturesBalance)(exchange, rawCreds, context);
+    if (new D(sizing.estimatedRiskAmount).gt(new D(availableAtSubmission).mul("0.02")) || new D(sizing.initialMargin).plus(sizing.marginReserve).gt(availableAtSubmission)) {
+      throw new TradeRiskError("BALANCE_CHANGED", "Available futures margin changed while preparing the trade. Refresh and try again; no entry was submitted.");
     }
+    Object.assign(sizing, { availableBalanceAtSubmission: availableAtSubmission });
 
-    const signalEntryPrice = parseFloat(signal.entry);
-    const currentPrice = parseFloat(currentPriceResult.price);
-
-    if (!Number.isFinite(signalEntryPrice) || signalEntryPrice <= 0) {
-      return tradeOutcome(422, {
-        message: "Signal entry price is invalid.",
-      });
+    if (!isProTrade && (await getProfitShareSummary(userId)).settlementRequired) {
+      return tradeOutcome(402, { success: false, code: "PROFIT_SHARE_DUE", message: "Settle your outstanding profit share in your dashboard before copying another trade." });
     }
-
-    if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
-      return tradeOutcome(502, {
-        message: "Exchange returned an invalid current price.",
-      });
-    }
-
-    const configuredMaxDeviation = parseFloat(
-      process.env.TRADE_ENTRY_DEVIATION_LIMIT ?? "",
-    );
-    const maxDeviation =
-      Number.isFinite(configuredMaxDeviation) && configuredMaxDeviation > 0
-        ? configuredMaxDeviation
-        : DEFAULT_MAX_ENTRY_DEVIATION;
-    const deviation =
-      Math.abs(currentPrice - signalEntryPrice) / signalEntryPrice;
-    const rebaseForTestnet = shouldRebaseTestnetSignals();
-
-    if (!rebaseForTestnet && deviation > maxDeviation) {
-      return tradeOutcome(409, {
-        message: "Current market price is too far from the signal entry price.",
-        pair: signal.pair,
-        entryPrice: signal.entry,
-        currentPrice: currentPriceResult.price,
-        deviation: Number(deviation.toFixed(6)),
-        maxDeviation,
-      });
-    }
-
-    // ── 6. Position sizing — 2% risk model ───────────────────────────────────
-    const testnetScale = rebaseForTestnet
-      ? currentPrice / signalEntryPrice
-      : 1;
-    const executionEntryPrice = rebaseForTestnet
-      ? currentPrice
-      : signalEntryPrice;
-    const executionTpPrice = parseFloat(signal.tp) * testnetScale;
-    const executionSlPrice = parseFloat(signal.sl) * testnetScale;
-    const validLevels =
-      Number.isFinite(executionTpPrice) &&
-      Number.isFinite(executionSlPrice) &&
-      executionTpPrice > 0 &&
-      executionSlPrice > 0 &&
-      (signal.direction === "buy"
-        ? executionSlPrice < executionEntryPrice &&
-          executionEntryPrice < executionTpPrice
-        : executionTpPrice < executionEntryPrice &&
-          executionEntryPrice < executionSlPrice);
-    if (!validLevels) {
-      return tradeOutcome(422, {
-        message:
-          "Signal price levels are invalid for its direction. A long requires SL < entry < TP; a short requires TP < entry < SL.",
-      });
-    }
-    const priceDistance = Math.abs(executionEntryPrice - executionSlPrice);
-
-    if (!Number.isFinite(priceDistance) || priceDistance <= 0) {
-      return tradeOutcome(422, {
-        message:
-          "Cannot calculate position size: entry and stop-loss prices are too close or identical.",
-      });
-    }
-
-    const riskAmount = parsedBalance * MAX_RISK_PERCENT;
-    const quantity = riskAmount / priceDistance;
-    const parsedQty = parseFloat(quantity.toFixed(6));
-
-    if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
-      return tradeOutcome(422, {
-        message: "Calculated order quantity is invalid.",
-      });
-    }
-
-    // ── 6. Place the order on the exchange ───────────────────────────────────
-    const exchangeClientOrderId = `sc_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-    let placed;
-    try {
-      placed = await placeOrder(connection.exchange as ExchangeId, {
-        credentials: rawCreds,
-        pair: signal.pair,
-        direction: signal.direction as "buy" | "sell",
-        clientOrderId: exchangeClientOrderId,
-        quantity: String(parsedQty),
-        entryPrice: String(executionEntryPrice),
-        tp: String(executionTpPrice),
-        sl: String(executionSlPrice),
-      });
-    } catch (orderErr) {
-      const message =
-        orderErr instanceof Error
-          ? orderErr.message
-          : "Order placement failed.";
-      console.error("[initiateTrade] Exchange error:", message);
-      return tradeOutcome(502, {
-        message: "Failed to place order on exchange.",
-        code: "ORDER_REVIEW_REQUIRED",
-        detail: message,
-      });
-    }
-
-    // ── 7. Persist trade record ──────────────────────────────────────────────
+    const exchangeClientOrderId = `sc${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+    if (isProTrade) await signal.save();
+    // Save the client ID before the network call. A lost response is reconciled, never blindly retried.
+    attempt = await Trade.create({ userId, pair: normalizedPair, direction: signal.direction,
+      tp: sizing.takeProfitPrice, sl: sizing.stopLossPrice, signalId, tradeOrigin: isProTrade ? "pro" : "copy",
+      sourceTradeId: isProTrade ? null : sourceTradeId, exchangeConnectionId, exchangeClientOrderId,
+      quantity: sizing.positionQuantity, entryPrice: sizing.entryPrice, status: "pending",
+      sizing, leverage: sizing.leverage, marginMode: context.marginMode, protectionStatus: "pending",
+      rawOrderResponse: { sizing, exchangeMode: getExchangeMode(), signalPricesRebased: rebaseForTestnet },
+    });
+    const orderParams = { credentials: rawCreds, pair: normalizedPair, direction: signal.direction as "buy" | "sell",
+      clientOrderId: exchangeClientOrderId, quantity: sizing.positionQuantity, entryPrice: sizing.entryPrice,
+      tp: sizing.takeProfitPrice, sl: sizing.stopLossPrice, sizing, marginMode: context.marginMode };
     orderSubmitted = true;
-    if (isProTrade) {
-      await signal.save();
+    const placed = await (dependencies.placeOrder ?? placeOrder)(exchange, orderParams);
+    if (!placed.orderId) throw new TradeRiskError("ORDER_REVIEW_REQUIRED", "No exchange order ID was returned. Check the exchange before retrying.");
+    attempt.exchangeOrderId = placed.orderId;
+    attempt.rawOrderResponse = { sizing, exchangeMode: getExchangeMode(), order: placed.raw };
+    await attempt.save();
+    try {
+      await (dependencies.verifyOrRecoverProtection ?? verifyOrRecoverProtection)(exchange, { ...orderParams,
+        orderId: placed.orderId, clientOrderId: exchangeClientOrderId, orderQuantity: sizing.orderQuantity });
+    } catch (error) {
+      if (error instanceof ProtectionFailure) {
+        attempt.protectionStatus = error.recovery === "review" ? "review" : "failed";
+        attempt.protectionError = error.message;
+        attempt.monitoringError = error.message;
+        if (error.closedQuantity) attempt.quantity = error.closedQuantity;
+        if (error.entryFillPrice) attempt.entryFillPrice = error.entryFillPrice;
+        if (error.recovery === "cancelled") attempt.status = "cancelled";
+        await attempt.save();
+        if (error.recovery === "closed" && error.exitPrice) await processTradeClose(String(attempt._id), error.exitPrice, "manual");
+        if (error.recovery === "review") await (dependencies.startMonitoring ?? (id => getTradeMonitorService().startMonitoring(id)))(String(attempt._id)).catch(() => undefined);
+        return tradeOutcome(502, { success: false, code: error.recovery === "review" ? "ORDER_REVIEW_REQUIRED" : error.code,
+          message: error.message, tradeId: String(attempt._id), exchangeOrderId: placed.orderId, recovery: error.recovery });
+      }
+      throw error;
     }
-
-    const trade = await Trade.create({
-      userId,
-      pair: signal.pair,
-      direction: signal.direction,
-      tp: placed.execution?.tp ?? String(executionTpPrice),
-      sl: placed.execution?.sl ?? String(executionSlPrice),
-      signalId,
-      tradeOrigin: isProTrade ? "pro" : "copy",
-      sourceTradeId: isProTrade ? null : sourceTradeId,
-      exchangeConnectionId,
-      exchangeOrderId: placed.orderId,
-      exchangeClientOrderId,
-      quantity: placed.execution?.quantity ?? String(parsedQty),
-      entryPrice:
-        placed.execution?.entryPrice ?? String(executionEntryPrice),
-      status: "pending",
-      wsMonitoringActive: false,
-      monitoringStatus: "connecting",
-      monitoringError: null,
-      rawOrderResponse: {
-        order: placed.raw,
-        marketPrice: currentPriceResult.raw,
-        sizing: {
-          balance: parsedBalance,
-          riskPercent: MAX_RISK_PERCENT,
-          riskAmount,
-          priceDistance,
-          currentPrice: currentPriceResult.price,
-          deviation,
-          exchangeMode: getExchangeMode(),
-          signalPricesRebased: rebaseForTestnet,
-          originalSignalPrices: {
-            entry: signal.entry,
-            tp: signal.tp,
-            sl: signal.sl,
-          },
-        },
-      },
-    });
-
-    queueTradeEmail(userId, isProTrade ? "opened" : "copied", {
-      pair: trade.pair,
-      direction: trade.direction,
-      quantity: trade.quantity,
-      entryPrice: trade.entryPrice,
-    });
-
+    attempt.protectionStatus = "confirmed";
+    attempt.protectionCheckedAt = new Date();
+    await attempt.save();
+    let trade = attempt;
     let monitoringWarning: string | null = null;
     try {
-      await getTradeMonitorService().startMonitoring(String(trade._id));
+      await (dependencies.startMonitoring ?? (id => getTradeMonitorService().startMonitoring(id)))(String(trade._id));
     } catch (monitorErr) {
       monitoringWarning =
         monitorErr instanceof Error
@@ -426,6 +317,20 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
       );
       console.error("[initiateTrade] Failed to start trade monitor:", monitorErr);
     }
+
+    // Monitoring can discover a fill/protection failure before the HTTP reply.
+    // Report its persisted result instead of the earlier pending snapshot.
+    trade = await Trade.findById(trade._id) ?? trade;
+    if (trade.protectionStatus !== "confirmed") {
+      return tradeOutcome(502, { success: false, code: trade.protectionStatus === "review" ? "ORDER_REVIEW_REQUIRED" : "STOP_LOSS_PROTECTION_FAILED",
+        message: trade.protectionError || "Stop-loss protection requires exchange review.", tradeId: String(trade._id), exchangeOrderId: trade.exchangeOrderId });
+    }
+    queueTradeEmail(userId, isProTrade ? "opened" : "copied", {
+      pair: trade.pair,
+      direction: trade.direction,
+      quantity: trade.quantity,
+      entryPrice: trade.entryPrice,
+    });
 
     if (!isProTrade) {
       const source = await Trade.findById(sourceTradeId).select("status").lean();
@@ -446,6 +351,9 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
         tp: trade.tp,
         sl: trade.sl,
         quantity: trade.quantity,
+        leverage: trade.leverage,
+        sizing: { ...sizing, riskPercent: 100 * sizing.riskPercent },
+        protectionStatus: trade.protectionStatus,
         status: trade.status,
         tradeOrigin: trade.tradeOrigin,
         sourceTradeId: trade.sourceTradeId,
@@ -457,8 +365,18 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
       },
     });
   } catch (err) {
-    console.error("[initiateTrade]", err);
-    return tradeOutcome(500, { message: "Internal server error.", ...(orderSubmitted ? { code: "ORDER_REVIEW_REQUIRED" } : {}) });
+    const safeMessage = err instanceof TradeRiskError ? err.message : "The exchange could not complete or confirm this trade. Check its order history before retrying.";
+    if (attempt && orderSubmitted) {
+      const rejected = err instanceof TradeRiskError && err.code === "EXCHANGE_REJECTED";
+      await Trade.updateOne({ _id: attempt._id }, { $set: { ...(rejected ? { status: "failed" } : {}),
+        protectionStatus: rejected ? "failed" : "review", protectionError: safeMessage, monitoringError: safeMessage } }).catch(() => undefined);
+      return tradeOutcome(502, { success: false, message: safeMessage, code: rejected ? err.code : "ORDER_REVIEW_REQUIRED",
+        tradeId: String(attempt._id), clientOrderId: attempt.exchangeClientOrderId });
+    }
+    if (err instanceof TradeRiskError) return tradeOutcome(err.code === "EXCHANGE_UNAVAILABLE" ? 502 : err.code === "ENTRY_DEVIATION" ? 409 : 422, { success: false, code: err.code, message: err.message });
+    return tradeOutcome(503, { success: false, message: "Trade preparation is unavailable. Check the connected futures account and try again." });
+  } finally {
+    if (lockedConnectionId && lockToken) await ExchangeConnection.updateOne({ _id: lockedConnectionId, executionLockToken: lockToken },
+      { $unset: { executionLockToken: 1, executionLockUntil: 1 } }).catch(() => undefined);
   }
 }
-

@@ -1,3 +1,5 @@
+import { ProtectionFailure, recordProtectionFailure } from "./tradeProtectionService.js";
+import { validateAmendmentRisk } from "./tradeRiskService.js";
 import { Trade } from "../models/tradeModel.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import { amendTradeOrder, closeTradeOrder, getOrderStatus } from "./tradeService.js";
@@ -44,8 +46,10 @@ async function updateOneCopiedTrade(tradeId: string, parameters: ProtectionUpdat
     const live = await getOrderStatus(exchange, credentials, trade.pair, trade.exchangeOrderId);
     if (!["pending", "filled"].includes(live.status)) return;
 
+    const sizing = validateAmendmentRisk(trade, live.filledPrice || trade.entryFillPrice || trade.entryPrice, parameters.tp, parameters.sl);
     const amended = await amendTradeOrder(exchange, {
-      credentials,
+      credentials, sizing, marginMode: trade.marginMode || (exchange === "okx" ? "isolated" : "crossed"),
+      ...(trade.exchangeClientOrderId ? { clientOrderId: trade.exchangeClientOrderId } : {}),
       pair: trade.pair,
       direction: trade.direction as "buy" | "sell",
       quantity: trade.quantity,
@@ -62,6 +66,7 @@ async function updateOneCopiedTrade(tradeId: string, parameters: ProtectionUpdat
         : {}),
     });
 
+    trade.sizing = sizing;
     trade.tp = amended.tp;
     trade.sl = amended.sl;
     if (amended.orderId) trade.exchangeOrderId = amended.orderId;
@@ -86,6 +91,7 @@ async function updateOneCopiedTrade(tradeId: string, parameters: ProtectionUpdat
       timestamp: new Date(),
     });
   } catch (error) {
+    if (error instanceof ProtectionFailure) await recordProtectionFailure(tradeId, error);
     await Trade.updateOne(
       { _id: tradeId },
       {
@@ -166,6 +172,7 @@ async function closeOneCopiedTrade(tradeId: string): Promise<void> {
     quantity: trade.quantity,
     orderId: trade.exchangeOrderId,
     status: trade.status as "pending" | "filled",
+    ...(trade.sizing ? { sizing: trade.sizing } : {}),
   });
 
   const monitor = getTradeMonitorService();
@@ -176,7 +183,8 @@ async function closeOneCopiedTrade(tradeId: string): Promise<void> {
       { $set: { status: "cancelled", closedAt: new Date(), closedVia: "manual", sourceTradeClosedAt: null, sourceTradeCloseMessage: null } },
     );
   } else {
-    await processTradeClose(String(trade._id), closed.exitPrice || trade.entryFillPrice || trade.entryPrice, "manual");
+    await Trade.updateOne({ _id: trade._id }, { $set: { ...(closed.closedQuantity ? { quantity: closed.closedQuantity } : {}), ...(closed.entryFillPrice ? { entryFillPrice: closed.entryFillPrice } : {}) } });
+    await processTradeClose(String(trade._id), closed.exitPrice!, "manual");
   }
   monitor.emit("tradeUpdate", {
     tradeId: String(trade._id),

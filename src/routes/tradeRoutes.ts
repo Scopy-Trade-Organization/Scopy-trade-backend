@@ -3,6 +3,7 @@ import {
   getUserTrades,
   getTradeById,
   fetchExchangeBalances,
+  previewTrade,
 } from "../controllers/tradeController.js";
 import {
   userAuthenticate,
@@ -13,6 +14,8 @@ const tradeRouter = Router();
 
 // All trade routes require authentication
 tradeRouter.use(userAuthenticate);
+
+tradeRouter.post("/preview", requireRole(["CopyTrader", "ProTrader"]), previewTrade);
 
 // Legacy manual copying is replaced by trader subscriptions:
 tradeRouter.post("/", requireRole(["CopyTrader"]), (_req, res) => res.status(410).json({ success: false, message: "Trades are copied automatically. Choose a pro trader from your dashboard to start copying." }));

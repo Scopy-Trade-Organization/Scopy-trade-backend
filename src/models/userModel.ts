@@ -86,22 +86,13 @@ const userSchema = new Schema(
       trim: true,
     },
     withdrawalAddressChangedAt: { type: Date, default: null },
-    proLiveUnits: { type: Number, default: 0, min: 0 },
-    proDemoUnits: { type: Number, default: 0, min: 0 },
-    proDemoGranted: { type: Boolean, default: false },
+    // Unpaid copier settlement fees, in USDT micro-units.
+    settlementOwedUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
+    // Available pro-trader earnings after withdrawal reservations, in USDT micro-units.
+    proBalanceUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
+    proNetworkFeeOwedUnits: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
     financeOtpSentAt: { type: Date, default: null },
-    proFinanceVersion: { type: Number, default: 0 },
-    proEarningsBalance: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
-    profitShareWithdrawalStatus: {
-      type: String,
-      enum: ["idle", "processing"],
-      default: "idle",
-    },
-    profitShareWithdrawalStartedAt: { type: Date, default: null },
+
   },
   { timestamps: true },
 );

@@ -111,6 +111,16 @@ const tradeSchema = new Schema(
       type: Schema.Types.Mixed,
       default: null,
     },
+    sizing: { type: Schema.Types.Mixed, default: null },
+    leverage: { type: Number, default: null },
+    marginMode: { type: String, default: null },
+    protectionStatus: {
+      type: String,
+      enum: ["pending", "confirmed", "failed", "review", null],
+      default: null,
+    },
+    protectionCheckedAt: { type: Date, default: null },
+    protectionError: { type: String, default: null },
     // Last status check snapshot from the exchange
     lastCheckedAt: {
       type: Date,
@@ -217,31 +227,17 @@ tradeSchema.index(
 );
 
 tradeSchema.index({ userId: 1, status: 1, createdAt: -1 });
+tradeSchema.index(
+  { exchangeConnectionId: 1, pair: 1 },
+  {
+    unique: true,
+    name: "one_active_position_per_symbol",
+    partialFilterExpression: { status: { $in: ["pending", "filled"] } },
+  },
+);
 tradeSchema.index({ tradeOrigin: 1, copyFanoutAt: 1, createdAt: 1 });
 
 export type ITrade = InferSchemaType<typeof tradeSchema>;
 export type TradeDocument = HydratedDocument<ITrade>;
 
 export const Trade = model<TradeDocument>("Trade", tradeSchema);
-
-export async function backfillMissingTradeIds(): Promise<void> {
-  while (true) {
-    const trades = await Trade.find({
-      $or: [
-        { tradeId: { $exists: false } },
-        { tradeId: null },
-        { tradeId: "" },
-      ],
-    }).select("_id").limit(500).lean();
-    if (!trades.length) return;
-    await Trade.bulkWrite(
-      trades.map((trade) => ({
-        updateOne: {
-          filter: { _id: trade._id, $or: [{ tradeId: { $exists: false } }, { tradeId: null }, { tradeId: "" }] },
-          update: { $set: { tradeId: createTradeId() } },
-        },
-      })),
-      { ordered: false },
-    );
-  }
-}

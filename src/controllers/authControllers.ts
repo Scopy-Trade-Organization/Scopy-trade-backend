@@ -149,9 +149,6 @@ export const registerUser = async (
       });
     }
 
-    // Temporarily force all new registrations onto the waitlist.
-    // const signupStatus =
-    //   process.env.SIGNUP_DEFAULT_STATUS === "active" ? "active" : "waitlist";
     const signupStatus = "waitlist";
 
     // waitlist registrations.
@@ -579,43 +576,3 @@ export const refreshToken = async (req: Request, res: Response) => {
     });
   }
 };
-
-// export const handleGoogleLogin = (
-//   req: Request,
-//   res: Response,
-//   next: NextFunction,
-// ) => {
-//   passport.authenticate("google-user", {
-//     scope: ["profile", "email"],
-//     session: false,
-//   })(req, res, next);
-// };
-
-// export const googleAuthCallback = (
-//   req: Request,
-//   res: Response,
-//   next: NextFunction,
-// ) => {
-//   passport.authenticate(
-//     "google-user",
-//     { session: false },
-//     (err: Error | null, user: UserJwtPayload | false) => {
-//       if (err) return next(err);
-//       if (!user)
-//         return res.redirect(
-//           `${process.env.FRONTEND_URL}/login?error=oauth_failed`,
-//         );
-
-//       const token = signToken(user.id);
-//       const isProduction = process.env.COOKIE_SECURE === "true";
-
-//       res.cookie("user_token", token, {
-//         httpOnly: true,
-//         secure: isProduction,
-//         sameSite: isProduction ? "none" : "lax",
-//         maxAge: 7 * 24 * 60 * 60 * 1000,
-//       });
-//       res.redirect(`${process.env.FRONTEND_URL}/dashboard`);
-//     },
-//   )(req, res, next);
-// };

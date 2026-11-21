@@ -6,7 +6,6 @@ import {
   requestWalletOtp,
   getWithdrawalRequest,
   getFinanceSummary,
-  grantDemoFunds,
   getEarnings,
   getWithdrawals,
   financeLimit,
@@ -65,7 +64,6 @@ proTraderDashboardRouter.get("/finance", getFinanceSummary);
 proTraderDashboardRouter.get("/earnings", getEarnings);
 proTraderDashboardRouter.get("/withdrawals", getWithdrawals);
 
-proTraderDashboardRouter.post("/demo-credit", financeLimit, grantDemoFunds);
 
 proTraderDashboardRouter.get(
   "/withdrawals/request/:requestId",

@@ -72,34 +72,12 @@ Verify the stored outcome through:
   `GET /api/pro-trader/dashboard/trades/:tradeId/copiers`
 - Admin: `GET /api/admin/dashboard/trades?status=history`
 
-## 2. Simulate the copy trader's approved withdrawal
+## 2. Verify a wallet settlement
 
-`POST /api/temporary/withdraw-usdt` must be called while authenticated as the
-copy trader. It decrypts that user's stored credentials and makes the real,
-signed credential and withdrawal-account balance requests. It validates the
-account type and available USDT, but it does **not** submit a withdrawal. After
-preflight succeeds it records a simulated completed settlement and applies the
-same trade/pro-credit database changes as a confirmed live withdrawal.
+The old `POST /api/temporary/withdraw-usdt` simulator now returns HTTP 410.
+It cannot withdraw or mark fees paid. The trade-close simulator above still works.
 
-```json
-{
-  "requestId": "settlement-test-001",
-  "exchangeConnectionId": "COPY_CONNECTION_OBJECT_ID"
-}
-```
-
-Repeat the exact request to verify idempotency. It returns the same settlement
-with `idempotent: true` and does not credit the pro twice.
-
-Verify the result through:
-
-- Copy trader profit-share endpoint (pending amount decreases)
-- Pro trader trades endpoint (`creditedProTraderShare`) and wallet endpoint
-  (`proEarningsBalance`)
-- Admin: `GET /api/admin/dashboard/settlements`
-
-Live settlement accepts `Idempotency-Key` (or body `requestId`) on
-`POST /api/copy-trader/dashboard/profit-share/approve`. The durable settlement
-state machine is `PROCESSING -> SUBMITTED -> COMPLETED`; terminal exchange
-failure becomes `FAILED`. A polling timeout remains `SUBMITTED` and is never
-automatically resent.
+Use `GET /api/copy-trader/dashboard/profit-share` to get the new invoice, then
+follow [the settlement setup guide](settlement-payments-setup.md) for payment
+and hash verification. The new flow never reads exchange withdrawal credentials
+or makes withdrawal-account preflight requests.

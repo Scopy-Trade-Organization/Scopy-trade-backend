@@ -1,19 +1,19 @@
+import { quoteWithdrawalFee } from "../services/withdrawalFeeService.js";
+import { Earning } from "../models/earningModel.js";
+import { Transaction } from "../models/transactionModel.js";
 import type { Request, Response } from "express";
 import mongoose from "mongoose";
 import rateLimit from "express-rate-limit";
 import User from "../models/userModel.js";
 import AuditLog from "../models/auditLogModel.js";
 import { Trade } from "../models/tradeModel.js";
-import { ProEarning, ProWithdrawal } from "../models/proFinanceModel.js";
 import { RankAward } from "../models/rankModel.js";
 import { isValidTronAddress } from "../helpers/tronAddress.js";
 import { formatUsdt, usdtUnits } from "../helpers/usdt.js";
 import { consumeOtp, issueOtp } from "../services/otpService.js";
 import { sendOtpEmail } from "../services/emailService.js";
 import {
-  balanceField,
   liveClient,
-  payoutMode,
 } from "../services/proFinanceService.js";
 
 class InputError extends Error {}
@@ -88,22 +88,18 @@ function wallet(value: unknown): string {
   return value;
 }
 
-function context(mode: string, units: number, address: string, key: string) {
-  return JSON.stringify(["pro-withdrawal", mode, units, address, key]);
+export function withdrawalOtpContext(units: number, address: string, key: string, quote: any) {
+  return JSON.stringify(["pro-withdrawal", units, address, key, quote.payoutUnits,
+    quote.networkFeeReserveUnits, quote.feeLimitSun, quote.bandwidthSunPerByte,
+    quote.trxPriceUnits, new Date(quote.quoteExpiresAt).toISOString()]);
 }
 
-function ready(user: Awaited<ReturnType<typeof account>>, mode: string) {
+function ready(user: Awaited<ReturnType<typeof account>>) {
   wallet(user.withdrawalAddress);
-  if (mode === "live") {
-    liveClient();
-    if (
-      !user.withdrawalAddressChangedAt ||
-      Date.now() - user.withdrawalAddressChangedAt.getTime() < 24 * 60 * 60_000
-    ) {
-      throw new InputError(
-        "Live withdrawals unlock 24 hours after verifying your wallet.",
-      );
-    }
+  liveClient();
+  if (user.proNetworkFeeOwedUnits > 0) throw new InputError("Outstanding network fees must be covered before withdrawing.");
+  if (!user.withdrawalAddressChangedAt || Date.now() - user.withdrawalAddressChangedAt.getTime() < 24 * 60 * 60_000) {
+    throw new InputError("Withdrawals unlock 24 hours after verifying your wallet.");
   }
 }
 
@@ -118,8 +114,13 @@ export function publicWithdrawal(row: any) {
   return {
     _id: row._id,
     requestId: row.requestId,
-    mode: row.mode,
-    amount: row.amount || formatUsdt(row.units),
+    amount: formatUsdt(row.units),
+    payoutAmount: formatUsdt(row.payoutUnits ?? row.units),
+    networkFeeReserve: formatUsdt(row.networkFeeReserveUnits ?? 0),
+    networkFee: row.networkFeeUnits === undefined ? null : formatUsdt(row.networkFeeUnits),
+    refundedAmount: row.refundUnits === undefined ? null : formatUsdt(row.refundUnits),
+    additionalNetworkFee: formatUsdt(row.feeOverrunUnits ?? 0),
+    quoteExpiresAt: row.quoteExpiresAt ?? null,
     address: row.address,
     status: row.status,
     transactionId: row.transactionId,
@@ -129,44 +130,36 @@ export function publicWithdrawal(row: any) {
     lastError: row.status === "REVIEW"
       ? "Your withdrawal is under review because the blockchain result could not yet be confirmed. Funds remain reserved."
       : row.status === "FAILED"
-        ? "Your withdrawal failed. The withdrawal amount has been returned to your available balance."
+        ? "Transfer failed or was cancelled. Unsent funds were refunded after any consumed network fee."
         : null,
   };
 }
 
 export const getFinanceSummary = handler(async (req, res) => {
   const user = await account(req);
-  const mode = payoutMode();
   const [earned, reserved, bonuses] = await Promise.all([
-    ProEarning.aggregate([
-      { $match: { userId: req.user, mode } },
+    Earning.aggregate([{ $match: { userId: req.user, status: "COMPLETED" } },
       { $group: { _id: null, units: { $sum: "$units" } } },
     ]),
-    ProWithdrawal.aggregate([
+    Transaction.aggregate([{ $match: { type: "withdrawal" } },
       {
         $match: {
           userId: req.user,
-          mode,
           status: { $in: ["QUEUED", "SIGNED", "REVIEW"] },
         },
       },
       { $group: { _id: null, units: { $sum: "$units" } } },
     ]),
     RankAward.aggregate([
-      { $match: { userId: req.user, mode, status: "credited" } },
+      { $match: { userId: req.user, status: "credited" } },
       { $group: { _id: null, amount: { $sum: "$bonus" } } },
     ]),
   ]);
   res.json({
     success: true,
     accountId: String(user._id),
-    demoFundingEnabled:
-      mode === "demo" &&
-      process.env.PRO_DEMO_FUNDING_ENABLED === "true" &&
-      !user.proDemoGranted,
-    legacyBalance: String(user.proEarningsBalance || 0),
-    mode,
-    available: formatUsdt(user[balanceField(mode)] || 0),
+    available: formatUsdt(user.proBalanceUnits || 0),
+    networkFeeOwed: formatUsdt(user.proNetworkFeeOwedUnits || 0),
     earned: formatUsdt((earned[0]?.units || 0) + Math.round((bonuses[0]?.amount || 0) * 1_000_000)),
     reserved: formatUsdt(reserved[0]?.units || 0),
     withdrawalAddress: user.withdrawalAddress || null,
@@ -194,37 +187,6 @@ async function throttleOtp(userId: mongoose.Types.ObjectId) {
   if (!result.modifiedCount)
     throw new InputError("Wait one minute before requesting another code.");
 }
-
-export const grantDemoFunds = handler(async (req, res) => {
-  const user = await account(req);
-  if (
-    payoutMode() !== "demo" ||
-    process.env.PRO_DEMO_FUNDING_ENABLED !== "true"
-  )
-    throw new InputError("Demo funding is disabled.");
-  await mongoose.connection.transaction(
-    async (session) => {
-      const result = await User.updateOne(
-        { _id: user._id, proDemoGranted: { $ne: true } },
-        { $set: { proDemoGranted: true }, $inc: { proDemoUnits: 100_000_000 } },
-        { session },
-      );
-      if (result.modifiedCount)
-        await AuditLog.create(
-          [
-            {
-              userId: user._id,
-              action: "Demo Funds Granted",
-              details: { units: 100_000_000, mode: "demo" },
-            },
-          ],
-          { session },
-        );
-    },
-    { writeConcern: { w: "majority" }, readConcern: { level: "snapshot" } },
-  );
-  res.json({ success: true, message: "Demo funds available." });
-});
 
 export const requestWalletOtp = handler(async (req, res) => {
   const user = await account(req);
@@ -267,7 +229,6 @@ export const saveWalletAddress = handler(async (req, res) => {
             withdrawalAddress: address,
             withdrawalAddressChangedAt: new Date(),
           },
-          $inc: { proFinanceVersion: 1 },
         },
         { session },
       );
@@ -295,48 +256,55 @@ export const saveWalletAddress = handler(async (req, res) => {
 
 export const requestWithdrawalOtp = handler(async (req, res) => {
   const user = await account(req);
-  const mode = payoutMode(),
-    units = amountUnits(req.body.amount),
+  const units = amountUnits(req.body.amount),
     key = requestId(req);
-  if (req.body.mode !== mode)
-    throw new InputError("Payout mode changed. Refresh this page.");
-  ready(user, mode);
-  if ((user[balanceField(mode)] || 0) < units)
+  ready(user);
+  if ((user.proBalanceUnits || 0) < units)
     throw new InputError("Insufficient available balance.");
+  let quote = await Transaction.findOne({ type: "withdrawal", userId: user._id, requestId: key }).lean();
+  if (quote && quote.units !== units) throw new InputError("Request ID already used for a different withdrawal.");
+  if (quote && quote.status !== "QUOTED") throw new InputError("This withdrawal was already submitted. Refresh its status.");
+  if (!quote || quote.address !== user.withdrawalAddress || !quote.quoteExpiresAt || quote.quoteExpiresAt.getTime() <= Date.now()) {
+    let feeQuote;
+    try { feeQuote = await quoteWithdrawalFee(units, user.withdrawalAddress!); }
+    catch (error) { throw new InputError(error instanceof Error && error.message === "Withdrawal amount must exceed its network fee reserve." ? error.message : "Network fees cannot be quoted right now. Please try again later."); }
+    quote = await Transaction.findOneAndUpdate({ type: "withdrawal", userId: user._id, requestId: key, status: "QUOTED" },
+      { $set: { units, address: user.withdrawalAddress, ...feeQuote } }, { upsert: true, new: true, runValidators: true }).lean();
+  }
+  if (!quote) throw new Error("Withdrawal quote unavailable.");
   await throttleOtp(user._id);
   const code = await issueOtp({
     email: user.email,
     purpose: "withdrawal",
     userId: user._id,
-    context: context(mode, units, user.withdrawalAddress!, key),
+    context: withdrawalOtpContext(units, user.withdrawalAddress!, key, quote),
   });
   await sendOtpEmail(
     user.email,
     user.firstName,
     code,
     "withdrawal",
-    mode.toUpperCase() +
-      " withdrawal: " +
+    "Withdrawal: " +
       formatUsdt(units) +
       " USDT to " +
-      user.withdrawalAddress,
+      user.withdrawalAddress + ". Total debit: " + formatUsdt(units) +
+      " USDT; network fee reserve: " + formatUsdt(quote.networkFeeReserveUnits!) +
+      " USDT; wallet receives: " + formatUsdt(quote.payoutUnits!) +
+      " USDT. Unused reserve is returned to your balance after confirmation. Failed transfers may still consume network fees.",
   );
-  res.json({ success: true, message: "Withdrawal verification code sent." });
+  res.json({ success: true, message: "Withdrawal verification code sent.", quote: publicWithdrawal(quote) });
 });
 
 export const withdrawFunds = handler(async (req, res) => {
   const user = await account(req);
   const units = amountUnits(req.body.amount),
     key = requestId(req);
-  const existing = await ProWithdrawal.findOne({
+  const existing = await Transaction.findOne({ type: "withdrawal",
     userId: user._id,
     requestId: key,
   }).lean();
-  if (existing) {
-    if (existing.units !== units || existing.mode !== req.body.mode)
-      throw new InputError(
-        "Request ID already used for a different withdrawal.",
-      );
+  if (existing && existing.units !== units) throw new InputError("Request ID already used for a different withdrawal.");
+  if (existing && existing.status !== "QUOTED") {
     res.json({
       success: true,
       withdrawal: publicWithdrawal(existing),
@@ -344,20 +312,20 @@ export const withdrawFunds = handler(async (req, res) => {
     });
     return;
   }
-  const mode = payoutMode();
-  if (req.body.mode !== mode)
-    throw new InputError("Payout mode changed. Refresh this page.");
-  ready(user, mode);
-  const field = balanceField(mode);
+  ready(user);
+  const field = "proBalanceUnits";
   let result: any;
   try {
     await mongoose.connection.transaction(
       async (session) => {
+        const quote = await Transaction.findOne({ type: "withdrawal", userId: user._id, requestId: key, status: "QUOTED",
+          units, address: user.withdrawalAddress, quoteExpiresAt: { $gt: new Date() } }).session(session).lean();
+        if (!quote?.payoutUnits || quote.networkFeeReserveUnits === undefined) throw new InputError("Request a new network fee quote and verification code.");
         const valid = await consumeOtp({
           email: user.email,
           purpose: "withdrawal",
           code: req.body.otp,
-          context: context(mode, units, user.withdrawalAddress!, key),
+          context: withdrawalOtpContext(units, user.withdrawalAddress!, key, quote),
           session,
         });
         if (!valid)
@@ -373,27 +341,18 @@ export const withdrawFunds = handler(async (req, res) => {
             withdrawalAddress: user.withdrawalAddress,
             withdrawalAddressChangedAt: user.withdrawalAddressChangedAt ?? null,
             [field]: { $gte: units },
+            $or: [{ proNetworkFeeOwedUnits: { $lte: 0 } }, { proNetworkFeeOwedUnits: { $exists: false } }],
           },
-          { $inc: { [field]: -units, proFinanceVersion: 1 } },
+          { $inc: { [field]: -units } },
           { session },
         );
         if (debited.modifiedCount !== 1)
           throw new InputError(
             "Balance or wallet changed. Refresh and request a new code.",
           );
-        const rows = await ProWithdrawal.create(
-          [
-            {
-              userId: user._id,
-              requestId: key,
-              units,
-              mode,
-              address: user.withdrawalAddress,
-            },
-          ],
-          { session },
-        );
-        result = rows[0];
+        result = await Transaction.findOneAndUpdate({ _id: quote._id, status: "QUOTED" },
+          { $set: { status: "QUEUED" } }, { new: true, session });
+        if (!result) throw new InputError("Withdrawal quote changed. Refresh and try again.");
         await AuditLog.create(
           [
             {
@@ -402,8 +361,7 @@ export const withdrawFunds = handler(async (req, res) => {
               targetId: result._id,
               details: {
                 units,
-                mode,
-                address: user.withdrawalAddress,
+                  address: user.withdrawalAddress,
                 requestId: key,
               },
               ipAddress: req.ip,
@@ -416,20 +374,17 @@ export const withdrawFunds = handler(async (req, res) => {
     );
   } catch (error) {
     // Covers duplicate requests and an ambiguous transaction commit response.
-    const replay = await ProWithdrawal.findOne({
+    const replay = await Transaction.findOne({ type: "withdrawal",
       userId: user._id,
       requestId: key,
     }).lean();
-    if (!replay || replay.units !== units || replay.mode !== mode) throw error;
+    if (!replay || replay.status === "QUOTED" || replay.units !== units) throw error;
     result = replay;
   }
   res.status(202).json({
     success: true,
     withdrawal: publicWithdrawal(result),
-    message:
-      mode === "demo"
-        ? "Demo withdrawal queued. No funds will be transferred."
-        : "Withdrawal queued for TRON confirmation.",
+    message: "Withdrawal queued for TRON confirmation.",
   });
 });
 
@@ -450,6 +405,15 @@ export const getEarnings = handler(async (req, res) => {
       },
     },
     { $match: { "source.userId": req.user, "source.tradeOrigin": "pro" } },
+    {
+      $lookup: {
+        from: Earning.collection.name,
+        localField: "_id",
+        foreignField: "tradeId",
+        pipeline: [{ $match: { userId: req.user, status: "COMPLETED" } }],
+        as: "earning",
+      },
+    },
     { $sort: { closedAt: -1, _id: -1 } },
     {
       $facet: {
@@ -457,14 +421,6 @@ export const getEarnings = handler(async (req, res) => {
         rows: [
           { $skip: (current - 1) * limit },
           { $limit: limit },
-          {
-            $lookup: {
-              from: ProEarning.collection.name,
-              localField: "_id",
-              foreignField: "tradeId",
-              as: "credit",
-            },
-          },
           {
             $project: {
               _id: 1,
@@ -477,10 +433,8 @@ export const getEarnings = handler(async (req, res) => {
               proTraderShare: 1,
               feeStatus: 1,
               proTraderCreditStatus: 1,
-              mode: {
-                $ifNull: [{ $arrayElemAt: ["$credit.mode", 0] }, "unallocated"],
-              },
               sourceTradeId: 1,
+              earning: { $arrayElemAt: ["$earning", 0] },
             },
           },
         ],
@@ -499,38 +453,20 @@ export const getWithdrawals = handler(async (req, res) => {
   await account(req);
   const current = page(req),
     limit = 20;
-  const [result] = await ProWithdrawal.aggregate([
+  const [result] = await Transaction.aggregate([{ $match: { type: "withdrawal", status: { $ne: "QUOTED" } } },
     { $match: { userId: req.user } },
     {
       $project: {
         _id: 1,
         units: 1,
-        mode: 1,
         address: 1,
         status: 1,
         transactionId: 1,
         createdAt: 1,
         completedAt: 1,
         requestId: 1,
-      },
-    },
-    {
-      $unionWith: {
-        coll: AuditLog.collection.name,
-        pipeline: [
-          { $match: { userId: req.user, action: "Withdrawal Executed" } },
-          {
-            $project: {
-              _id: 1,
-              amount: { $toString: "$details.amount" },
-              mode: { $literal: "live" },
-              address: "$details.destinationAddress",
-              transactionId: "$details.transactionId",
-              status: { $literal: "LEGACY_SUBMITTED" },
-              createdAt: 1,
-            },
-          },
-        ],
+        payoutUnits: 1, networkFeeReserveUnits: 1, networkFeeUnits: 1,
+        refundUnits: 1, feeOverrunUnits: 1, quoteExpiresAt: 1,
       },
     },
     { $sort: { createdAt: -1, _id: -1 } },
@@ -554,9 +490,9 @@ export const getWithdrawalRequest = handler(async (req, res) => {
   const key = req.params.requestId;
   if (typeof key !== "string" || !/^[a-zA-Z0-9_-]{16,80}$/.test(key))
     throw new InputError("Invalid request ID.");
-  const row = await ProWithdrawal.findOne({
+  const row = await Transaction.findOne({ type: "withdrawal",
     userId: req.user,
-    requestId: key,
+    requestId: key, status: { $ne: "QUOTED" },
   }).lean();
   res.json({ success: true, withdrawal: row ? publicWithdrawal(row) : null });
 });
