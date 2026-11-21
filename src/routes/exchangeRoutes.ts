@@ -10,10 +10,25 @@ import {
 import { userAuthenticate } from "../middleware/authenticationMiddleware.js";
 import { validateConnectBody, validateCredentialUpdateBody } from "../middleware/validateExchange.js";
 import { connectionLimiter } from "../middleware/rateLimit.js";
+import { getServerIps } from "../services/serverIpService.js";
 
 const exchangeRouter = Router();
 
-// All routes require a valid JWT
+// Public setup information must be registered before authentication.
+exchangeRouter.get("/server-ip", async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const ips = await getServerIps();
+    res.json({ success: true, ips });
+  } catch {
+    res.status(503).json({
+      success: false,
+      message: "Server IP addresses are temporarily unavailable. Please try again.",
+    });
+  }
+});
+
+// Every route below requires a valid JWT.
 exchangeRouter.use(userAuthenticate);
 
 // GET  /api/exchanges              — list supported exchanges + connection status
