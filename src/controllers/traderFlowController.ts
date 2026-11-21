@@ -23,7 +23,7 @@ function page(req: Request) { return Math.max(1, Math.min(10000, Number.parseInt
 
 export const discoverTraders = handler(async (req, res) => {
   const current = page(req), limit = 12;
-  const filter = { role: "ProTrader", status: "live" };
+  const filter = { role: "ProTrader", status: { $in: ["active", "live"] } };
   const [users, total] = await Promise.all([
     User.find(filter).select("_id").sort({ createdAt: -1, _id: -1 }).skip((current - 1) * limit).limit(limit).lean(),
     User.countDocuments(filter),
@@ -44,7 +44,7 @@ export const startCopying = handler(async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.traderId) || !mongoose.isValidObjectId(exchangeConnectionId)) return res.status(400).json({ success: false, message: "Select a trader and an exchange account." });
   if (typeof allocation !== "number" || !Number.isFinite(allocation) || allocation < 1 || allocation > 1e9) return res.status(400).json({ success: false, message: "Allocation must be a positive USDT amount of at least 1." });
   const proTraderId = new mongoose.Types.ObjectId(String(req.params.traderId));
-  if (String(proTraderId) === String(req.user) || !await User.exists({ _id: proTraderId, role: "ProTrader", status: "live" })) return res.status(404).json({ success: false, message: "This pro trader is unavailable." });
+  if (String(proTraderId) === String(req.user) || !await User.exists({ _id: proTraderId, role: "ProTrader", status: { $in: ["active", "live"] } })) return res.status(404).json({ success: false, message: "This pro trader is unavailable." });
   const existing = await CopySubscription.findOne({ copierId: req.user, proTraderId, active: true }).lean();
   if (existing) return res.status(409).json({ success: false, message: "You already copy this trader. Stop copying before changing the account or allocation." });
   const connection = await ExchangeConnection.findOne({ _id: exchangeConnectionId, userId: req.user, isActive: true }).lean();

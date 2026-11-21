@@ -25,7 +25,6 @@ import {
 import { queueTradeEmail } from "../services/emailService.js";
 import { getProfitShareSummary } from "../services/profitSharingService.js";
 import { triggerCopiedTradeClosures } from "./copiedTradeUpdateService.js";
-import { hasLiveTradingAccess, TRADING_NOT_ENABLED_MESSAGE } from "./tradingAccessService.js";
 
 
 export type TradeOutcome = { status: number; body: Record<string, any> };
@@ -46,10 +45,6 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
   let attempt: any;
   let lockedConnectionId: string | undefined;
   try {
-    if (!await hasLiveTradingAccess(userId)) {
-      return tradeOutcome(403, { success: false, code: "TRADING_NOT_ENABLED", message: TRADING_NOT_ENABLED_MESSAGE });
-    }
-    let sourceUserId: mongoose.Types.ObjectId | undefined;
     const {
       sourceTradeId,
       exchangeConnectionId,
@@ -124,10 +119,6 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
         });
       }
 
-      sourceUserId = sourceTrade.userId;
-      if (!await hasLiveTradingAccess(sourceUserId)) {
-        return tradeOutcome(403, { success: false, code: "TRADING_NOT_ENABLED", message: "This pro trader is not currently enabled for trading." });
-      }
       signalId = sourceTrade.signalId;
       const template = await Signal.findById(signalId).lean();
       signal = template
@@ -263,10 +254,6 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
 
     if (!isProTrade && (await getProfitShareSummary(userId)).settlementRequired) {
       return tradeOutcome(402, { success: false, code: "PROFIT_SHARE_DUE", message: "Settle your outstanding profit share in your dashboard before copying another trade." });
-    }
-    // Status can change while exchange balances and risk settings are being prepared.
-    if (!await hasLiveTradingAccess(userId) || (sourceUserId && !await hasLiveTradingAccess(sourceUserId))) {
-      return tradeOutcome(403, { success: false, code: "TRADING_NOT_ENABLED", message: "Trading access changed while preparing this order. No new order was submitted." });
     }
     const exchangeClientOrderId = `sc${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     if (isProTrade) await signal.save();

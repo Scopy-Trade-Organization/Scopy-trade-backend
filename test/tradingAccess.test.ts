@@ -50,14 +50,13 @@ function request(path: string, cookie: string, method = "POST") {
   return fetch(baseUrl + path, { method, headers: { Cookie: cookie, "Content-Type": "application/json" }, ...(method === "POST" ? { body: JSON.stringify({ status: "live" }) } : {}) });
 }
 
-test("new trading endpoints require current live status; existing management stays accessible", async () => {
+test("only pro trade creation is temporarily restricted; copying and management stay accessible", async () => {
   for (const status of ["active", "waitlist", "suspended", undefined]) {
     const pro = await user("ProTrader", status), copier = await user("CopyTrader", status);
-    for (const [path, cookie] of [["/pro/trades", pro.cookie], ["/copy/traders/invalid/copy", copier.cookie]]) {
-      const response = await request(path!, cookie!);
-      assert.equal(response.status, 403, `${path}: ${status}`);
-      assert.equal((await response.json()).code, "TRADING_NOT_ENABLED");
-    }
+    const response = await request("/pro/trades", pro.cookie);
+    assert.equal(response.status, 403, `pro creation: ${status}`);
+    assert.equal((await response.json()).message, "Live trading is coming soon.");
+    assert.equal((await request("/copy/traders/invalid/copy", copier.cookie)).status, 400);
     assert.equal((await request("/pro/trades", pro.cookie, "GET")).status, 200);
     assert.equal((await request(`/copy/traders/${pro._id}/copy`, copier.cookie, "DELETE")).status, 200);
     // A missing trade returns 404, demonstrating management is not blocked by status.
@@ -71,19 +70,21 @@ test("live users pass access checks and a database downgrade takes effect with t
   assert.equal((await request("/copy/traders/invalid/copy", copier.cookie)).status, 400);
   await User.updateMany({ _id: { $in: [pro._id, copier._id] } }, { $set: { status: "active" } });
   assert.equal((await request("/pro/trades", pro.cookie)).status, 403);
-  assert.equal((await request("/copy/traders/invalid/copy", copier.cookie)).status, 403);
+  assert.equal((await request("/copy/traders/invalid/copy", copier.cookie)).status, 400);
 });
 
-test("discovery and profiles include live pro traders", async () => {
-  const pro = await user("ProTrader", "live"), copier = await user("CopyTrader", "live");
+test("active copy traders can discover active and live pro traders", async () => {
+  const pro = await user("ProTrader", "live"), activePro = await user("ProTrader", "active"), copier = await user("CopyTrader", "active");
   const discovery = await request("/copy/traders", copier.cookie, "GET");
   assert.equal(discovery.status, 200);
-  assert.ok((await discovery.json()).traders.some((trader: { _id: string }) => trader._id === String(pro._id)));
+  const traders = (await discovery.json()).traders as { _id: string }[];
+  assert.ok(traders.some(trader => trader._id === String(pro._id)));
+  assert.ok(traders.some(trader => trader._id === String(activePro._id)));
   assert.equal((await request(`/copy/traders/${pro._id}`, copier.cookie, "GET")).status, 200);
 });
 
-test("queued copies execute only when both the copier and source trader are still live", async () => {
-  for (const [copierStatus, proStatus] of [["live", "live"], ["active", "live"], ["waitlist", "live"], ["suspended", "live"], ["live", "active"], ["live", "suspended"]]) {
+test("automatic copying accepts active and live accounts using normal account availability", async () => {
+  for (const [copierStatus, proStatus] of [["live", "live"], ["active", "live"], ["active", "active"], ["waitlist", "live"], ["suspended", "live"], ["live", "active"], ["live", "suspended"]]) {
     const copier = await user("CopyTrader", "live"), pro = await user("ProTrader", "live");
     const sourceId = new mongoose.Types.ObjectId(), connectionId = new mongoose.Types.ObjectId();
     const subscription = await CopySubscription.create({ copierId: copier._id, proTraderId: pro._id, exchangeConnectionId: connectionId, allocation: 100, startedAt: new Date(Date.now() - 5000) });
@@ -93,7 +94,7 @@ test("queued copies execute only when both the copier and source trader are stil
     await User.updateOne({ _id: pro._id }, { $set: { status: proStatus } });
     let executions = 0;
     await drainCopyQueue({ executeTrade: async () => { executions++; return { status: 201, body: {} }; } });
-    const allowed = copierStatus === "live" && proStatus === "live";
+    const allowed = ["active", "live"].includes(copierStatus!) && ["active", "live"].includes(proStatus!);
     assert.equal(executions, allowed ? 1 : 0);
     const job = await CopyExecution.findOne({ subscriptionId: subscription._id }).lean();
     assert.equal(job?.status, allowed ? "completed" : "failed");

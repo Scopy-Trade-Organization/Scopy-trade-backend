@@ -23,6 +23,7 @@ import {
   getProTradeCopiers,
 } from "../controllers/proTraderDashboardController.js";
 import { initiateTrade } from "../controllers/tradeController.js";
+import { requireLiveTrading } from "../middleware/requireLiveTrading.js";
 
 const proTraderDashboardRouter = Router();
 
@@ -37,6 +38,7 @@ proTraderDashboardRouter.get("/wallet", getWalletAddress);
 
 proTraderDashboardRouter.post(
   "/trades",
+  requireLiveTrading,
   (_req, res, next) => {
     res.locals.tradeOrigin = "pro";
     next();

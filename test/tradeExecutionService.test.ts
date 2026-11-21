@@ -49,43 +49,6 @@ async function fixture(balance = "50") {
   const body = { exchangeConnectionId: String(connection._id), pair: "BTCUSDT", entry: "64755.1", sl: "64949.3", tp: "64000", direction: "sell" };
   return { userId, connection, body, dependencies, entries: () => entries, checks: () => checks, submitted: () => submitted };
 }
-test("only live accounts can open trades, including when the caller spoofs a live status", async () => {
-  for (const status of ["active", "waitlist", "suspended", undefined]) {
-    const f = await fixture();
-    await User.collection.updateOne({ _id: f.userId }, status === undefined ? { $unset: { status: "" } } : { $set: { status } });
-    const result = await executeTrade(f.userId, { ...f.body, status: "live" }, true, f.dependencies);
-    assert.equal(result.status, 403);
-    assert.equal(result.body.code, "TRADING_NOT_ENABLED");
-    assert.equal(f.entries(), 0);
-    assert.equal(await Trade.countDocuments({ userId: f.userId }), 0);
-  }
-});
-
-test("status is rechecked after exchange preparation and before creating an entry", async () => {
-  const f = await fixture();
-  f.dependencies.refreshAvailableFuturesBalance = async () => {
-    await User.updateOne({ _id: f.userId }, { $set: { status: "active" } });
-    return "50";
-  };
-  const result = await executeTrade(f.userId, f.body, true, f.dependencies);
-  assert.equal(result.status, 403);
-  assert.equal(result.body.code, "TRADING_NOT_ENABLED");
-  assert.equal(f.entries(), 0);
-  assert.equal(await Trade.countDocuments({ userId: f.userId }), 0);
-  assert.equal((await ExchangeConnection.findById(f.connection._id))?.executionLockToken, null);
-});
-
-test("a live copier cannot open a copy after the source trader loses live access", async () => {
-  const pro = await fixture("1000");
-  const source = await executeTrade(pro.userId, pro.body, true, pro.dependencies);
-  assert.equal(source.status, 201);
-  await User.updateOne({ _id: pro.userId }, { $set: { status: "active" } });
-  const copier = await fixture();
-  const result = await executeTrade(copier.userId, { sourceTradeId: source.body.trade._id, exchangeConnectionId: String(copier.connection._id) }, false, copier.dependencies);
-  assert.equal(result.status, 403);
-  assert.equal(copier.entries(), 0);
-});
-
 test("frontend balance is ignored, leverage precedes submission, protection precedes success, snapshot persists", async () => {
   for (const balance of [undefined, -1, "tampered", 1_000_000_000]) {
     const f = await fixture();
