@@ -128,7 +128,21 @@ deducts its transfer fee from the amount sent, increase the exchange withdrawal
 so that the receiving amount still exactly matches the invoice. Network fees
 do not reduce the settlement debt or earn payment credit.
 
-The backend worker checks every minute when automatic verification is enabled.
+Invoice creation runs immediately after a profitable copied trade closes. The
+existing trade record is marked for an invoice check in the same transaction as
+the fee. The retry worker checks only marked trades at startup and every 15 minutes,
+with failed checks deferred for at least 15 minutes. It does not scan CopyTrader accounts. Successful checks below
+the threshold also clear the marker. Existing accounts are not backfilled by a
+periodic sweep; dashboard access still checks for a required invoice.
+
+Invoice creation saves the in-app notification and immediately attempts its email.
+Failed emails remain on the existing notification record for recovery at startup
+and every 15 minutes. Repeated invoice checks do not resend delivered emails or
+bypass a failed email's 15-minute retry delay.
+
+The separate blockchain scanner runs at startup and every minute when
+`SETTLEMENT_AUTO_VERIFY_ENABLED=true`. Submitted transaction hashes are still
+verified immediately. Invoice retries and email delivery do not depend on that setting.
 The dashboard refreshes payment state every 30 seconds and the notification bell
 every minute. There are no push notifications or notification WebSockets.
 

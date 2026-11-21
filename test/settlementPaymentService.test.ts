@@ -9,9 +9,10 @@ import { issueOtp } from "../src/services/otpService.js";
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import mongoose from "mongoose";
+import axios from "axios";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { TronWeb } from "tronweb";
-import { ensureSettlement, validateSettlementReceipt, verifySettlement, scanSettlementInvoice, normalizeSettlementHash } from "../src/services/settlementPaymentService.js";
+import { ensureSettlement, validateSettlementReceipt, verifySettlement, scanSettlementInvoice, normalizeSettlementHash, runSettlementWorker, retrySettlementForUser, deliverSettlementEmails } from "../src/services/settlementPaymentService.js";
 import { MAINNET_USDT, TRANSFER_TOPIC, finishWithdrawal, reconcileProWithdrawal, processProWithdrawal } from "../src/services/proFinanceService.js";
 import { Transaction } from "../src/models/transactionModel.js";
 import { Notification } from "../src/models/notificationModel.js";
@@ -137,6 +138,7 @@ test("trade close accrues settlement debt exactly once under concurrent requests
   assert.equal((await User.findById(userId).lean())?.settlementOwedUnits, 4_000_000);
   assert.equal((await getProfitShareSummary(userId)).pendingAmount, "4.000000");
   assert.equal((await Trade.findById(id).lean())?.status, "closed");
+  assert.equal((await Trade.findById(id).lean())?.settlementInvoicePending, false);
 });
 
 test("a missing balance rolls back the trade close instead of losing the debt", async () => {
@@ -144,6 +146,105 @@ test("a missing balance rolls back the trade close instead of losing the debt", 
   await Trade.collection.insertOne({ _id: id, userId, pair: "BTCUSDT", direction: "buy", quantity: "1", entryPrice: "100", status: "filled", tradeOrigin: "copy", signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
   await assert.rejects(processTradeClose(String(id), "120", "tp"), /balance unavailable/);
   assert.equal((await Trade.findById(id).lean())?.status, "filled");
+  assert.notEqual((await Trade.findById(id).lean())?.settlementInvoicePending, true);
+});
+
+test("failed invoice creation preserves the closed trade and retries only marked trades after a delay", async (t) => {
+  const userId = new mongoose.Types.ObjectId(), id = new mongoose.Types.ObjectId();
+  await User.collection.insertOne({ _id: userId, email: "retry@example.com", traderID: "retry-test", role: "CopyTrader", settlementOwedUnits: 0 });
+  // This legacy user has no balance. A background sweep must never visit it.
+  await User.collection.insertOne({ email: "legacy@example.com", traderID: "legacy-test", role: "CopyTrader" });
+  await Trade.collection.insertOne({ _id: id, userId, pair: "BTCUSDT", direction: "buy", quantity: "1", entryPrice: "100", status: "filled", tradeOrigin: "copy", signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
+  const originalWallet = process.env.SYSTEM_WALLET_ADDRESS;
+  t.after(() => { process.env.SYSTEM_WALLET_ADDRESS = originalWallet; });
+  process.env.SYSTEM_WALLET_ADDRESS = "invalid";
+  await processTradeClose(String(id), "160", "tp");
+  assert.equal((await Trade.findById(id).lean())?.status, "closed");
+  assert.equal((await User.findById(userId).lean())?.settlementOwedUnits, 12_000_000);
+  const failed = (await Trade.findById(id).lean())!;
+  assert.equal(failed.settlementInvoicePending, true);
+  assert.match(failed.settlementError!, /SYSTEM_WALLET_ADDRESS/);
+  assert.ok(failed.settlementInvoiceRetryAt!.getTime() > Date.now());
+  await retrySettlementForUser(userId);
+  await processTradeClose(String(id), "160", "tp");
+  assert.equal((await Trade.findById(id).lean())?.settlementInvoiceRetryAt?.getTime(), failed.settlementInvoiceRetryAt!.getTime());
+  process.env.SYSTEM_WALLET_ADDRESS = wallet;
+  await Trade.updateOne({ _id: id }, { $set: { settlementInvoiceRetryAt: new Date(0) } });
+  const noSweep = t.mock.method(User, "find", () => { throw new Error("Full user scan is forbidden"); });
+  await runSettlementWorker();
+  noSweep.mock.restore();
+  assert.equal((await Trade.findById(id).lean())?.settlementInvoicePending, false);
+  assert.equal((await Trade.findById(id).lean())?.settlementError, null);
+  assert.equal(await Transaction.countDocuments({ userId, type: "settlement", status: "AWAITING_PAYMENT" }), 1);
+  assert.equal(await Notification.countDocuments({ userId, kind: "settlement_due" }), 1);
+  assert.equal((await User.findById(userId).lean())?.settlementOwedUnits, 12_000_000);
+});
+
+test("retrying an interrupted invoice check preserves a newer trade's pending marker", async (t) => {
+  const userId = new mongoose.Types.ObjectId(), id = new mongoose.Types.ObjectId(), newerId = new mongoose.Types.ObjectId();
+  await User.collection.insertOne({ _id: userId, email: "recovery@example.com", traderID: "recovery-test", settlementOwedUnits: 12_000_000 });
+  await Trade.collection.insertOne({ _id: id, userId, signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId(), tradeOrigin: "copy", tradeResult: "profit", platformFee: "12.000000", feeStatus: "pending", settlementInvoicePending: true, settlementInvoiceRetryAt: new Date(0) });
+  const updateNotification = Notification.updateOne.bind(Notification);
+  const notificationMock = t.mock.method(Notification, "updateOne", async (...args: any[]) => {
+    if (args[2]?.upsert) await Trade.collection.insertOne({ _id: newerId, userId, signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId(), tradeOrigin: "copy", tradeResult: "profit", platformFee: "1.000000", feeStatus: "pending", settlementInvoicePending: true, settlementInvoiceRetryAt: new Date() });
+    return (updateNotification as any)(...args);
+  });
+  await retrySettlementForUser(userId);
+  notificationMock.mock.restore();
+  assert.equal((await Trade.findById(id).lean())?.settlementInvoicePending, false);
+  assert.equal((await Trade.findById(newerId).lean())?.settlementInvoicePending, true);
+  await runSettlementWorker();
+  assert.equal((await Trade.findById(newerId).lean())?.settlementInvoicePending, false);
+  assert.equal(await Transaction.countDocuments({ userId, type: "settlement", status: "AWAITING_PAYMENT" }), 1);
+});
+
+test("threshold crossing sends email immediately and failed delivery retries without recreating the invoice", async (t) => {
+  const envNames = ["GMAIL_SENDER_EMAIL", "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"];
+  const previous = envNames.map(name => process.env[name]);
+  envNames.forEach(name => { process.env[name] = "test-only"; });
+  t.after(() => envNames.forEach((name, i) => {
+    if (previous[i] === undefined) delete process.env[name];
+    else process.env[name] = previous[i];
+  }));
+  let attempts = 0, fail = true;
+  t.mock.method(axios, "post", async (url: string, body: any) => {
+    if (url === "https://oauth2.googleapis.com/token") return { data: { access_token: "test-token", expires_in: 0 } };
+    assert.equal(url, "https://gmail.googleapis.com/gmail/v1/users/me/messages/send");
+    const message = Buffer.from(body.raw, "base64url").toString();
+    if (message.includes(Buffer.from("Profit-share settlement due").toString("base64"))) {
+      attempts++;
+      if (fail) throw new Error("Simulated email outage");
+    }
+    return { data: {} };
+  });
+  for (const shouldFail of [true, false]) {
+    fail = shouldFail;
+    const userId = new mongoose.Types.ObjectId(), id = new mongoose.Types.ObjectId();
+    await User.collection.insertOne({ _id: userId, email: `${userId}@example.com`, traderID: String(userId), settlementOwedUnits: 0 });
+    await Trade.collection.insertOne({ _id: id, userId, pair: "BTCUSDT", direction: "buy", quantity: "1", entryPrice: "100", status: "filled", tradeOrigin: "copy", signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
+    const beforeAttempts = attempts;
+    await processTradeClose(String(id), "160", "tp");
+    assert.equal(attempts, beforeAttempts + 1);
+    const invoice = (await Transaction.findOne({ userId, type: "settlement" }).lean())!;
+    const notification = (await Notification.findOne({ settlementId: invoice._id, kind: "settlement_due" }).lean())!;
+    assert.equal((await Trade.findById(id).lean())?.settlementInvoicePending, false);
+    if (shouldFail) {
+      assert.equal(notification.emailSentAt, null);
+      assert.ok(notification.emailLastError);
+      assert.ok(notification.emailLeaseUntil!.getTime() >= Date.now() + 14 * 60_000);
+      await ensureSettlement(userId);
+      assert.equal(attempts, beforeAttempts + 1);
+      fail = false;
+      await Notification.updateOne({ _id: notification._id }, { $set: { emailLeaseUntil: new Date(0) } });
+      await deliverSettlementEmails(invoice._id);
+    }
+    assert.ok((await Notification.findById(notification._id).lean())?.emailSentAt);
+    const sentAttempts = attempts;
+    await ensureSettlement(userId);
+    await deliverSettlementEmails(invoice._id);
+    assert.equal(attempts, sentAttempts);
+    assert.equal(await Transaction.countDocuments({ userId, type: "settlement" }), 1);
+  }
 });
 
 let sequence = 100;
@@ -164,6 +265,18 @@ function chain(invoice: any, txHash: string, memo: string | null = invoice.memo)
 function clientFor(result: ReturnType<typeof receipt>) {
   return (() => ({ post: async (path: string) => ({ data: path.endsWith("gettransactionbyid") ? result.tx : result.info }) })) as any;
 }
+
+test("paying a fixed invoice schedules a check for fees accrued after its creation", async () => {
+  const { userId, invoice, txHash } = await fixture();
+  const laterId = new mongoose.Types.ObjectId();
+  await Trade.collection.insertOne({ _id: laterId, userId, signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId(), tradeOrigin: "copy", tradeResult: "profit", platformFee: "10.000000", feeStatus: "pending", settlementInvoicePending: false });
+  await User.updateOne({ _id: userId }, { $inc: { settlementOwedUnits: 10_000_000 } });
+  await verifySettlement(userId, String(invoice._id), txHash, clientFor(chain(invoice, txHash)));
+  assert.equal((await Trade.findById(laterId).lean())?.settlementInvoicePending, true);
+  await runSettlementWorker();
+  assert.equal((await Transaction.findOne({ userId, type: "settlement", status: "AWAITING_PAYMENT" }).lean())?.units, 10_000_000);
+  assert.equal((await Trade.findById(laterId).lean())?.settlementInvoicePending, false);
+});
 
 test("two users racing for a memo-less hash: the first claim wins permanently", async () => {
   const first = await fixture(), second = await fixture();

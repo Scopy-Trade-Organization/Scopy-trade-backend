@@ -86,6 +86,8 @@ export async function processTradeClose(
           platformShare: platformShare.toFixed(6),
           proTraderShare: proTraderShare.toFixed(6),
           feeStatus,
+          settlementInvoicePending: feeApplies,
+          settlementInvoiceRetryAt: feeApplies ? new Date() : null,
           proTraderCreditStatus: feeApplies ? "pending" : "waived",
           tradeResult,
           wsMonitoringActive: false,
@@ -127,9 +129,12 @@ export async function processTradeClose(
   });
 
   if (feeApplies) {
-    // Notification failures cannot undo a closed trade. The settlement worker retries.
-    const { ensureSettlement } = await import("./settlementPaymentService.js");
-    await ensureSettlement(closed.userId).catch(() => console.error("[Settlement] Invoice creation requires retry"));
+    // The trade's pending marker survives a crash or unavailable invoice dependency.
+    const { retrySettlementForUser } = await import("./settlementPaymentService.js");
+    await retrySettlementForUser(closed.userId).catch((error: unknown) => console.error(
+      "[Settlement] Invoice task unavailable", String(closed.userId),
+      error instanceof Error ? error.message : "Unknown error",
+    ));
   }
   return {
     tradeId,

@@ -192,6 +192,8 @@ const tradeSchema = new Schema(
     settlementTransactionId: { type: String, default: null },
     settlementBlockchainTransactionId: { type: String, default: null },
     settlementError: { type: String, default: null },
+    settlementInvoicePending: { type: Boolean, default: false },
+    settlementInvoiceRetryAt: { type: Date, default: null },
     settlementStartedAt: { type: Date, default: null },
     settlementBatchId: { type: String, default: null, index: true },
     settlementCompletedAt: { type: Date, default: null },
@@ -227,6 +229,7 @@ tradeSchema.index(
 );
 
 tradeSchema.index({ userId: 1, status: 1, createdAt: -1 });
+tradeSchema.index({ settlementInvoicePending: 1, settlementInvoiceRetryAt: 1 });
 tradeSchema.index(
   { exchangeConnectionId: 1, pair: 1 },
   {
