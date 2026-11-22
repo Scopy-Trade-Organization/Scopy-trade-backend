@@ -139,8 +139,6 @@ export const registerUser = async (
       });
     }
 
-    const signupStatus = "waitlist";
-
     // waitlist registrations.
     const user = await User.create({
       email,
@@ -152,7 +150,6 @@ export const registerUser = async (
       sponsored,
       traderID:
         role === "CopyTrader" ? generateCopyTraderID() : generateProTraderID(),
-      status: signupStatus,
     });
 
     // Temporarily disabled: signup OTP generation and email delivery.
