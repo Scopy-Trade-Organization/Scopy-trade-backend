@@ -1,8 +1,10 @@
 # Trader subscriptions and ranks
 
-Copy traders now discover active pro trader profiles, open profile details, and subscribe using an owned, active supported exchange connection and a USDT allocation. One active subscription is allowed per copier/pro pair. Onboarding, trade monitoring/history and withdrawal mechanics are preserved. Old per-trade discovery routes are removed; manual copy submission returns HTTP 410.
+Copy traders now discover active pro trader profiles, open profile details, and subscribe using an owned, active supported exchange connection. One active subscription is allowed per copier/pro pair. Onboarding, trade monitoring/history and withdrawal mechanics are preserved. Old per-trade discovery routes are removed; manual copy submission returns HTTP 410.
 
-The allocation is the balance used by the existing 2% stop-loss risk calculation for each future trade. It is not a deposit or reserved balance. Concurrent trades can increase aggregate exposure. Live connected balance is verified before each automatic order; an insufficient balance results in a notification. Starting or restarting a subscription never copies existing pro positions. Stopping prevents queued and future orders; an exchange submission already in flight may still finish. Existing positions continue receiving protection updates and pro closures.
+`POST /api/copy-trader/dashboard/traders/:traderId/copy` requires only `{ "exchangeConnectionId": "..." }`. No allocation is required, stored for new subscriptions, or returned; an allocation submitted by older clients is ignored. Each automatic order fetches the copier's live available futures balance and applies the existing 2% stop-loss risk calculation to that balance. Concurrent trades can increase aggregate exposure. Insufficient balance results in a notification. Starting or restarting a subscription never copies existing pro positions. Stopping prevents queued and future orders; an exchange submission already in flight may still finish. Existing positions continue receiving protection updates and pro closures.
+
+Subscription creation does not check exchange funds or settlement debt. These checks run when executing each copied trade. For legacy accounts missing `settlementOwedUnits`, the settlement check restores that field transactionally from unpaid profitable copy-trade fees (pending, processing, or failed). Existing balances are preserved, and outstanding fees continue to block trade execution when settlement is due.
 
 ## Automatic execution
 

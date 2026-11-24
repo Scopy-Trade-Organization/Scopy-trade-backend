@@ -153,13 +153,32 @@ export interface ProfitShareSummary {
   settlementRequired: boolean;
 }
 
+async function restoreLegacySettlementBalance(userId: mongoose.Types.ObjectId) {
+  // Schema defaults do not backfill stored documents or apply to lean reads.
+  // Recover only absent fields; never replace an existing (even invalid) balance.
+  await mongoose.connection.transaction(async session => {
+    const legacy = await User.exists({ _id: userId, settlementOwedUnits: { $exists: false } }).session(session);
+    if (!legacy) return;
+    const unpaid = await Trade.find({
+      userId, tradeOrigin: "copy", tradeResult: "profit",
+      feeStatus: { $in: ["pending", "processing", "failed"] },
+    }).select("platformFee").session(session).lean();
+    const units = unpaid.reduce((sum, trade) => sum + usdtUnits(trade.platformFee || "0"), 0);
+    if (!Number.isSafeInteger(units)) throw new Error("Settlement amount exceeds supported precision.");
+    await User.updateOne({ _id: userId, settlementOwedUnits: { $exists: false } },
+      { $set: { settlementOwedUnits: units } }, { session });
+  });
+}
+
 export async function getProfitShareSummary(
   userId: mongoose.Types.ObjectId,
 ): Promise<ProfitShareSummary> {
-  const [user, processing] = await Promise.all([
-    User.findById(userId).select("settlementOwedUnits").lean(),
-    Trade.exists({ userId, tradeOrigin: "copy", feeStatus: "processing" }),
-  ]);
+  let user = await User.findById(userId).select("settlementOwedUnits").lean();
+  if (user && user.settlementOwedUnits === undefined) {
+    await restoreLegacySettlementBalance(userId);
+    user = await User.findById(userId).select("settlementOwedUnits").lean();
+  }
+  const processing = await Trade.exists({ userId, tradeOrigin: "copy", feeStatus: "processing" });
   if (!user || !Number.isSafeInteger(user.settlementOwedUnits) || user.settlementOwedUnits < 0) {
     throw new Error("Settlement balance unavailable.");
   }

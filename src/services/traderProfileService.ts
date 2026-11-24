@@ -29,7 +29,7 @@ export async function getCopiers(proTraderId: mongoose.Types.ObjectId, now = new
     const balanceFresh = !!connection?.balanceCheckedAt && connection.balanceCheckedAt.getTime() >= now.getTime() - 86400_000;
     const balanceQualified = balanceFresh && !!connection?.isActive && Number(connection.balanceUsdt) >= 100;
     return {
-      _id: subscription._id, copier, startedAt: subscription.startedAt, allocation: subscription.allocation,
+      _id: subscription._id, copier, startedAt: subscription.startedAt,
       exchange: connection?.exchange, label: connection?.label,
       copiedTrades: stat.copiedTrades, monthlyTrades: stat.monthlyTrades, monthlyFees: stat.monthlyFees, realizedPnl: stat.realizedPnl,
       balanceQualified, balanceFresh,

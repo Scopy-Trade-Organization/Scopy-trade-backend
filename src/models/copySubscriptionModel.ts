@@ -4,7 +4,8 @@ const schema = new Schema({
   copierId: { type: Schema.Types.ObjectId, ref: "User", required: true },
   proTraderId: { type: Schema.Types.ObjectId, ref: "User", required: true },
   exchangeConnectionId: { type: Schema.Types.ObjectId, ref: "ExchangeConnection", required: true },
-  allocation: { type: Number, required: true, min: 1 },
+  // Legacy metadata only; execution sizes from the copier's live futures balance.
+  allocation: { type: Number, select: false },
   active: { type: Boolean, default: true, required: true },
   startedAt: { type: Date, default: Date.now, required: true },
   stoppedAt: { type: Date, default: null },

@@ -7,9 +7,7 @@ import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import { RankAward } from "../models/rankModel.js";
 import AuditLog from "../models/auditLogModel.js";
 import { traderProfile, getCopiers } from "../services/traderProfileService.js";
-import { refreshConnectionBalance } from "../services/automaticCopyService.js";
 import { RANKS } from "../services/rankRules.js";
-import { getProfitShareSummary } from "../services/profitSharingService.js";
 import { SUPPORTED_TRADE_EXCHANGES } from "../constants.js";
 
 const handler = (fn: (req: Request, res: Response) => Promise<unknown>) => async (req: Request, res: Response) => {
@@ -39,24 +37,18 @@ export const getTraderProfile = handler(async (req, res) => {
 });
 
 export const startCopying = handler(async (req, res) => {
-  if ((await getProfitShareSummary(req.user as mongoose.Types.ObjectId)).settlementRequired) return res.status(403).json({ success: false, message: "Settle your outstanding profit share in your dashboard before copying new trades." });
-  const { exchangeConnectionId, allocation } = req.body;
+  const { exchangeConnectionId } = req.body ?? {};
   if (!mongoose.isValidObjectId(req.params.traderId) || !mongoose.isValidObjectId(exchangeConnectionId)) return res.status(400).json({ success: false, message: "Select a trader and an exchange account." });
-  if (typeof allocation !== "number" || !Number.isFinite(allocation) || allocation < 1 || allocation > 1e9) return res.status(400).json({ success: false, message: "Allocation must be a positive USDT amount of at least 1." });
   const proTraderId = new mongoose.Types.ObjectId(String(req.params.traderId));
   if (String(proTraderId) === String(req.user) || !await User.exists({ _id: proTraderId, role: "ProTrader", status: { $in: ["active", "live"] } })) return res.status(404).json({ success: false, message: "This pro trader is unavailable." });
   const existing = await CopySubscription.findOne({ copierId: req.user, proTraderId, active: true }).lean();
-  if (existing) return res.status(409).json({ success: false, message: "You already copy this trader. Stop copying before changing the account or allocation." });
+  if (existing) return res.status(409).json({ success: false, message: "You already copy this trader. Stop copying before changing the account." });
   const connection = await ExchangeConnection.findOne({ _id: exchangeConnectionId, userId: req.user, isActive: true }).lean();
   if (!connection || !SUPPORTED_TRADE_EXCHANGES.includes(connection.exchange as typeof SUPPORTED_TRADE_EXCHANGES[number])) return res.status(422).json({ success: false, message: "Select an active exchange that supports trading." });
-  let balance: number;
-  try { balance = await refreshConnectionBalance(connection._id, req.user as mongoose.Types.ObjectId); }
-  catch { return res.status(422).json({ success: false, message: "Could not verify your exchange balance. Check your connection and API permissions." }); }
-  if (allocation > balance) return res.status(422).json({ success: false, message: "Allocation exceeds your connected exchange balance." });
   // An atomic predicate prevents concurrent requests from changing an active subscription.
   let subscription;
   try {
-    subscription = await CopySubscription.findOneAndUpdate({ copierId: req.user, proTraderId, active: false }, { $set: { exchangeConnectionId, allocation, active: true, startedAt: new Date(), stoppedAt: null } }, { upsert: true, new: true, runValidators: true });
+    subscription = await CopySubscription.findOneAndUpdate({ copierId: req.user, proTraderId, active: false }, { $set: { exchangeConnectionId, active: true, startedAt: new Date(), stoppedAt: null }, $unset: { allocation: 1 } }, { upsert: true, new: true, runValidators: true });
   } catch (error) {
     if ((error as { code?: number }).code === 11000) return res.status(409).json({ success: false, message: "You already copy this trader." });
     throw error;

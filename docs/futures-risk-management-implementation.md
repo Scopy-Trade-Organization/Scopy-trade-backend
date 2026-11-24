@@ -213,9 +213,9 @@ A copier copies the direction and price levels, not the Pro Trader's quantity.
 Every copier passes through the live balance, fee, quantity, margin and leverage
 checks for their own connected account.
 
-The existing subscription allocation remains subscription metadata and can
-still be used by eligibility features. It does not set order quantity or replace
-the exchange's available margin.
+Subscriptions require only an exchange connection; allocation submitted by older
+clients is ignored. Order sizing uses the copier's live available futures balance,
+and rank eligibility uses refreshed connected-balance snapshots.
 
 The `balance` field in an old opening request is ignored. It can be omitted,
 and changing it cannot enlarge the position. No frontend leverage choice

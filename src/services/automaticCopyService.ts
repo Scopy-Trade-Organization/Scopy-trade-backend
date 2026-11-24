@@ -50,9 +50,9 @@ async function notifyFailure(job: { _id: mongoose.Types.ObjectId; copierId: mong
 // Only user-safe reasons enter notifications; raw exchange errors can contain signed URLs.
 function safeFailure(result: { status: number; body: Record<string, any> }) {
   const detail = String(result.body.detail || "").toLowerCase();
-  if (/insufficient|not enough|available balance|margin is not enough/.test(detail)) return "The exchange reported insufficient funds or margin. Fund your account or reduce your allocation.";
+  if (/insufficient|not enough|available balance|margin is not enough/.test(detail)) return "The exchange reported insufficient funds or margin. Check your available futures balance and open positions.";
   if (/permission|api.?key|signature|unauthorized|authentication/.test(detail)) return "The exchange rejected your API credentials or trading permissions. Check your connection in Exchange Settings.";
-  if (/minimum|min.?notional|lot.?size|quantity|precision/.test(detail)) return "The order does not meet this exchange’s size or precision requirements. Review your allocation and exchange limits.";
+  if (/minimum|min.?notional|lot.?size|quantity|precision/.test(detail)) return "The order does not meet this exchange’s size or precision requirements. Review your available futures balance and exchange limits.";
   if (result.status === 500) return "The platform could not complete this copy. Check your exchange orders before taking further action.";
   if (result.status === 502) return "The exchange could not confirm this order. Check your balance, trading permissions and exchange order history before taking further action.";
   return String(result.body.message || "This trade could not be copied.");
