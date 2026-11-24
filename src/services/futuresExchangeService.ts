@@ -45,6 +45,18 @@ function array(value: any, name: string): any[] {
     );
   return value;
 }
+function bitgetPendingOrders(response: any, name: string): any[] {
+  const list = response?.data?.entrustedList;
+  // Record only response types; account/order contents and credentials stay private.
+  // An unrecognized payload cannot establish that the symbol has no open orders.
+  if (!Array.isArray(list)) {
+    const type = (value: unknown) => value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+    console.warn("[futuresExchange] Invalid Bitget pending-order response", {
+      check: name, dataType: type(response?.data), listType: type(list),
+    });
+  }
+  return array(list, name);
+}
 function amount(value: any, name: string, zero = false) {
   return decimal(value, name, zero).toFixed();
 }
@@ -112,8 +124,8 @@ export async function assertSymbolFree(
       throw rejectMode();
     if (
       rows.some((p) => decimal(p.total, "Position size", true).gt(0)) ||
-      array(orders.data?.entrustedList, "Bitget orders").length ||
-      array(stops.data?.entrustedList, "Bitget stops").length
+      bitgetPendingOrders(orders, "Bitget orders").length ||
+      bitgetPendingOrders(stops, "Bitget stops").length
     )
       throw busy();
   }

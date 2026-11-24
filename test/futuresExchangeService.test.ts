@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { getFuturesContext, configureLeverage, refreshAvailableFuturesBalance, futuresSymbol } from "../src/services/futuresExchangeService.js";
+import { assertSymbolFree, getFuturesContext, configureLeverage, refreshAvailableFuturesBalance, futuresSymbol } from "../src/services/futuresExchangeService.js";
 import { calculateTradeRisk, TradeRiskError } from "../src/services/tradeRiskService.js";
 import type { ExchangeId } from "../src/types/index.js";
 import type { ExchangeRequest } from "../src/services/exchangeApiService.js";
@@ -72,6 +72,35 @@ test("Bybit isolated balance subtracts position margin, order margin and locked 
   assert.equal((await getFuturesContext("bybit", credentials, "BTCUSDT", f.request)).availableBalance, "50");
   f.responses["/v5/account/wallet-balance"].result.list[0].coin[0].totalOrderIM = undefined;
   await assert.rejects(getFuturesContext("bybit", credentials, "BTCUSDT", f.request), /Order margin.*unavailable/);
+});
+
+test("Bitget malformed order responses remain unverifiable and log only response types", async t => {
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => { warnings.push(args); });
+  for (const path of ["/api/v2/mix/order/orders-pending", "/api/v2/mix/order/orders-plan-pending"]) {
+    for (const response of [{}, { data: null }, { data: {} }, { data: [] },
+      { code: "00000", data: { entrustedList: {} } }, { code: "00000", data: { entrustedList: "private-response-value" } },
+      { code: "40001", data: { entrustedList: null } }, { data: { entrustedList: null } },
+      { code: "00000", data: { entrustedList: null, endId: null } }]) {
+      const f = fixture("bitget");
+      f.responses[path] = response;
+      await assert.rejects(assertSymbolFree("bitget", f.request, "BTCUSDT"), (error: unknown) =>
+        error instanceof TradeRiskError && error.code === "INVALID_EXCHANGE_RESPONSE");
+      assert.equal(f.calls.filter(call => call.method === "POST").length, 0);
+    }
+  }
+  assert.equal(warnings.length, 18);
+  assert.ok(!JSON.stringify(warnings).includes("private-response-value"));
+});
+
+test("Bitget nonempty entry and protection order lists still block a new trade", async () => {
+  for (const path of ["/api/v2/mix/order/orders-pending", "/api/v2/mix/order/orders-plan-pending"]) {
+    const f = fixture("bitget");
+    f.responses[path] = { code: "00000", data: { entrustedList: [{ orderId: "existing-order" }] } };
+    await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", f.request), (error: unknown) =>
+      error instanceof TradeRiskError && error.code === "EXISTING_EXPOSURE");
+    assert.equal(f.calls.filter(call => call.method === "POST").length, 0);
+  }
 });
 
 for (const exchange of ["bybit", "okx", "bitget"] as const) test(`${exchange}: exchange API failures cannot yield an assumed-safe context`, async () => {
