@@ -37,6 +37,22 @@ const busy = () =>
   );
 const unsupportedCross = () => new TradeRiskError("UNSUPPORTED_MARGIN_MODE",
   "Liquidation safety requires isolated margin. Cross account-wide exposure cannot be verified by this planner; select isolated margin on the exchange.");
+function bitgetModeError(field: "posMode" | "assetMode" | "marginMode", value: unknown) {
+  const known = ["one_way_mode", "hedge_mode", "single", "multi", "crossed", "isolated"].includes(String(value));
+  console.warn("[futuresExchange] Unsupported Bitget account setting", {
+    field, value: known ? value : value == null ? "missing" : "unrecognized",
+  });
+  const message = field === "posMode"
+    ? value === "hedge_mode"
+      ? "Bitget USDT-M Futures is in Hedge Mode. Select One-way Mode in Bitget Futures settings before opening a trade."
+      : "Bitget did not confirm One-way Mode (posMode). Check your USDT-M Futures position mode and account API response."
+    : field === "assetMode"
+      ? value === "multi"
+        ? "Bitget USDT-M Futures is in Multi-asset Mode. Select Single-asset Mode before opening a trade."
+        : "Bitget did not confirm Single-asset Mode (assetMode). Check your USDT-M Futures asset mode and account API response."
+      : "Bitget did not return a supported marginMode. This integration requires isolated USDT-M Futures margin.";
+  return new TradeRiskError("UNSUPPORTED_ACCOUNT_MODE", message);
+}
 function array(value: any, name: string): any[] {
   if (!Array.isArray(value))
     throw new TradeRiskError(
@@ -124,8 +140,8 @@ export async function assertSymbolFree(
       }),
     ]);
     const rows = array(positions.data, "Bitget positions");
-    if (rows.some((p) => p.posMode && p.posMode !== "one_way_mode"))
-      throw rejectMode();
+    const unsupportedPosition = rows.find((p) => p.posMode && p.posMode !== "one_way_mode");
+    if (unsupportedPosition) throw bitgetModeError("posMode", unsupportedPosition.posMode);
     if (
       rows.some((p) => decimal(p.total, "Position size", true).gt(0)) ||
       bitgetPendingOrders(orders, "Bitget orders").length ||
@@ -377,13 +393,9 @@ async function bitgetContext(
       "UNSUPPORTED_INSTRUMENT",
       "Bitget requires an active classic-account USDT perpetual futures instrument.",
     );
-  if (
-    !account ||
-    account.posMode !== "one_way_mode" ||
-    account.assetMode !== "single" ||
-    !["crossed", "isolated"].includes(account.marginMode)
-  )
-    throw rejectMode();
+  if (account?.posMode !== "one_way_mode") throw bitgetModeError("posMode", account?.posMode);
+  if (account.assetMode !== "single") throw bitgetModeError("assetMode", account.assetMode);
+  if (!["crossed", "isolated"].includes(account.marginMode)) throw bitgetModeError("marginMode", account.marginMode);
   if (account.marginMode !== "isolated") throw unsupportedCross();
   const available =
     account.marginMode === "crossed"
@@ -581,11 +593,8 @@ export async function refreshAvailableFuturesBalance(
     productType: "USDT-FUTURES",
     marginCoin: "USDT",
   });
-  if (
-    result.data?.marginMode !== context.marginMode ||
-    result.data?.posMode !== "one_way_mode"
-  )
-    throw rejectMode();
+  if (result.data?.posMode !== "one_way_mode") throw bitgetModeError("posMode", result.data?.posMode);
+  if (result.data?.marginMode !== context.marginMode) throw bitgetModeError("marginMode", result.data?.marginMode);
   return amount(
     context.marginMode === "crossed"
       ? result.data?.crossedMaxAvailable

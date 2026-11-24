@@ -164,6 +164,30 @@ test("unknown portfolio or hedge modes are rejected without silently changing ac
   assert.equal(futuresSymbol("okx", "BTC/USDT"), "BTC-USDT-SWAP");
 });
 
+test("Bitget account-mode rejection identifies the setting without logging account contents", async t => {
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => { warnings.push(args); });
+  for (const [field, value, message] of [
+    ["posMode", "hedge_mode", /Hedge Mode.*One-way Mode/],
+    ["posMode", undefined, /did not confirm One-way Mode \(posMode\)/],
+    ["assetMode", "multi", /Multi-asset Mode.*Single-asset Mode/],
+    ["assetMode", undefined, /did not confirm Single-asset Mode \(assetMode\)/],
+    ["marginMode", "private-account-value", /supported marginMode/],
+  ] as const) {
+    const f = fixture("bitget");
+    const request: ExchangeRequest = async (...args) => {
+      const result = await f.request(...args);
+      if (args[1] === "/api/v2/mix/account/account") result.data[field] = value;
+      return result;
+    };
+    await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", request), (error: unknown) =>
+      error instanceof TradeRiskError && error.code === "UNSUPPORTED_ACCOUNT_MODE" && message.test(error.message));
+    assert.equal(f.calls.filter(call => call.method === "POST").length, 0);
+  }
+  assert.equal(warnings.length, 5);
+  assert.ok(!JSON.stringify(warnings).includes("private-account-value"));
+});
+
 test("exchange transport signs all three formats and uses demo headers only in testnet", async t => {
   const previous = process.env.EXCHANGE_MODE;
   try {
