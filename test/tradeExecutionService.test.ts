@@ -7,10 +7,11 @@ import { executeTrade, type ExecutionDependencies } from "../src/services/tradeE
 import { ExchangeConnection } from "../src/models/exchangeConnectionModel.js";
 import { Trade } from "../src/models/tradeModel.js";
 import User from "../src/models/userModel.js";
-import { encryptCredentials } from "../src/services/exchangeConnectionService.js";
+import { encryptCredentials, http } from "../src/services/exchangeConnectionService.js";
 import { D, TradeRiskError, type InstrumentRules } from "../src/services/tradeRiskService.js";
 import { ProtectionFailure } from "../src/services/tradeProtectionService.js";
 import { previewTradeWithDependencies } from "../src/controllers/tradeController.js";
+import { closeProTrade } from "../src/controllers/proTraderDashboardController.js";
 
 const rules: InstrumentRules = { symbol: "BTCUSDT", quantityStep: "0.0001", minimumQuantity: "0.0001", maximumQuantity: "100",
   minimumNotional: "5", priceTickSize: "0.1", contractSize: "1", minimumLeverage: "1", maximumLeverage: "100", leverageStep: "1",
@@ -174,6 +175,57 @@ test("lost POST response keeps the saved client ID for reconciliation without re
   assert.ok(result.body.clientOrderId);
   assert.equal((await Trade.findById(result.body.tradeId))?.protectionStatus, "review");
   assert.equal((await executeTrade(f.userId, f.body, true, f.dependencies)).status, 409);
+});
+
+test("manual close recovers a lost entry response by client ID and cancels the confirmed order", async t => {
+  const f = await fixture();
+  f.dependencies.placeOrder = async () => { throw new Error("Response lost"); };
+  const result = await executeTrade(f.userId, f.body, true, f.dependencies);
+  const clientId = result.body.clientOrderId;
+  let cancelled = false;
+  const mutations: string[] = [];
+  t.mock.method(http, "get", async () => ({ data: { retCode: 0, time: Date.now() } }));
+  t.mock.method(http, "request", async (config: any) => {
+    const url = new URL(config.url);
+    if (config.method === "POST") {
+      mutations.push(url.pathname);
+      assert.equal(url.pathname, "/v5/order/cancel");
+      assert.equal(JSON.parse(config.data).orderId, "recovered-entry");
+      cancelled = true;
+      return { data: { retCode: 0, result: {} } };
+    }
+    if (url.pathname === "/v5/position/list") return { data: { retCode: 0, result: { list: [] } } };
+    assert.equal(url.pathname, "/v5/order/realtime");
+    assert.equal(url.searchParams.get("orderId") || url.searchParams.get("orderLinkId"), url.searchParams.has("orderId") ? "recovered-entry" : clientId);
+    return { data: { retCode: 0, result: { list: [{ orderId: "recovered-entry", orderLinkId: clientId, orderStatus: cancelled ? "Cancelled" : "New", cumExecQty: "0", qty: "1" }] } } };
+  });
+  let status = 0, body: any;
+  const res = { status(value: number) { status = value; return this; }, json(value: any) { body = value; return this; } };
+  await closeProTrade({ params: { tradeId: result.body.tradeId }, user: f.userId, headers: {} } as any, res as any);
+  assert.equal(status, 200, JSON.stringify(body));
+  assert.equal(body.trade.status, "cancelled");
+  assert.equal(body.trade.exchangeOrderId, "recovered-entry");
+  assert.deepEqual(mutations, ["/v5/order/cancel"]);
+});
+
+test("manual close leaves an unconfirmed entry active for review without submitting an order", async t => {
+  const f = await fixture();
+  f.dependencies.placeOrder = async () => { throw new Error("Response lost"); };
+  const result = await executeTrade(f.userId, f.body, true, f.dependencies);
+  t.mock.method(http, "get", async () => ({ data: { retCode: 0, time: Date.now() } }));
+  t.mock.method(http, "request", async (config: any) => {
+    assert.equal(config.method, "GET");
+    return { data: { retCode: 0, result: { list: [] } } };
+  });
+  let status = 0, body: any;
+  const res = { status(value: number) { status = value; return this; }, json(value: any) { body = value; return this; } };
+  await closeProTrade({ params: { tradeId: result.body.tradeId }, user: f.userId, headers: {} } as any, res as any);
+  assert.equal(status, 409);
+  assert.equal(body.code, "ORDER_REVIEW_REQUIRED");
+  const stored = await Trade.findById(result.body.tradeId);
+  assert.equal(stored?.status, "pending");
+  assert.equal(stored?.protectionStatus, "review");
+  assert.equal(stored?.exchangeOrderId, null);
 });
 test("testnet rebasing preserves stop distance ratio and still uses the account balance", async () => {
   const previous = process.env.EXCHANGE_MODE;

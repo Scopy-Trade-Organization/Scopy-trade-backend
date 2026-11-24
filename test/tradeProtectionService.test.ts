@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { hasProtection, verifyOrRecoverProtection, readConfirmedExit, ProtectionFailure, type ProtectedOrder } from "../src/services/tradeProtectionService.js";
-import { closeTradeOrder } from "../src/services/tradeService.js";
+import { closeTradeOrder, resolveExchangeOrderId } from "../src/services/tradeService.js";
 import type { ExchangeId } from "../src/types/index.js";
 import type { ExchangeRequest } from "../src/services/exchangeApiService.js";
 
@@ -38,6 +38,30 @@ function fixture(exchange: ExchangeId, filled = false, repairWorks = false) {
   return { request, mutations, protect: () => { protectedOrder = true; } };
 }
 for (const exchange of ["bybit", "okx", "bitget"] as const) {
+  test(`${exchange}: recover the exact order by saved client ID using only reads`, async () => {
+    const row = exchange === "bybit" ? { orderId: "recovered", orderLinkId: "sc123" }
+      : exchange === "okx" ? { ordId: "recovered", clOrdId: "sc123" }
+      : { orderId: "recovered", clientOid: "sc123" };
+    const api: ExchangeRequest = async (method, _path, values) => {
+      assert.equal(method, "GET");
+      assert.equal(values?.orderId ?? values?.ordId, undefined);
+      assert.equal(values?.orderLinkId ?? values?.clOrdId ?? values?.clientOid, "sc123");
+      return exchange === "bybit" ? { result: { list: [row] } } : exchange === "okx" ? { data: [row] } : { data: row };
+    };
+    assert.equal(await resolveExchangeOrderId(exchange, order.credentials, order.pair, "sc123", api), "recovered");
+  });
+  test(`${exchange}: missing identifiers never issue an unfiltered lookup`, async () => {
+    let calls = 0;
+    await assert.rejects(resolveExchangeOrderId(exchange, order.credentials, order.pair, null, async () => { calls++; }), { code: "ORDER_REVIEW_REQUIRED" });
+    assert.equal(calls, 0);
+  });
+  test(`${exchange}: unrelated, malformed and unavailable orders remain under review`, async () => {
+    for (const row of [{ orderId: "other", ordId: "other", orderLinkId: "other", clOrdId: "other", clientOid: "other" }, {}, null]) {
+      const api: ExchangeRequest = async () => exchange === "bybit" ? { result: { list: row ? [row] : [] } } : exchange === "okx" ? { data: row ? [row] : [] } : { data: row };
+      await assert.rejects(resolveExchangeOrderId(exchange, order.credentials, order.pair, "sc123", api), { code: "ORDER_REVIEW_REQUIRED" });
+    }
+    await assert.rejects(resolveExchangeOrderId(exchange, order.credentials, order.pair, "sc123", async () => { throw new Error("Timeout"); }), { code: "ORDER_REVIEW_REQUIRED" });
+  });
   test(`${exchange}: confirmed pending native TP/SL passes read-back without recovery`, async () => {
     const f = fixture(exchange);
     f.protect();

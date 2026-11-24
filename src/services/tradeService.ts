@@ -731,6 +731,31 @@ export async function amendTradeOrder(
   return result;
 }
 
+/** Recover a lost submission response without placing another entry. */
+export async function resolveExchangeOrderId(
+  exchange: ExchangeId,
+  credentials: RawCredentials,
+  pair: string,
+  clientOrderId: string | null | undefined,
+  api = exchangeApi(exchange, credentials),
+): Promise<string> {
+  const unresolved = () => new TradeRiskError("ORDER_REVIEW_REQUIRED",
+    "The exchange order could not be confirmed by its saved client order ID. Check the exchange order history before retrying; this trade remains under review.");
+  // Never issue an unfiltered order lookup when both identifiers are missing.
+  if (!clientOrderId) throw unresolved();
+  let entry;
+  try {
+    entry = await readEntry(exchange, api, normalizePairForExchange(exchange, pair), "", clientOrderId);
+  } catch {
+    throw unresolved();
+  }
+  const row = entry.row;
+  const returnedClientId = exchange === "bybit" ? row.orderLinkId : exchange === "okx" ? row.clOrdId : row.clientOid;
+  const orderId = exchange === "okx" ? row.ordId : row.orderId;
+  if (returnedClientId !== clientOrderId || typeof orderId !== "string" || !orderId.trim()) throw unresolved();
+  return orderId;
+}
+
 export async function getOrderStatus(
   exchange: ExchangeId,
   credentials: RawCredentials,

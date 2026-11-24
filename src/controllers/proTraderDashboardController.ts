@@ -10,6 +10,7 @@ import {
   amendTradeOrder,
   closeTradeOrder,
   getOrderStatus,
+  resolveExchangeOrderId,
 } from "../services/tradeService.js";
 import { decryptCredentials } from "../services/exchangeConnectionService.js";
 import { getTradeMonitorService } from "../services/tradeMonitorService.js";
@@ -374,10 +375,6 @@ export const closeProTrade = async (req: Request, res: Response) => {
     if (!trade) {
       return res.status(404).json({ success: false, message: "Active pro trade not found." });
     }
-    if (!trade.exchangeOrderId) {
-      return res.status(409).json({ success: false, message: "This trade has no exchange order to close." });
-    }
-
     const connection = await ExchangeConnection.findOne({
       _id: trade.exchangeConnectionId,
       userId: req.user,
@@ -393,6 +390,15 @@ export const closeProTrade = async (req: Request, res: Response) => {
       apiSecret: connection.encryptedApiSecret,
       ...(connection.encryptedPassphrase ? { passphrase: connection.encryptedPassphrase } : {}),
     });
+    if (!trade.exchangeOrderId) {
+      try {
+        trade.exchangeOrderId = await resolveExchangeOrderId(exchange, credentials, trade.pair, trade.exchangeClientOrderId);
+        await trade.save();
+      } catch (error) {
+        if (!(error instanceof TradeRiskError)) throw error;
+        return res.status(409).json({ success: false, code: error.code, message: error.message });
+      }
+    }
     const live = await getOrderStatus(exchange, credentials, trade.pair, trade.exchangeOrderId);
     if (!['pending', 'filled'].includes(live.status)) {
       return res.status(409).json({ success: false, message: `The exchange reports this order as ${live.status}; it can no longer be closed manually.` });
