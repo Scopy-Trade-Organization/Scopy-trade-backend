@@ -74,6 +74,27 @@ test("Bybit isolated balance subtracts position margin, order margin and locked 
   await assert.rejects(getFuturesContext("bybit", credentials, "BTCUSDT", f.request), /Order margin.*unavailable/);
 });
 
+test("Bitget successful null order lists permit planning and the leverage recheck", async () => {
+  for (const endId of [undefined, null, ""]) {
+    const f = fixture("bitget");
+    for (const path of ["/api/v2/mix/order/orders-pending", "/api/v2/mix/order/orders-plan-pending"]) {
+      f.responses[path] = { code: "00000", data: { entrustedList: null, endId } };
+    }
+    const context = await getFuturesContext("bitget", credentials, "BTCUSDT", f.request);
+    assert.equal(context.availableBalance, "50");
+    const sizing = calculateTradeRisk({ exchange: "bitget", ...context, entry: "64755.1", sl: "64949.3", tp: "64000", direction: "sell" });
+    await configureLeverage("bitget", credentials, context, sizing, f.request);
+    assert.equal(f.calls.filter(call => call.method === "POST").length, 1);
+    f.responses["/api/v2/mix/order/orders-plan-pending"].data.entrustedList = [{ orderId: "existing-stop" }];
+    await assert.rejects(configureLeverage("bitget", credentials, context, sizing, f.request), (error: unknown) =>
+      error instanceof TradeRiskError && error.code === "EXISTING_EXPOSURE");
+    assert.equal(f.calls.filter(call => call.method === "POST").length, 1);
+    f.occupy();
+    await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", f.request), (error: unknown) =>
+      error instanceof TradeRiskError && error.code === "EXISTING_EXPOSURE");
+  }
+});
+
 test("Bitget malformed order responses remain unverifiable and log only response types", async t => {
   const warnings: unknown[][] = [];
   t.mock.method(console, "warn", (...args: unknown[]) => { warnings.push(args); });
@@ -81,7 +102,7 @@ test("Bitget malformed order responses remain unverifiable and log only response
     for (const response of [{}, { data: null }, { data: {} }, { data: [] },
       { code: "00000", data: { entrustedList: {} } }, { code: "00000", data: { entrustedList: "private-response-value" } },
       { code: "40001", data: { entrustedList: null } }, { data: { entrustedList: null } },
-      { code: "00000", data: { entrustedList: null, endId: null } }]) {
+      { code: "00000", data: { entrustedList: null, endId: "existing-order" } }]) {
       const f = fixture("bitget");
       f.responses[path] = response;
       await assert.rejects(assertSymbolFree("bitget", f.request, "BTCUSDT"), (error: unknown) =>

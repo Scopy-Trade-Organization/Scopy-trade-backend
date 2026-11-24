@@ -47,6 +47,10 @@ function array(value: any, name: string): any[] {
 }
 function bitgetPendingOrders(response: any, name: string): any[] {
   const list = response?.data?.entrustedList;
+  // Bitget can return null instead of [] when there are no pending orders.
+  // Require a successful response and no pagination cursor before treating it as empty.
+  const endId = response?.data?.endId;
+  if (response?.code === "00000" && list === null && (endId === undefined || endId === null || endId === "")) return [];
   // Record only response types; account/order contents and credentials stay private.
   // An unrecognized payload cannot establish that the symbol has no open orders.
   if (!Array.isArray(list)) {
