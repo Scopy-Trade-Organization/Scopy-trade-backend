@@ -38,8 +38,10 @@ The product category is `USDT-FUTURES`; order quantity is base coin in `qty`.
 Entry protection uses `takeProfit` and `stopLoss`, mark-price triggers and market
 execution. Exits use the opposite side with `reduceOnly=yes`. Open orders use
 `data.list`; the shared position parser accepts a `data` array or `data.list`.
-Strategy orders use a `data` array. Missing or null position data remains an
-error, with data/list types logged for diagnosis without account contents.
+Strategy orders use a `data` array. A successful `code=00000` position response
+with `data.list=null` and no pagination marker is normalized to an empty list.
+Missing data, `data=null`, failed responses and incomplete pages remain errors,
+with data/list types logged for diagnosis without account contents.
 History reconciliation follows `cursor` pagination and requires confirmed
 cumulative fills before recording an exit price. Unknown order states,
 unverifiable responses and changed position identity require review.
@@ -74,6 +76,23 @@ the periodic REST reconciliation also remains active.
 
 Automated tests use mocked v3 responses and local database fixtures. They do not
 establish that real exchange orders or account settings have been verified.
+
+The execution integration test includes the reported LINKUSDT short payload
+(`entry=8.618`, `tp=8.561`, `sl=8.65`). It uses public LINK instrument/tier
+fields checked on 2026-11-25, simulated available margin of 51.24649142 USDT,
+and a simulated account taker fee of 0.0006. The real execution pipeline selects
+24 LINK at 5x, keeping estimated entry/stop risk including fees at 1.0166592
+USDT against a 1.0249298284 USDT budget. Both a protected pending limit order
+and an immediately filled, protected short return 201 and persist the exchange
+order ID. The test also verifies duplicate submissions are blocked.
+
+These are conditional sizing results: the backend ignores the submitted
+`balance` field and reads available isolated margin from Bitget. Actual account
+fees, reserved margin, existing exposure, account settings and current prices
+can change the outcome. An accepted limit entry may remain pending until filled.
+Bitget HTTP rejection codes are retained in safe errors. Codes `40010`, `40725`
+and `45001` remain unconfirmed requests requiring client-ID reconciliation;
+they do not authorize a second entry.
 
 ## Official references
 

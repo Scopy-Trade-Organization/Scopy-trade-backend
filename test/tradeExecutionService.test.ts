@@ -9,7 +9,7 @@ import { Trade } from "../src/models/tradeModel.js";
 import User from "../src/models/userModel.js";
 import { encryptCredentials, http } from "../src/services/exchangeConnectionService.js";
 import { D, TradeRiskError, type InstrumentRules } from "../src/services/tradeRiskService.js";
-import { ProtectionFailure } from "../src/services/tradeProtectionService.js";
+import { ProtectionFailure, enforceStoredTradeProtection } from "../src/services/tradeProtectionService.js";
 import { previewTradeWithDependencies } from "../src/controllers/tradeController.js";
 import { closeProTrade } from "../src/controllers/proTraderDashboardController.js";
 
@@ -50,6 +50,94 @@ async function fixture(balance = "50") {
   const body = { exchangeConnectionId: String(connection._id), pair: "BTCUSDT", entry: "64755.1", sl: "64949.3", tp: "64000", direction: "sell" };
   return { userId, connection, body, dependencies, entries: () => entries, checks: () => checks, submitted: () => submitted };
 }
+
+test("LINKUSDT pro payload opens a protected Bitget UTA trade through the real execution pipeline", async t => {
+  // Public LINK instrument/tier fields verified against Bitget on 2026-11-25.
+  // Private account, price and order responses are deterministic fixtures, not live orders.
+  for (const filled of [false, true]) {
+    const userId = new mongoose.Types.ObjectId();
+    await User.collection.insertOne({ _id: userId, email: `${userId}@example.com`, traderID: String(userId), status: "live" });
+    const encrypted = encryptCredentials("bitget", { apiKey: "test-key", apiSecret: "test-secret", passphrase: "test-passphrase" });
+    const connection = await ExchangeConnection.create({ userId, exchange: "bitget", encryptedApiKey: encrypted.apiKey, encryptedApiSecret: encrypted.apiSecret, encryptedPassphrase: encrypted.passphrase });
+    const payload = { pair: "LINKUSDT", entry: 8.618, tp: 8.561, sl: 8.65, direction: "sell", notes: "", balance: 51.24649142, exchangeConnectionId: String(connection._id) };
+    let leverage = "1";
+    let submitted: any;
+    let submissions = 0;
+    let protectionReads = 0;
+    const orderId = `link-entry-${userId}`;
+    const calls: string[] = [];
+    const getMock = t.mock.method(http, "get", async (url: string) => {
+      assert.ok(url.endsWith("/api/v3/market/tickers"));
+      return { data: { code: "00000", data: [{ symbol: "LINKUSDT", lastPrice: "8.618" }] } };
+    });
+    const requestMock = t.mock.method(http, "request", async (options: any) => {
+      const url = new URL(options.url), path = url.pathname;
+      calls.push(path);
+      assert.ok(path.startsWith("/api/v3/"));
+      const body = options.data ? JSON.parse(options.data) : {};
+      let data: any;
+      switch (path) {
+        case "/api/v3/position/current-position":
+          data = { list: submitted && filled ? [{ category: "USDT-FUTURES", symbol: "LINKUSDT", holdMode: "one_way_mode", marginMode: "isolated", posSide: "short", total: submitted.qty, avgPrice: "8.618", liquidationPrice: "10", leverage }] : null };
+          break;
+        case "/api/v3/trade/unfilled-orders": data = { list: [] }; break;
+        case "/api/v3/trade/unfilled-strategy-orders":
+          data = submitted && filled ? [{ category: "USDT-FUTURES", symbol: "LINKUSDT", orderId: "protection", status: "pending", side: "buy", posSide: "short", qty: submitted.qty, takeProfit: "8.561", stopLoss: "8.65", tpTriggerBy: "mark", slTriggerBy: "mark", tpOrderType: "market", slOrderType: "market" }] : [];
+          break;
+        case "/api/v3/market/instruments":
+          data = [{ symbol: "LINKUSDT", category: "USDT-FUTURES", quoteCoin: "USDT", status: "online", type: "perpetual", quantityMultiplier: "1", minOrderQty: "1", maxOrderQty: "49000", maxMarketOrderQty: "6500", priceMultiplier: "0.001", minOrderAmount: "5", minLeverage: "1", maxLeverage: "75", openCostUpRatio: "0.01" }];
+          break;
+        case "/api/v3/account/settings":
+          data = { accountMode: "unified", accountLevel: "isolated", holdMode: "one_way_mode", deltaSwitch: "no", symbolConfigList: [{ category: "USDT-FUTURES", symbol: "LINKUSDT", marginMode: "isolated", leverage }] };
+          break;
+        case "/api/v3/account/assets":
+          data = { usdtEquity: "51.24649142", assets: [{ coin: "USDT", equity: "51.24649142", available: "51.24649142", locked: "0" }] };
+          break;
+        case "/api/v3/market/position-tier": data = [{ tier: "1", minTierValue: "0", maxTierValue: "10000", leverage: "75", mmr: "0.0067" }]; break;
+        case "/api/v3/account/fee-rate": data = { takerFeeRate: "0.0006" }; break;
+        case "/api/v3/account/max-open-available":
+          assert.equal(body.marginMode, "isolated"); data = { available: "51.24649142" }; break;
+        case "/api/v3/account/set-leverage":
+          assert.equal(body.posSide, "short"); assert.equal(body.marginMode, "isolated"); leverage = body.leverage; data = "success"; break;
+        case "/api/v3/trade/place-order":
+          assert.equal(options["axios-retry"].retries, 0);
+          assert.equal(leverage, "5");
+          assert.equal(body.side, "sell"); assert.equal(body.qty, "24"); assert.equal(body.price, "8.618");
+          assert.equal(body.marginMode, "isolated"); assert.equal(body.timeInForce, "gtc");
+          assert.equal(body.stopLoss, "8.65"); assert.equal(body.takeProfit, "8.561");
+          assert.equal(body.slTriggerBy, "mark"); assert.equal(body.slOrderType, "market");
+          assert.ok(await Trade.exists({ exchangeClientOrderId: body.clientOid, protectionStatus: "pending" }));
+          submitted = body; submissions++; data = { orderId, clientOid: body.clientOid }; break;
+        case "/api/v3/trade/order-info":
+          protectionReads++;
+          data = { ...submitted, orderId, orderStatus: filled ? "filled" : "live", cumExecQty: filled ? submitted.qty : "0", avgPrice: filled ? "8.618" : "0" }; break;
+        default: throw new Error(`Unexpected Bitget request: ${path}`);
+      }
+      return { data: { code: "00000", data } };
+    });
+    try {
+      const outcome = await executeTrade(userId, payload, true, { startMonitoring: async id => {
+        assert.ok(protectionReads > 0);
+        assert.equal(await enforceStoredTradeProtection(id), true);
+      } });
+      assert.equal(outcome.status, 201, JSON.stringify(outcome.body));
+      assert.equal(submissions, 1);
+      assert.equal(outcome.body.trade.exchangeOrderId, orderId);
+      assert.equal(outcome.body.trade.status, filled ? "filled" : "pending");
+      assert.equal(outcome.body.trade.protectionStatus, "confirmed");
+      assert.equal(outcome.body.trade.quantity, "24");
+      assert.equal(outcome.body.trade.leverage, 5);
+      assert.equal(outcome.body.trade.sizing.riskAmount, "1.0249298284");
+      assert.ok(new D(outcome.body.trade.sizing.estimatedRiskAmount).lte("1.0249298284"));
+      assert.ok(calls.indexOf("/api/v3/account/set-leverage") < calls.indexOf("/api/v3/trade/place-order"));
+      assert.equal((await ExchangeConnection.findById(connection._id))?.executionLockToken, null);
+      const duplicate = await executeTrade(userId, payload, true);
+      assert.equal(duplicate.status, 409); assert.equal(submissions, 1);
+    } finally {
+      getMock.mock.restore(); requestMock.mock.restore();
+    }
+  }
+});
 test("frontend balance is ignored, leverage precedes submission, protection precedes success, snapshot persists", async () => {
   for (const balance of [undefined, -1, "tampered", 1_000_000_000]) {
     const f = await fixture();

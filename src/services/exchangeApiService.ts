@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import axios from "axios";
 import { http, getBybitTimestamp } from "./exchangeConnectionService.js";
 import {
   getExchangeRestUrl,
@@ -7,6 +8,11 @@ import {
 } from "./exchangeEnvironment.js";
 import type { ExchangeId, RawCredentials } from "../types/index.js";
 import { TradeRiskError } from "./tradeRiskService.js";
+
+// Bitget documents these codes as ambiguous submissions: reconcile by clientOid.
+const bitgetUnconfirmedCodes = new Set(["40010", "40725", "45001"]);
+const bitgetCode = (value: unknown): string | undefined =>
+  typeof value === "string" && /^\d{5}$/.test(value) ? value : undefined;
 
 /** Signing is shared transport only; account, margin and order APIs stay exchange-specific. */
 export function exchangeApi(exchange: ExchangeId, credentials: RawCredentials) {
@@ -85,7 +91,13 @@ export function exchangeApi(exchange: ExchangeId, credentials: RawCredentials) {
         ...(method === "POST" ? { data: body } : {}),
         "axios-retry": { retries: method === "GET" ? 2 : 0 },
       }));
-    } catch {
+    } catch (error) {
+      const code = axios.isAxiosError(error) ? bitgetCode(error.response?.data?.code) : undefined;
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (exchange === "bitget" && code && status && [400, 401, 403, 429].includes(status) && !bitgetUnconfirmedCodes.has(code)) {
+        throw new TradeRiskError("EXCHANGE_REJECTED",
+          `BITGET rejected the request (code ${code}). Check account mode, permissions, order prices and available margin.`);
+      }
       throw new TradeRiskError(
         "EXCHANGE_UNAVAILABLE",
         `${exchange.toUpperCase()} could not confirm the request. Check the exchange before retrying an order.`,
@@ -94,6 +106,10 @@ export function exchangeApi(exchange: ExchangeId, credentials: RawCredentials) {
     const code = exchange === "bybit" ? data?.retCode : data?.code;
     const success =
       exchange === "bybit" ? 0 : exchange === "okx" ? "0" : "00000";
+    if (exchange === "bitget" && bitgetUnconfirmedCodes.has(code)) {
+      throw new TradeRiskError("EXCHANGE_UNAVAILABLE",
+        `BITGET could not confirm the request (code ${code}). Reconcile the saved client order ID before retrying.`);
+    }
     if (code !== success && !allowedCodes.includes(code))
       throw new TradeRiskError(
         "EXCHANGE_REJECTED",

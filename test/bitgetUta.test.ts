@@ -5,13 +5,32 @@ import { http } from "../src/services/exchangeConnectionService.js";
 import { getExchangeBalance, getCurrentPrice, placeOrder, amendTradeOrder } from "../src/services/tradeService.js";
 import { hasProtection, position, readConfirmedExit, readEntry, repairProtection, setBitgetPositionProtection, type ProtectedOrder } from "../src/services/tradeProtectionService.js";
 import { assertSymbolFree } from "../src/services/futuresExchangeService.js";
+import { bitgetPositions } from "../src/services/bitgetUtaService.js";
 import { TradeMonitorService } from "../src/services/tradeMonitorService.js";
-import type { ExchangeRequest } from "../src/services/exchangeApiService.js";
+import { exchangeApi, type ExchangeRequest } from "../src/services/exchangeApiService.js";
 
 const credentials = { apiKey: "test-key", apiSecret: "test-secret", passphrase: "test-passphrase" };
 const p: ProtectedOrder = { credentials, pair: "BTCUSDT", direction: "buy", orderId: "entry", clientOrderId: "sc123", quantity: "0.01", orderQuantity: "0.01", entryPrice: "60000", tp: "62000", sl: "59000", marginMode: "isolated" };
 const sizing: any = { orderQuantity: "0.01", positionQuantity: "0.01", entryPrice: "60000", takeProfitPrice: "62000", stopLossPrice: "59000", riskAmount: "30", takerFeeRate: "0.0006", exchangeInstrumentRules: { contractSize: "1" } };
 const entry = { orderId: "entry", clientOid: "sc123", category: "USDT-FUTURES", symbol: "BTCUSDT", qty: "0.01", price: "60000", cumExecQty: "0", avgPrice: "0", orderStatus: "live", takeProfit: "62000", stopLoss: "59000", slTriggerBy: "mark", tpTriggerBy: "mark", slOrderType: "market", tpOrderType: "market" };
+
+test("UTA HTTP rejections retain safe exchange codes while uncertain submissions require reconciliation", async t => {
+  let code = "40017";
+  let httpFailure = true;
+  t.mock.method(http, "request", async () => {
+    const data = { code, msg: credentials.apiSecret };
+    if (httpFailure) throw { isAxiosError: true, response: { status: 400, data } };
+    return { data };
+  });
+  const request = exchangeApi("bitget", credentials);
+  await assert.rejects(request("POST", "/api/v3/trade/place-order", { clientOid: "sc123" }), (error: any) =>
+    error.code === "EXCHANGE_REJECTED" && error.message.includes("40017") && !error.message.includes(credentials.apiSecret));
+  for (code of ["40010", "40725", "45001"]) {
+    for (httpFailure of [true, false]) {
+      await assert.rejects(request("POST", "/api/v3/trade/place-order", { clientOid: "sc123" }), { code: "EXCHANGE_UNAVAILABLE" });
+    }
+  }
+});
 
 test("UTA direct and nested position arrays work for both exposure checks and monitoring", async () => {
   const live = { symbol: "BTCUSDT", category: "USDT-FUTURES", holdMode: "one_way_mode", marginMode: "isolated", posSide: "long", total: "0.01" };
@@ -36,7 +55,7 @@ test("UTA direct and nested position arrays work for both exposure checks and mo
 test("UTA malformed position envelopes stay unverifiable and diagnostics contain only types", async t => {
   const logs: unknown[][] = [];
   t.mock.method(console, "warn", (...args: unknown[]) => logs.push(args));
-  for (const data of [undefined, null, {}, { list: null }, { list: "private-account-value" }, "private-account-value"]) {
+  for (const data of [undefined, null, {}, { list: null, cursor: "more" }, { list: "private-account-value" }, "private-account-value"]) {
     const api: ExchangeRequest = async (_method, path) => ({ code: "00000", data: path.endsWith("current-position") ? data : path.endsWith("unfilled-orders") ? { list: [] } : [] });
     await assert.rejects(assertSymbolFree("bitget", api, "BTCUSDT"), { code: "INVALID_EXCHANGE_RESPONSE" });
     await assert.rejects(position("bitget", api, "BTCUSDT"), { code: "INVALID_EXCHANGE_RESPONSE" });
@@ -44,6 +63,30 @@ test("UTA malformed position envelopes stay unverifiable and diagnostics contain
   assert.equal(logs.length, 12);
   assert.ok(!JSON.stringify(logs).includes("private-account-value"));
   assert.ok(JSON.stringify(logs).includes('"dataType":"null"'));
+});
+
+test("UTA successful null position lists are empty in planning and monitoring", async () => {
+  for (const marker of [undefined, null, ""]) {
+    const api: ExchangeRequest = async (_method, path) => ({ code: "00000", data:
+      path.endsWith("current-position") ? { list: null, cursor: marker, endId: marker }
+        : path.endsWith("unfilled-orders") ? { list: [] } : [] });
+    await assertSymbolFree("bitget", api, "BTCUSDT");
+    assert.equal(await position("bitget", api, "BTCUSDT"), undefined);
+  }
+});
+
+test("UTA null lists never hide failed responses or additional position pages", t => {
+  t.mock.method(console, "warn", () => {});
+  for (const response of [
+    { code: "40014", data: { list: null } },
+    { data: { list: null } },
+    { code: "00000", data: null },
+    { code: "00000", data: {} },
+    { code: "00000", data: { list: null, cursor: "more" } },
+    { code: "00000", data: { list: null, endId: "more" } },
+    { code: "00000", data: { list: null }, cursor: "more" },
+    { code: "00000", data: { list: null }, endId: "more" },
+  ]) assert.throws(() => bitgetPositions(response), { code: "INVALID_EXCHANGE_RESPONSE" });
 });
 
 test("UTA places a native v3 isolated entry with mark-price market TP/SL", async t => {

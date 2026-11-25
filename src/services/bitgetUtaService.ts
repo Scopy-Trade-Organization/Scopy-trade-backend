@@ -9,10 +9,13 @@ export function bitgetList(value: unknown, name: string): any[] {
   return value;
 }
 
-/** Normalize position envelopes without treating missing data as a flat account. */
+/** Bitget can return list:null for an empty, successful position lookup. */
 export function bitgetPositions(response: any): any[] {
   const data = response?.data;
   const rows = Array.isArray(data) ? data : data?.list;
+  const noMoreData = [data?.cursor, data?.endId, response?.cursor, response?.endId]
+    .every(value => value === undefined || value === null || value === "");
+  if (response?.code === "00000" && rows === null && data?.list === null && noMoreData) return [];
   if (!Array.isArray(rows)) {
     const type = (value: unknown) => value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
     console.warn("[bitgetUta] Invalid position response shape", {
