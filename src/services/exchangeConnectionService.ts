@@ -10,7 +10,7 @@ import {
   BitgetAccountInfo,
 } from "../types/index.js";
 import axiosRetry from "axios-retry";
-import { getExchangeRestUrl, isBitgetDemo, isOkxDemo } from "./exchangeEnvironment.js";
+import { getExchangeMode, getExchangeRestUrl, isBitgetDemo, isOkxDemo } from "./exchangeEnvironment.js";
 
 
 export const http = axios.create({
@@ -24,8 +24,44 @@ axiosRetry(http, {
     (error.config?.method?.toLowerCase() === "get") && (axiosRetry.isNetworkError(error) || (error.response?.status ?? 0) >= 500),
 });
 
-function normalizeError(err: unknown): Error {
+export class CredentialValidationError extends Error {}
+
+export function credentialValidationMessage(err: unknown): string {
+  return err instanceof CredentialValidationError
+    ? err.message
+    : "The exchange rejected the credentials or is temporarily unavailable.";
+}
+
+function bitgetValidationError(rawCode: unknown): CredentialValidationError {
+  const code = typeof rawCode === "string" && /^\d{5}$/.test(rawCode) ? rawCode : undefined;
+  const mode = getExchangeMode();
+  const messages: Record<string, string> = {
+    "40005": "Bitget rejected the request timestamp. Check the backend server clock.",
+    "40008": "Bitget reports an expired timestamp. Synchronize the backend server clock.",
+    "40009": "Bitget rejected the request signature. Check that the API secret belongs to this API key.",
+    "40012": "Bitget rejected the API key or API passphrase.",
+    "40014": "Bitget API permissions are insufficient. Enable futures order and position Read/Write permissions.",
+    "40018": "Bitget rejected the server IP. Add the backend server's outbound IP to the API key whitelist.",
+    "40036": "Bitget rejected the API passphrase. Use the passphrase created with the API key.",
+    "40038": "The backend server's outbound IP is not in the Bitget API key whitelist.",
+    "40040": "Bitget API key permissions are invalid. Check the API key permission settings.",
+  };
+  const keyMessage = `Bitget could not find a valid API key for ${mode === "testnet" ? "demo" : "live"} mode. Use a matching ${mode === "testnet" ? "Demo API Key" : "live API key"} and check EXCHANGE_MODE on the backend.`;
+  const message = code && ["40006", "40037", "40041"].includes(code)
+    ? keyMessage
+    : (code && messages[code]) || "Bitget rejected the connection request. Check the API key mode, permissions and server IP whitelist.";
+  return new CredentialValidationError(`${message}${code ? ` (Bitget code ${code})` : ""}`);
+}
+
+function normalizeError(err: unknown, exchange?: ExchangeId): Error {
   if (axios.isAxiosError(err)) {
+    if (exchange === "bitget") {
+      const rawCode = err.response?.data?.code;
+      // Never log the Axios error, headers, request config or remote message.
+      const code = typeof rawCode === "string" && /^\d{5}$/.test(rawCode) ? rawCode : undefined;
+      console.error("Exchange credential validation failed", { exchange, status: err.response?.status, code, mode: getExchangeMode() });
+      return err.response ? bitgetValidationError(code) : new CredentialValidationError("Bitget could not be reached. Try again shortly.");
+    }
     console.error("Exchange credential validation failed", { status: err.response?.status });
     return new Error("The exchange rejected the credentials or is temporarily unavailable.");
   }
@@ -230,7 +266,7 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
 }) => {
   try {
     if (!passphrase)
-      throw new Error("Bitget requires a passphrase. Please provide it.");
+      throw new CredentialValidationError("Bitget requires a passphrase. Please provide it.");
     const timestamp = Date.now().toString();
     const method = "GET";
     const path = "/api/v2/spot/account/info";
@@ -265,16 +301,29 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
       timeout: 8000,
     });
     if (data.code !== "00000")
-      throw new Error(data.msg || "Invalid Bitget API credentials.");
+      throw bitgetValidationError(data.code);
 
     const info = data.data as any;
     if (!info) throw new Error("Bitget returned an empty response.");
 
     const hasTradePermission = Array.isArray(info.authorities) && info.authorities.includes("coow") && info.authorities.includes("cpow");
-    if (!hasTradePermission) throw new Error("Bitget API key needs futures order and position Read/Write permissions (coow and cpow).");
+    if (!hasTradePermission) throw new CredentialValidationError("Bitget API key needs futures order and position Read/Write permissions (coow and cpow).");
     // Verify access to futures assets as well as key metadata. No balance fallback.
-    const { exchangeApi } = await import("./exchangeApiService.js");
-    await exchangeApi("bitget", { apiKey, apiSecret, passphrase })("GET", "/api/v2/mix/account/accounts", { productType: "USDT-FUTURES" });
+    const futuresPath = "/api/v2/mix/account/accounts?productType=USDT-FUTURES";
+    const futuresTimestamp = String(Date.now());
+    const futuresResponse = await http.request<{ code: string }>({
+      method: "GET",
+      url: getExchangeRestUrl("bitget") + futuresPath,
+      headers: {
+        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
+        "ACCESS-KEY": apiKey,
+        "ACCESS-SIGN": crypto.createHmac("sha256", apiSecret).update(futuresTimestamp + "GET" + futuresPath).digest("base64"),
+        "ACCESS-TIMESTAMP": futuresTimestamp,
+        "ACCESS-PASSPHRASE": passphrase,
+        "Content-Type": "application/json",
+      },
+    });
+    if (futuresResponse.data.code !== "00000") throw bitgetValidationError(futuresResponse.data.code);
 
     return {
       userId: info.userId || "bitget-user",
@@ -285,7 +334,7 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
       trader: info.trader || false,
     };
   } catch (error) {
-    throw normalizeError(error);
+    throw normalizeError(error, "bitget");
   }
 };
 

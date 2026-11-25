@@ -3,6 +3,7 @@ import {
   validateCredentials,
   encryptCredentials,
   decryptCredentials,
+  credentialValidationMessage,
 } from "../services/exchangeConnectionService.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import {
@@ -91,7 +92,7 @@ export const connectExchange = async (req: Request, res: Response) => {
 
       return res.status(422).json({
         success: false,
-        message: "The exchange rejected the credentials or is temporarily unavailable.",
+        message: credentialValidationMessage(validationError),
         hint: "Double-check your API key, secret, and permissions in your exchange settings.",
       });
     }
@@ -257,7 +258,7 @@ export const testConnection = async (req: Request, res: Response) => {
 
       return res.status(422).json({
         success: false,
-        message: "The exchange rejected the credentials or is temporarily unavailable.",
+        message: credentialValidationMessage(validationError),
         hint: "Your API keys may have expired or been revoked. Please reconnect.",
       });
     }
@@ -314,7 +315,7 @@ export const updateConnectionCredentials = async (
     } catch (err) {
       return res.status(422).json({
         success: false,
-        message: "The exchange rejected the credentials or is temporarily unavailable.",
+        message: credentialValidationMessage(err),
       });
     }
 
