@@ -14,6 +14,34 @@ const bitgetUnconfirmedCodes = new Set(["40010", "40725", "45001"]);
 const bitgetCode = (value: unknown): string | undefined =>
   typeof value === "string" && /^\d{5}$/.test(value) ? value : undefined;
 
+export interface ExchangeFailureDetails {
+  endpoint: string;
+  method: "GET" | "POST";
+  exchangeCode: string;
+  parameter?: string;
+}
+export class ExchangeRequestError extends TradeRiskError {
+  constructor(message: string, public details: ExchangeFailureDetails) {
+    super("EXCHANGE_REJECTED", message);
+  }
+}
+const bitgetParameterNames = new Set([
+  "category", "symbol", "orderId", "clientOid", "qty", "price", "side", "posSide", "orderType",
+  "marginMode", "reduceOnly", "type", "tpslMode", "takeProfit", "stopLoss", "tpTriggerBy", "slTriggerBy",
+  "tpOrderType", "slOrderType", "tpLimitPrice", "slLimitPrice", "triggerBy", "triggerPrice",
+  "triggerOrderType", "triggerOrderPrice", "autoCancel", "newClientOid", "timeInForce",
+]);
+function bitgetRejection(code: string, msg: unknown, method: "GET" | "POST", endpoint: string) {
+  // Extract only a recognized parameter from the documented template. Never copy raw exchange text.
+  const match = code === "40019" && typeof msg === "string" && msg.length < 256
+    ? /^Parameter\s+["'`]?([A-Za-z][A-Za-z0-9]*)["'`]?\s+can(?:not| not) be empty[.!]?$/i.exec(msg.trim()) : null;
+  const parameter = match && bitgetParameterNames.has(match[1]) ? match[1] : undefined;
+  return new ExchangeRequestError(`BITGET rejected the request (code ${code}). ${parameter
+    ? `Parameter ${parameter} cannot be empty.`
+    : code === "40019" ? "A required parameter is empty." : "Check account mode, permissions, order prices and available margin."}`,
+  { endpoint, method, exchangeCode: code, ...(parameter ? { parameter } : {}) });
+}
+
 /** Signing is shared transport only; account, margin and order APIs stay exchange-specific. */
 export function exchangeApi(exchange: ExchangeId, credentials: RawCredentials) {
   return async (
@@ -95,8 +123,7 @@ export function exchangeApi(exchange: ExchangeId, credentials: RawCredentials) {
       const code = axios.isAxiosError(error) ? bitgetCode(error.response?.data?.code) : undefined;
       const status = axios.isAxiosError(error) ? error.response?.status : undefined;
       if (exchange === "bitget" && code && status && [400, 401, 403, 429].includes(status) && !bitgetUnconfirmedCodes.has(code)) {
-        throw new TradeRiskError("EXCHANGE_REJECTED",
-          `BITGET rejected the request (code ${code}). Check account mode, permissions, order prices and available margin.`);
+        throw bitgetRejection(code, axios.isAxiosError(error) ? error.response?.data?.msg : undefined, method, path);
       }
       throw new TradeRiskError(
         "EXCHANGE_UNAVAILABLE",
@@ -109,6 +136,9 @@ export function exchangeApi(exchange: ExchangeId, credentials: RawCredentials) {
     if (exchange === "bitget" && bitgetUnconfirmedCodes.has(code)) {
       throw new TradeRiskError("EXCHANGE_UNAVAILABLE",
         `BITGET could not confirm the request (code ${code}). Reconcile the saved client order ID before retrying.`);
+    }
+    if (exchange === "bitget" && bitgetCode(code) && code !== success && !allowedCodes.includes(code)) {
+      throw bitgetRejection(code, data?.msg, method, path);
     }
     if (code !== success && !allowedCodes.includes(code))
       throw new TradeRiskError(

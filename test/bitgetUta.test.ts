@@ -32,6 +32,51 @@ test("UTA HTTP rejections retain safe exchange codes while uncertain submissions
   }
 });
 
+test("UTA missing-parameter errors preserve the parameter and endpoint on both HTTP and API failures", async t => {
+  let httpFailure = false;
+  let msg = "Parameter posSide cannot be empty";
+  t.mock.method(http, "request", async () => {
+    const data = { code: "40019", msg };
+    if (httpFailure) throw { isAxiosError: true, response: { status: 400, data }, config: { headers: credentials } };
+    return { data };
+  });
+  for (httpFailure of [false, true]) {
+    await assert.rejects(exchangeApi("bitget", credentials)("POST", "/api/v3/trade/place-strategy-order", {}), (error: any) => {
+      assert.equal(error.code, "EXCHANGE_REJECTED");
+      assert.match(error.message, /Parameter posSide cannot be empty/);
+      assert.deepEqual(error.details, { endpoint: "/api/v3/trade/place-strategy-order", method: "POST", exchangeCode: "40019", parameter: "posSide" });
+      return true;
+    });
+    for (msg of [credentials.apiSecret, `Parameter ${credentials.apiKey} cannot be empty`, "Parameter posSide cannot be empty\nsecret signed request"]) {
+      await assert.rejects(exchangeApi("bitget", credentials)("POST", "/api/v3/trade/place-strategy-order", {}), (error: any) => {
+        assert.equal(error.details.parameter, undefined);
+        assert.equal(JSON.stringify(error).includes(credentials.apiKey), false);
+        assert.equal(error.message.includes(credentials.apiSecret), false);
+        assert.equal(error.message.includes("signed request"), false);
+        return true;
+      });
+    }
+    msg = "Parameter posSide cannot be empty";
+  }
+});
+
+test("UTA mismatch snapshots expose expected and observed protection fields without unrelated account data", async () => {
+  const reports: any[] = [];
+  const api: ExchangeRequest = async (_method, path) => ({ data: path.endsWith("order-info")
+    ? { ...entry, orderStatus: "filled", cumExecQty: "0.01", apiSecret: credentials.apiSecret }
+    : path.endsWith("current-position") ? { list: [{ symbol: "BTCUSDT", category: "USDT-FUTURES", total: "0.01", posSide: "long", holdMode: "one_way_mode", marginMode: "isolated" }] }
+    : [{ ...entry, status: "pending", side: "sell", posSide: "long", slTriggerBy: "market", apiKey: credentials.apiKey, account: { secret: credentials.apiSecret } }] });
+  assert.equal(await hasProtection("bitget", p, api, (code, details) => reports.push({ code, details })), false);
+  const report = reports[0];
+  assert.equal(report.code, "NATIVE_PROTECTION_MISMATCH");
+  assert.equal(report.details.expected.slTriggerBy, "mark");
+  assert.equal(report.details.strategies[0].slTriggerBy, "market");
+  assert.equal(report.details.stopLossConfirmed, false);
+  assert.equal(report.details.takeProfitConfirmed, true);
+  assert.equal(JSON.stringify(reports).includes(credentials.apiSecret), false);
+  assert.equal(JSON.stringify(reports).includes(credentials.apiKey), false);
+});
+
 test("UTA direct and nested position arrays work for both exposure checks and monitoring", async () => {
   const live = { symbol: "BTCUSDT", category: "USDT-FUTURES", holdMode: "one_way_mode", marginMode: "isolated", posSide: "long", total: "0.01" };
   for (const nested of [false, true]) {

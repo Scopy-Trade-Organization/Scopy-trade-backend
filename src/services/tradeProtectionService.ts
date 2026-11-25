@@ -2,7 +2,7 @@ import { BITGET_CATEGORY, bitgetPositions, bitgetStrategies, bitgetOrderHistory,
 export { bitgetProtectionSide } from "./bitgetUtaService.js";
 import { randomUUID } from "node:crypto";
 import type { ExchangeId, RawCredentials } from "../types/index.js";
-import { exchangeApi, type ExchangeRequest } from "./exchangeApiService.js";
+import { exchangeApi, ExchangeRequestError, type ExchangeFailureDetails, type ExchangeRequest } from "./exchangeApiService.js";
 import { futuresSymbol } from "./futuresExchangeService.js";
 import { D, decimal, TradeRiskError, type RiskSnapshot } from "./tradeRiskService.js";
 import { Trade } from "../models/tradeModel.js";
@@ -19,6 +19,8 @@ export interface ProtectionDiagnostic {
   stage: "verification" | "repair" | "verification_after_repair";
   code: string;
   message?: string;
+  request?: ExchangeFailureDetails;
+  details?: Record<string, unknown>;
 }
 export class ProtectionFailure extends TradeRiskError {
   diagnostics: ProtectionDiagnostic[] = [];
@@ -29,6 +31,15 @@ export class ProtectionFailure extends TradeRiskError {
   }
 }
 const same = (a: any, b: string) => { try { return new D(a).eq(b); } catch { return false; } };
+/** Restrict diagnostic snapshots to protection fields; never retain entire exchange rows. */
+function protectionFields(row: any) {
+  const fields = ["orderId", "symbol", "category", "status", "orderStatus", "side", "posSide", "qty", "total",
+    "tpslMode", "takeProfit", "stopLoss", "tpTriggerBy", "slTriggerBy", "tpOrderType", "slOrderType",
+    "tpLimitPrice", "slLimitPrice", "reduceOnly"];
+  return Object.fromEntries(fields.map(key => [key, row?.[key]]).filter(([, value]) =>
+    typeof value === "boolean" || typeof value === "number" && Number.isFinite(value) ||
+    typeof value === "string" && value.length <= 128));
+}
 export async function readEntry(exchange: ExchangeId, api: ExchangeRequest, symbol: string, id: string, clientId?: string) {
   if (exchange === "bybit") {
     const query = { category: "linear", symbol, ...(id ? { orderId: id } : { orderLinkId: clientId }) };
@@ -94,8 +105,8 @@ export async function readConfirmedExit(exchange: ExchangeId, api: ExchangeReque
 }
 
 
-export async function hasProtection(exchange: ExchangeId, p: ProtectedOrder, api: ExchangeRequest, report?: (code: string) => void) {
-  const fail = (code: string) => { report?.(code); return false; };
+export async function hasProtection(exchange: ExchangeId, p: ProtectedOrder, api: ExchangeRequest, report?: (code: string, details?: Record<string, unknown>) => void) {
+  const fail = (code: string, details?: Record<string, unknown>) => { report?.(code, details); return false; };
   const symbol = futuresSymbol(exchange, p.pair), entry = await readEntry(exchange, api, symbol, p.orderId);
   if (!same(entry.quantity, p.orderQuantity) || (!entry.pending && !entry.filled)) return fail("ENTRY_STATE_OR_QUANTITY_MISMATCH");
   const live = await position(exchange, api, symbol);
@@ -132,12 +143,22 @@ export async function hasProtection(exchange: ExchangeId, p: ProtectedOrder, api
     same(r[field], price) && r[field === "stopLoss" ? "slTriggerBy" : "tpTriggerBy"] === "mark" &&
     r[field === "stopLoss" ? "slOrderType" : "tpOrderType"] === "market";
   const pendingProtected = levelsMatch(entry.row, "stopLoss", p.sl) && levelsMatch(entry.row, "takeProfit", p.tp);
-  if (entry.pending && !pendingProtected) return false;
+  const expected = { ...bitgetProtectionParams(p.tp, p.sl), side: p.direction === "buy" ? "sell" : "buy",
+    posSide: p.direction === "buy" ? "long" : "short", qty: live ? positionQuantity(exchange, live).toFixed() : p.orderQuantity };
+  if (entry.pending && !pendingProtected) return fail("NATIVE_PROTECTION_MISMATCH", {
+    source: "entry", expected, entry: protectionFields(entry.row),
+  });
   if (!live) return pendingProtected;
   const rows = await bitgetStrategies(api, symbol, "tpsl");
   const covers = (r: any) => r.status === "pending" && bitgetProtectionSide(r, p.direction) &&
     decimal(r.qty, "Bitget UTA protection quantity", true).gte(positionQuantity(exchange, live));
-  return rows.some(r => covers(r) && levelsMatch(r, "stopLoss", p.sl)) && rows.some(r => covers(r) && levelsMatch(r, "takeProfit", p.tp));
+  const stopLossConfirmed = rows.some(r => covers(r) && levelsMatch(r, "stopLoss", p.sl));
+  const takeProfitConfirmed = rows.some(r => covers(r) && levelsMatch(r, "takeProfit", p.tp));
+  return stopLossConfirmed && takeProfitConfirmed || fail("NATIVE_PROTECTION_MISMATCH", {
+    source: "position_strategies", expected, entry: protectionFields(entry.row), position: protectionFields(live),
+    stopLossConfirmed, takeProfitConfirmed, strategyCount: rows.length, strategiesTruncated: rows.length > 20,
+    strategies: rows.slice(0, 20).map(protectionFields),
+  });
 }
 
 export async function repairProtection(exchange: ExchangeId, p: ProtectedOrder, api: ExchangeRequest) {
@@ -236,15 +257,16 @@ export async function verifyOrRecoverProtection(exchange: ExchangeId, p: Protect
   const recordError = (stage: ProtectionDiagnostic["stage"], error: unknown) => {
     // Never retain arbitrary transport errors, which may contain signed requests or credentials.
     diagnostics.push(error instanceof TradeRiskError
-      ? { stage, code: error.code, message: error.message }
+      ? { stage, code: error.code, message: error.message, ...(error instanceof ExchangeRequestError ? { request: error.details } : {}) }
       : { stage, code: "PROTECTION_LOOKUP_OR_REQUEST_FAILED" });
   };
   const verify = async (stage: "verification" | "verification_after_repair") => {
     for (let attempt = 0; attempt < 3; attempt++) {
       let reason = "NATIVE_PROTECTION_MISMATCH";
+      let details: Record<string, unknown> | undefined;
       try {
-        if (await hasProtection(exchange, p, api, code => { reason = code; })) return true;
-        diagnostics.push({ stage, code: reason });
+        if (await hasProtection(exchange, p, api, (code, snapshot) => { reason = code; details = snapshot; })) return true;
+        diagnostics.push({ stage, code: reason, ...(details ? { details } : {}) });
       } catch (error) { recordError(stage, error); }
       if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 200));
     }

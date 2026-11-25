@@ -4,7 +4,7 @@ import { hasProtection, verifyOrRecoverProtection, readConfirmedExit, Protection
 import { closeTradeOrder, resolveExchangeOrderId } from "../src/services/tradeService.js";
 import type { ExchangeId } from "../src/types/index.js";
 import type { ExchangeRequest } from "../src/services/exchangeApiService.js";
-import { TradeRiskError } from "../src/services/tradeRiskService.js";
+import { ExchangeRequestError } from "../src/services/exchangeApiService.js";
 
 const order: ProtectedOrder = { credentials: { apiKey: "test", apiSecret: "test", passphrase: "test" }, pair: "BTCUSDT", direction: "buy",
   orderId: "entry", clientOrderId: "sc123", quantity: "1", orderQuantity: "1", entryPrice: "100", sl: "95", tp: "110", marginMode: "isolated" };
@@ -116,13 +116,19 @@ for (const exchange of ["bybit", "okx", "bitget"] as const) {
 test("protection failure retains safe verification and repair diagnostics", async () => {
   const f = fixture("bitget", true);
   const api: ExchangeRequest = async (method, path, values) => {
-    if (path.endsWith("place-strategy-order")) throw new TradeRiskError("EXCHANGE_REJECTED", "BITGET rejected the request (code 43011).");
+    if (path.endsWith("place-strategy-order")) throw new ExchangeRequestError("BITGET rejected the request (code 40019). Parameter posSide cannot be empty.",
+      { endpoint: path, method, exchangeCode: "40019", parameter: "posSide" });
     return f.request(method, path, values);
   };
   await assert.rejects(verifyOrRecoverProtection("bitget", order, api), (error: any) => {
     assert.equal(error.recovery, "closed");
     assert.ok(error.diagnostics.some((d: any) => d.stage === "verification" && d.code === "NATIVE_PROTECTION_MISMATCH"));
-    assert.ok(error.diagnostics.some((d: any) => d.stage === "repair" && d.message.includes("43011")));
+    const repair = error.diagnostics.find((d: any) => d.stage === "repair");
+    assert.match(repair.message, /40019/);
+    assert.equal(repair.request.parameter, "posSide");
+    assert.equal(repair.request.endpoint, "/api/v3/trade/place-strategy-order");
+    assert.equal(error.diagnostics[0].details.expected.stopLoss, "95");
+    assert.deepEqual(error.diagnostics[0].details.strategies, []);
     return true;
   });
 });

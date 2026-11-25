@@ -130,6 +130,16 @@ the exchange order ID. Historical failures cannot acquire these details
 retroactively. Read-back failures after a successful repair receive the same
 three verification attempts as the initial check before recovery runs.
 
+Bitget rejection diagnostics include `request.endpoint`, `request.method` and
+`request.exchangeCode`. For `40019`, recognized parameter names from Bitget's
+"Parameter ... cannot be empty" message are retained in `request.parameter` and
+the safe message. Other raw exchange message text is excluded.
+Native protection mismatches include `details.expected` and selected observed
+entry, position and strategy fields, plus individual TP/SL confirmation results
+for position checks. Strategy snapshots are limited to 20 rows and indicate
+truncation. These details follow the existing persistence, response and logging
+paths; they do not relax verification or change recovery behavior.
+
 ## Official references
 
 - [Classic-to-UTA API migration guide](https://www.bitget.com/legacy-docs/classic/uta-api-upgrade-guide)
