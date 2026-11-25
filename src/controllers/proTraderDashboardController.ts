@@ -207,6 +207,8 @@ export const updateProTrade = async (req: Request, res: Response) => {
       Number(raw?.executedQty ?? 0) > 0 ||
       raw?.result?.list?.[0]?.orderStatus === "PartiallyFilled" ||
       raw?.data?.[0]?.state === "partially_filled" ||
+      raw?.data?.orderStatus === "partially_filled" ||
+      Number(raw?.data?.cumExecQty ?? 0) > 0 ||
       raw?.data?.status === "partial_fill";
     const entryLocked =
       live.status === "filled" || trade.status === "filled" || partiallyFilled;

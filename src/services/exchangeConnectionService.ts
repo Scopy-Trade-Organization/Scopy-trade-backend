@@ -40,11 +40,12 @@ function bitgetValidationError(rawCode: unknown): CredentialValidationError {
     "40008": "Bitget reports an expired timestamp. Synchronize the backend server clock.",
     "40009": "Bitget rejected the request signature. Check that the API secret belongs to this API key.",
     "40012": "Bitget rejected the API key or API passphrase.",
-    "40014": "Bitget API permissions are insufficient. Enable futures order and position Read/Write permissions.",
+    "40014": "Bitget API permissions are insufficient. Enable UTA management and UTA trading Read/Write permissions.",
     "40018": "Bitget rejected the server IP. Add the backend server's outbound IP to the API key whitelist.",
     "40036": "Bitget rejected the API passphrase. Use the passphrase created with the API key.",
     "40038": "The backend server's outbound IP is not in the Bitget API key whitelist.",
     "40040": "Bitget API key permissions are invalid. Check the API key permission settings.",
+    "40085": "Bitget rejected an account API request because the account mode does not match the endpoint. This integration requires Unified Trading Account (UTA) mode.",
   };
   const keyMessage = `Bitget could not find a valid API key for ${mode === "testnet" ? "demo" : "live"} mode. Use a matching ${mode === "testnet" ? "Demo API Key" : "live API key"} and check EXCHANGE_MODE on the backend.`;
   const message = code && ["40006", "40037", "40041"].includes(code)
@@ -267,71 +268,37 @@ const validateBitget: Validator<BitgetAccountInfo> = async ({
   try {
     if (!passphrase)
       throw new CredentialValidationError("Bitget requires a passphrase. Please provide it.");
-    const timestamp = Date.now().toString();
-    const method = "GET";
-    const path = "/api/v2/spot/account/info";
-    const signPayload = timestamp + method + path;
-    const signature = crypto
-      .createHmac("sha256", apiSecret)
-      .update(signPayload)
-      .digest("base64");
-
-    interface BitgetResponse {
-      code: string;
-      msg: string;
-      data: {
-        userId: string;
-        inviterId: string;
-        ips: string;
-        authorities: string[];
-        parentId: string;
-        trader: boolean;
-      };
+    async function read(path: string) {
+      const timestamp = String(Date.now());
+      const { data } = await http.get(getExchangeRestUrl("bitget") + path, {
+        headers: {
+          ...(isBitgetDemo() ? { paptrading: "1" } : {}),
+          "ACCESS-KEY": apiKey,
+          "ACCESS-SIGN": crypto.createHmac("sha256", apiSecret).update(timestamp + "GET" + path).digest("base64"),
+          "ACCESS-TIMESTAMP": timestamp,
+          "ACCESS-PASSPHRASE": passphrase,
+          "Content-Type": "application/json",
+        },
+      });
+      if (data.code !== "00000") throw bitgetValidationError(data.code);
+      return data.data;
     }
-
-    const { data } = await http.get<BitgetResponse>(getExchangeRestUrl("bitget") + path, {
-      headers: {
-        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
-        "ACCESS-KEY": apiKey,
-        "ACCESS-SIGN": signature,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": passphrase,
-        "Content-Type": "application/json",
-      },
-      timeout: 8000,
-    });
-    if (data.code !== "00000")
-      throw bitgetValidationError(data.code);
-
-    const info = data.data as any;
-    if (!info) throw new Error("Bitget returned an empty response.");
-
-    const hasTradePermission = Array.isArray(info.authorities) && info.authorities.includes("coow") && info.authorities.includes("cpow");
-    if (!hasTradePermission) throw new CredentialValidationError("Bitget API key needs futures order and position Read/Write permissions (coow and cpow).");
-    // Verify access to futures assets as well as key metadata. No balance fallback.
-    const futuresPath = "/api/v2/mix/account/accounts?productType=USDT-FUTURES";
-    const futuresTimestamp = String(Date.now());
-    const futuresResponse = await http.request<{ code: string }>({
-      method: "GET",
-      url: getExchangeRestUrl("bitget") + futuresPath,
-      headers: {
-        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
-        "ACCESS-KEY": apiKey,
-        "ACCESS-SIGN": crypto.createHmac("sha256", apiSecret).update(futuresTimestamp + "GET" + futuresPath).digest("base64"),
-        "ACCESS-TIMESTAMP": futuresTimestamp,
-        "ACCESS-PASSPHRASE": passphrase,
-        "Content-Type": "application/json",
-      },
-    });
-    if (futuresResponse.data.code !== "00000") throw bitgetValidationError(futuresResponse.data.code);
-
+    const info = await read("/api/v3/account/info");
+    if (!info?.userId) throw new CredentialValidationError("Bitget returned incomplete UTA account information.");
+    if (!["read_and_write", "read-and-write"].includes(info.permType) ||
+        !Array.isArray(info.permissions) || !["uta_mgt", "uta_trade"].every(p => info.permissions.includes(p))) {
+      throw new CredentialValidationError("Bitget API key requires UTA management and UTA trading Read/Write permissions.");
+    }
+    const settings = await read("/api/v3/account/settings");
+    if (!["unified", "hybrid"].includes(settings?.accountMode)) {
+      throw new CredentialValidationError("Enable Unified Trading Account (UTA) mode in Bitget before connecting this account.");
+    }
+    const assets = await read("/api/v3/account/assets");
+    if (!Array.isArray(assets?.assets)) throw new CredentialValidationError("Bitget did not return valid UTA balances.");
     return {
-      userId: info.userId || "bitget-user",
-      inviterId: info.inviterId || "",
-      ips: info.ips || "",
-      authorities: info.authorities || [],
-      parentId: info.parentId || "",
-      trader: info.trader || false,
+      userId: String(info.userId), inviterId: String(info.inviterId || ""), ips: info.ips || "",
+      authorities: info.permissions, parentId: String(info.parentId || ""), trader: info.traderType === "trader",
+      accountMode: settings.accountMode, accountLevel: settings.accountLevel, apiVersion: "v3",
     };
   } catch (error) {
     throw normalizeError(error, "bitget");

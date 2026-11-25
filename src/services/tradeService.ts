@@ -1,10 +1,11 @@
+import { BITGET_CATEGORY, bitgetList, bitgetProtectionParams } from "./bitgetUtaService.js";
 import {
   verifyOrRecoverProtection,
   readEntry,
   position,
-  bitgetProtectionSide,
+  setBitgetPositionProtection,
 } from "./tradeProtectionService.js";
-import { D, TradeRiskError, type RiskSnapshot } from "./tradeRiskService.js";
+import { D, decimal, TradeRiskError, type RiskSnapshot } from "./tradeRiskService.js";
 import { exchangeApi } from "./exchangeApiService.js";
 import crypto from "crypto";
 import { RawCredentials, ExchangeId } from "../types/index.js";
@@ -200,22 +201,18 @@ async function placeBitgetOrder(
 ): Promise<PlacedOrderResult> {
   const raw = await exchangeApi("bitget", p.credentials)(
     "POST",
-    "/api/v2/mix/order/place-order",
+    "/api/v3/trade/place-order",
     {
       symbol: normalizePairForExchange("bitget", p.pair),
-      productType: "USDT-FUTURES",
-      marginMode: p.marginMode,
-      marginCoin: "USDT",
-      size: p.sizing!.orderQuantity,
+      category: BITGET_CATEGORY,
+      marginMode: "isolated",
+      qty: p.sizing!.orderQuantity,
       price: p.entryPrice,
       side: p.direction,
       orderType: "limit",
-      force: "gtc",
+      timeInForce: "gtc",
       clientOid: p.clientOrderId,
-      presetStopSurplusPrice: p.tp,
-      presetStopLossPrice: p.sl,
-      presetStopSurplusExecutePrice: "0",
-      presetStopLossExecutePrice: "0",
+      ...bitgetProtectionParams(p.tp, p.sl),
     },
   );
   return { orderId: String(raw.data?.orderId || ""), raw };
@@ -260,9 +257,9 @@ async function getBitgetCurrentPrice(
   const normalizedPair = normalizePairForExchange("bitget", pair);
 
   const { data } = await http.get(
-    getExchangeRestUrl("bitget") + "/api/v2/mix/market/ticker",
+    getExchangeRestUrl("bitget") + "/api/v3/market/tickers",
     {
-      params: { symbol: normalizedPair, productType: "USDT-FUTURES" },
+      params: { symbol: normalizedPair, category: BITGET_CATEGORY },
       headers: {
         ...(isBitgetDemo() ? { paptrading: "1" } : {}),
       },
@@ -272,9 +269,9 @@ async function getBitgetCurrentPrice(
   if (data.code !== "00000")
     throw new Error(data.msg || "Bitget ticker failed.");
   const ticker = data.data?.[0];
-  if (!ticker?.lastPr) throw new Error("Bitget returned an invalid ticker.");
+  if (!ticker?.lastPrice) throw new Error("Bitget returned an invalid ticker.");
 
-  return { price: String(ticker.lastPr), raw: data };
+  return { price: String(ticker.lastPrice), raw: data };
 }
 
 // ─── Balance Fetchers ─────────────────────────────────────────────────────────
@@ -412,67 +409,18 @@ async function getOkxBalance(
   };
 }
 
+const decimalBalance = (value: any) => decimal(value, "Bitget UTA balance", true);
+
 async function getBitgetBalance(
   credentials: RawCredentials,
 ): Promise<ExchangeBalance> {
-  const { apiKey, apiSecret, passphrase } = credentials;
-  if (!passphrase) throw new Error("Bitget requires a passphrase.");
-
-  const timestamp = Date.now().toString();
-  const method = "GET";
-  const queryString = "productType=USDT-FUTURES&marginCoin=USDT";
-  const path = "/api/v2/mix/account/accounts";
-  const signPayload = timestamp + method + path + "?" + queryString;
-  const signature = crypto
-    .createHmac("sha256", apiSecret)
-    .update(signPayload)
-    .digest("base64");
-
-  interface BitgetBalanceResponse {
-    code: string;
-    msg: string;
-    data: Array<{
-      marginCoin: string;
-      available: string;
-      locked: string;
-      usdtEquity: string;
-    }>;
-  }
-
-  const { data } = await http.get<BitgetBalanceResponse>(
-    getExchangeRestUrl("bitget") + path,
-    {
-      params: { productType: "USDT-FUTURES", marginCoin: "USDT" },
-      headers: {
-        ...(isBitgetDemo() ? { paptrading: "1" } : {}),
-        "ACCESS-KEY": apiKey,
-        "ACCESS-SIGN": signature,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": passphrase,
-        "Content-Type": "application/json",
-      },
-    },
-  );
-
-  if (data.code !== "00000")
-    throw new Error(data.msg || "Bitget balance fetch failed.");
-
-  const nonZero = (data.data ?? []).filter(
-    (a) => parseFloat(a.available) > 0 || parseFloat(a.locked) > 0,
-  );
-
-  const totalUsdt = nonZero.reduce(
-    (sum, a) => sum + parseFloat(a.usdtEquity || "0"),
-    0,
-  );
-
+  const data = await exchangeApi("bitget", credentials)("GET", "/api/v3/account/assets");
+  const assets = bitgetList(data.data?.assets, "assets");
   return {
-    balances: nonZero.map((a) => ({
-      asset: a.marginCoin,
-      free: a.available,
-      locked: a.locked || "0",
+    balances: assets.filter(a => decimalBalance(a.available).gt(0) || decimalBalance(a.locked).gt(0)).map(a => ({
+      asset: a.coin, free: decimalBalance(a.available).toFixed(), locked: decimalBalance(a.locked).toFixed(),
     })),
-    totalUsdtEquivalent: totalUsdt > 0 ? String(totalUsdt) : null,
+    totalUsdtEquivalent: decimalBalance(data.data?.usdtEquity).toFixed(),
   };
 }
 
@@ -537,15 +485,6 @@ export async function amendTradeOrder(
   exchange: ExchangeId,
   params: AmendTradeParams,
 ): Promise<AmendTradeResult> {
-  if (
-    exchange === "bitget" &&
-    params.status === "pending" &&
-    params.entryChanged
-  )
-    throw new TradeRiskError(
-      "REPRICE_REQUIRES_CANCEL",
-      "Cancel the pending Bitget entry and open a newly sized trade to change its entry price. Bitget replaces repriced orders asynchronously.",
-    );
   const p = await prepareFuturesOrder(exchange, params);
   const api = exchangeApi(exchange, p.credentials),
     symbol = normalizePairForExchange(exchange, p.pair);
@@ -579,13 +518,9 @@ export async function amendTradeOrder(
       );
       result = { entryPrice: p.entryPrice, tp: p.tp, sl: p.sl, raw };
     } else if (exchange === "bitget" && params.status === "pending") {
-      const raw = await api("POST", "/api/v2/mix/order/modify-order", {
-        symbol,
-        productType: "USDT-FUTURES",
-        orderId: params.orderId,
-        newClientOid: `${p.clientOrderId || "scamend"}a`.slice(0, 32),
-        newPresetStopLossPrice: p.sl,
-        newPresetStopSurplusPrice: p.tp,
+      const raw = await api("POST", "/api/v3/trade/modify-order", {
+        symbol, category: BITGET_CATEGORY, orderId: params.orderId,
+        price: p.entryPrice, autoCancel: "no", ...bitgetProtectionParams(p.tp, p.sl),
       });
       result = { entryPrice: p.entryPrice, tp: p.tp, sl: p.sl, raw };
     } else if (exchange === "okx" && params.status === "pending") {
@@ -658,48 +593,12 @@ export async function amendTradeOrder(
       });
       result = { entryPrice: p.entryPrice, tp: p.tp, sl: p.sl, raw };
     } else {
-      const orders = (
-        await api("GET", "/api/v2/mix/order/orders-plan-pending", {
-          symbol,
-          productType: "USDT-FUTURES",
-          planType: "profit_loss",
-        })
-      ).data?.entrustedList;
-      const loss = orders?.filter(
-        (r: any) =>
-          bitgetProtectionSide(r, p.direction) &&
-          ["loss_plan", "pos_loss"].includes(r.planType),
-      );
-      const profit = orders?.filter(
-        (r: any) =>
-          bitgetProtectionSide(r, p.direction) &&
-          ["profit_plan", "pos_profit"].includes(r.planType),
-      );
-      if (loss?.length !== 1 || profit?.length !== 1)
-        throw new TradeRiskError(
-          "PROTECTION_ID_UNAVAILABLE",
-          "Bitget position TP/SL orders could not be identified uniquely. No amendment was submitted.",
-        );
-      const raw: any[] = [];
-      for (const [order, triggerPrice] of [
-        [loss[0], p.sl],
-        [profit[0], p.tp],
-      ] as const)
-        raw.push(
-          await api("POST", "/api/v2/mix/order/modify-tpsl-order", {
-            orderId: order.orderId,
-            symbol,
-            productType: "USDT-FUTURES",
-            marginCoin: "USDT",
-            triggerPrice,
-            triggerType: "mark_price",
-            executePrice: "0",
-            size: ["pos_loss", "pos_profit"].includes(order.planType)
-              ? ""
-              : order.size,
-          }),
-        );
-      result = { entryPrice: p.entryPrice, tp: p.tp, sl: p.sl, raw };
+      const live = await position(exchange, api, symbol);
+      if (!live || live.posSide !== (p.direction === "buy" ? "long" : "short") || new D(live.total).gt(p.sizing!.orderQuantity)) {
+        throw new TradeRiskError("PROTECTION_ID_UNAVAILABLE", "Bitget UTA position changed or is unavailable. No amendment was submitted.");
+      }
+      await setBitgetPositionProtection(api, symbol, { direction: p.direction, tp: p.tp, sl: p.sl, clientOrderId: p.clientOrderId || "scamend" }, new D(live.total).toFixed());
+      result = { entryPrice: p.entryPrice, tp: p.tp, sl: p.sl, raw: { protectionAmended: true } };
     }
   } catch (error) {
     if (
@@ -818,12 +717,12 @@ export async function closeTradeOrder(
         ? "/v5/order/cancel"
         : exchange === "okx"
           ? "/api/v5/trade/cancel-order"
-          : "/api/v2/mix/order/cancel-order",
+          : "/api/v3/trade/cancel-order",
       exchange === "bybit"
         ? { category: "linear", symbol, orderId: params.orderId }
         : exchange === "okx"
           ? { instId: symbol, ordId: params.orderId }
-          : { symbol, productType: "USDT-FUTURES", orderId: params.orderId },
+          : { symbol, category: BITGET_CATEGORY, orderId: params.orderId },
     );
     for (let i = 0; i < 4; i++) {
       entry = await readEntry(exchange, api, symbol, params.orderId);
@@ -867,7 +766,7 @@ export async function closeTradeOrder(
         ? new D(live.pos).gt(0)
           ? "Buy"
           : "Sell"
-        : live.holdSide === "long"
+        : live.posSide === "long"
           ? "Buy"
           : "Sell";
   if (nativeSide.toLowerCase() !== params.direction)
@@ -900,15 +799,14 @@ export async function closeTradeOrder(
             reduceOnly: true,
             clOrdId: clientId,
           })
-        : await api("POST", "/api/v2/mix/order/place-order", {
+        : await api("POST", "/api/v3/trade/place-order", {
             symbol,
-            productType: "USDT-FUTURES",
-            marginMode: live.marginMode,
-            marginCoin: "USDT",
+            category: BITGET_CATEGORY,
+            marginMode: "isolated",
             side,
             orderType: "market",
-            size: nativeQty.toFixed(),
-            reduceOnly: "YES",
+            qty: nativeQty.toFixed(),
+            reduceOnly: "yes",
             clientOid: clientId,
           });
   const id =

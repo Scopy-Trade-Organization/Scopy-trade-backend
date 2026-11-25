@@ -18,9 +18,13 @@ export function getExchangeWebSocketUrl(exchange: ExchangeId): string {
   const endpoints = {
     bybit: ["wss://stream.bybit.com/v5/private", "wss://stream-testnet.bybit.com/v5/private"],
     okx: ["wss://ws.okx.com:8443/ws/v5/private", "wss://wspap.okx.com:8443/ws/v5/private"],
-    bitget: ["wss://ws.bitget.com/v2/ws/private", "wss://wspap.bitget.com/v2/ws/private"],
+    bitget: ["wss://ws.bitget.com/v3/ws/private", "wss://wspap.bitget.com/v3/ws/private"],
   };
-  return url(`${exchange.toUpperCase()}_${isTestnet() ? "TEST_" : ""}WS_URL`, endpoints[exchange][isTestnet() ? 1 : 0]!);
+  const configured = url(`${exchange.toUpperCase()}_${isTestnet() ? "TEST_" : ""}WS_URL`, endpoints[exchange][isTestnet() ? 1 : 0]!);
+  // Existing deployments may still have the official v2 address in their .env.
+  return exchange === "bitget"
+    ? configured.replace(/^(wss:\/\/(?:ws|wspap)\.bitget\.com)\/v2\/ws\/private$/, "$1/v3/ws/private")
+    : configured;
 }
 export function shouldRebaseTestnetSignals() { return isTestnet() && process.env.TESTNET_REBASE_SIGNAL_PRICES?.toLowerCase() !== "false"; }
 export const isBitgetDemo = isTestnet;

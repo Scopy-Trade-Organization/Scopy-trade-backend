@@ -26,13 +26,16 @@ function fixture(exchange: ExchangeId) {
     "/api/v5/public/position-tiers": { data: [{ minSz: "0", maxSz: "10000", maxLever: "100", mmr: "0.005", imr: "0.01" }] },
     "/api/v5/trade/orders-pending": { data: [] }, "/api/v5/trade/orders-algo-pending": { data: [] },
   } : {
-    "/api/v2/mix/market/contracts": { data: [{ symbol: "BTCUSDT", symbolStatus: "normal", symbolType: "perpetual", quoteCoin: "USDT", supportMarginCoins: ["USDT"], sizeMultiplier: "0.001", minTradeNum: "0.001", maxOrderQty: "100", maxMarketOrderQty: "50", minTradeUSDT: "5", priceEndStep: "1", pricePlace: "1", takerFeeRate: "0.0006", minLever: "1", maxLever: "100", openCostUpRatio: "0.1" }] },
-    "/api/v2/mix/market/query-position-lever": { data: [{ startUnit: "0", endUnit: "1000000", leverage: "100", keepMarginRate: "0.005" }] },
-    "/api/v2/mix/order/orders-pending": { data: { entrustedList: [] } },
-    "/api/v2/mix/order/orders-plan-pending": { data: { entrustedList: [] } },
+    "/api/v3/market/instruments": { data: [{ symbol: "BTCUSDT", category: "USDT-FUTURES", status: "online", type: "perpetual", quoteCoin: "USDT", quantityMultiplier: "0.001", minOrderQty: "0.001", maxOrderQty: "100", maxMarketOrderQty: "50", minOrderAmount: "5", priceMultiplier: "0.1", minLeverage: "1", maxLeverage: "100", openCostUpRatio: "0.1" }] },
+    "/api/v3/market/position-tier": { data: [{ minTierValue: "0", maxTierValue: "1000000", leverage: "100", mmr: "0.005" }] },
+    "/api/v3/account/assets": { data: { usdtEquity: "1000", assets: [{ coin: "USDT", equity: "1000", available: "999", locked: "0" }] } },
+    "/api/v3/account/fee-rate": { data: { takerFeeRate: "0.0006" } },
+    "/api/v3/trade/unfilled-orders": { data: { list: [] } },
+    "/api/v3/trade/unfilled-strategy-orders": { data: [] },
   };
   const request: ExchangeRequest = async (method, path, values = {}) => {
     calls.push({ method, path, values });
+    if (path === "/api/v3/account/max-open-available") return { data: { available: "50" } };
     if (method === "POST") {
       if (rejectLeverage) throw new TradeRiskError("LEVERAGE_REJECTED", "Exchange refused leverage.");
       leverage = values.buyLeverage || values.lever || values.leverage;
@@ -41,8 +44,8 @@ function fixture(exchange: ExchangeId) {
     if (path === "/v5/position/list") return { result: { list: [{ positionIdx: 0, size: occupied ? "1" : "0", leverage }] } };
     if (path === "/api/v5/account/positions") return { data: occupied ? [{ pos: "1" }] : [] };
     if (path === "/api/v5/account/leverage-info") return { data: [{ lever: leverage, mgnMode: "isolated" }] };
-    if (path === "/api/v2/mix/position/single-position") return { data: occupied ? [{ total: "1", posMode: "one_way_mode" }] : [] };
-    if (path === "/api/v2/mix/account/account") return { data: { available: "1", crossedMaxAvailable: "50", isolatedMaxAvailable: "50", accountEquity: "1000", posMode: "one_way_mode", assetMode: "single", marginMode: "isolated", crossedMarginLeverage: leverage, isolatedLongLever: leverage, isolatedShortLever: leverage } };
+    if (path === "/api/v3/position/current-position") return { data: { list: occupied ? [{ total: "1", holdMode: "one_way_mode" }] : [] } };
+    if (path === "/api/v3/account/settings") return { data: { accountMode: "unified", accountLevel: "isolated", holdMode: "one_way_mode", deltaSwitch: "no", symbolConfigList: [{ category: "USDT-FUTURES", symbol: "BTCUSDT", marginMode: "isolated", leverage }] } };
     if (!(path in responses)) throw new Error(`Unexpected request: ${path}`);
     return responses[path];
   };
@@ -55,15 +58,15 @@ for (const exchange of ["bybit", "okx", "bitget"] as const) test(`${exchange}: a
   assert.equal(context.accountBalance, "1000");
   const sizing = calculateTradeRisk({ exchange, ...context, entry: "64755.1", sl: "64949.3", tp: "64000", direction: "sell" });
   await configureLeverage(exchange, credentials, context, sizing, f.request);
-  const mutation = f.calls.find(call => call.method === "POST")!;
-  assert.equal(mutation.path, exchange === "bybit" ? "/v5/position/set-leverage" : exchange === "okx" ? "/api/v5/account/set-leverage" : "/api/v2/mix/account/set-leverage");
+  const mutation = f.calls.find(call => call.method === "POST" && call.path.includes("leverage"))!;
+  assert.equal(mutation.path, exchange === "bybit" ? "/v5/position/set-leverage" : exchange === "okx" ? "/api/v5/account/set-leverage" : "/api/v3/account/set-leverage");
   if (exchange === "bybit") assert.equal(mutation.values.buyLeverage, mutation.values.sellLeverage);
   if (exchange === "okx") { assert.equal(mutation.values.mgnMode, "isolated"); assert.equal(mutation.values.instId, "BTC-USDT-SWAP"); }
-  if (exchange === "bitget") assert.equal(mutation.values.productType, "USDT-FUTURES");
+  if (exchange === "bitget") assert.equal(mutation.values.category, "USDT-FUTURES");
   assert.equal(await refreshAvailableFuturesBalance(exchange, credentials, context, f.request), "50");
   f.occupy();
   await assert.rejects(configureLeverage(exchange, credentials, context, sizing, f.request), /already has a position/);
-  assert.equal(f.calls.filter(call => call.method === "POST").length, 1);
+  assert.equal(f.calls.filter(call => call.method === "POST" && !call.path.includes("max-open-available")).length, 1);
 });
 
 test("Bybit isolated balance subtracts position margin, order margin and locked funds", async () => {
@@ -74,64 +77,39 @@ test("Bybit isolated balance subtracts position margin, order margin and locked 
   await assert.rejects(getFuturesContext("bybit", credentials, "BTCUSDT", f.request), /Order margin.*unavailable/);
 });
 
-test("Bitget successful null order lists permit planning and the leverage recheck", async () => {
-  for (const endId of [undefined, null, ""]) {
+test("Bitget UTA rejects malformed or incomplete lists and blocks any symbol exposure", async () => {
+  for (const malformed of [undefined, null, {}, "private-response-value"]) {
     const f = fixture("bitget");
-    for (const path of ["/api/v2/mix/order/orders-pending", "/api/v2/mix/order/orders-plan-pending"]) {
-      f.responses[path] = { code: "00000", data: { entrustedList: null, endId } };
-    }
-    const context = await getFuturesContext("bitget", credentials, "BTCUSDT", f.request);
-    assert.equal(context.availableBalance, "50");
-    const sizing = calculateTradeRisk({ exchange: "bitget", ...context, entry: "64755.1", sl: "64949.3", tp: "64000", direction: "sell" });
-    await configureLeverage("bitget", credentials, context, sizing, f.request);
-    assert.equal(f.calls.filter(call => call.method === "POST").length, 1);
-    f.responses["/api/v2/mix/order/orders-plan-pending"].data.entrustedList = [{ orderId: "existing-stop" }];
-    await assert.rejects(configureLeverage("bitget", credentials, context, sizing, f.request), (error: unknown) =>
-      error instanceof TradeRiskError && error.code === "EXISTING_EXPOSURE");
-    assert.equal(f.calls.filter(call => call.method === "POST").length, 1);
-    f.occupy();
-    await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", f.request), (error: unknown) =>
-      error instanceof TradeRiskError && error.code === "EXISTING_EXPOSURE");
+    f.responses["/api/v3/trade/unfilled-orders"] = { data: { list: malformed } };
+    await assert.rejects(assertSymbolFree("bitget", f.request, "BTCUSDT"), { code: "INVALID_EXCHANGE_RESPONSE" });
+    f.responses["/api/v3/trade/unfilled-orders"] = { data: { list: [], cursor: "more-orders" } };
+    await assert.rejects(assertSymbolFree("bitget", f.request, "BTCUSDT"), { code: "INVALID_EXCHANGE_RESPONSE" });
+  }
+  for (const strategy of [false, true]) {
+    const f = fixture("bitget");
+    const row = { orderId: "existing", symbol: "BTCUSDT", category: "USDT-FUTURES" };
+    if (strategy) f.responses["/api/v3/trade/unfilled-strategy-orders"] = { data: [row] };
+    else f.responses["/api/v3/trade/unfilled-orders"] = { data: { list: [row] } };
+    await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", f.request), { code: "EXISTING_EXPOSURE" });
+    assert.ok(!f.calls.some(c => c.method === "POST"));
   }
 });
 
-test("Bitget malformed order responses remain unverifiable and log only response types", async t => {
-  const warnings: unknown[][] = [];
-  t.mock.method(console, "warn", (...args: unknown[]) => { warnings.push(args); });
-  for (const path of ["/api/v2/mix/order/orders-pending", "/api/v2/mix/order/orders-plan-pending"]) {
-    for (const response of [{}, { data: null }, { data: {} }, { data: [] },
-      { code: "00000", data: { entrustedList: {} } }, { code: "00000", data: { entrustedList: "private-response-value" } },
-      { code: "40001", data: { entrustedList: null } }, { data: { entrustedList: null } },
-      { code: "00000", data: { entrustedList: null, endId: "existing-order" } }]) {
-      const f = fixture("bitget");
-      f.responses[path] = response;
-      await assert.rejects(assertSymbolFree("bitget", f.request, "BTCUSDT"), (error: unknown) =>
-        error instanceof TradeRiskError && error.code === "INVALID_EXCHANGE_RESPONSE");
-      assert.equal(f.calls.filter(call => call.method === "POST").length, 0);
-    }
-  }
-  assert.equal(warnings.length, 18);
-  assert.ok(!JSON.stringify(warnings).includes("private-response-value"));
-});
-
-test("Bitget nonempty entry and protection order lists still block a new trade", async () => {
-  for (const path of ["/api/v2/mix/order/orders-pending", "/api/v2/mix/order/orders-plan-pending"]) {
-    const f = fixture("bitget");
-    f.responses[path] = { code: "00000", data: { entrustedList: [{ orderId: "existing-order" }] } };
-    await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", f.request), (error: unknown) =>
-      error instanceof TradeRiskError && error.code === "EXISTING_EXPOSURE");
-    assert.equal(f.calls.filter(call => call.method === "POST").length, 0);
-  }
+test("Bitget UTA strategy orders on another symbol do not block this symbol", async () => {
+  const f = fixture("bitget");
+  f.responses["/api/v3/trade/unfilled-strategy-orders"] = { data: [{ category: "USDT-FUTURES", symbol: "ETHUSDT", orderId: "other" }] };
+  assert.equal((await getFuturesContext("bitget", credentials, "BTCUSDT", f.request)).availableBalance, "50");
+  assert.ok(f.calls.every(c => !c.path.startsWith("/api/v2/")));
 });
 
 for (const exchange of ["bybit", "okx", "bitget"] as const) test(`${exchange}: exchange API failures cannot yield an assumed-safe context`, async () => {
   const f = fixture(exchange);
   const request: ExchangeRequest = async (method, path, values, allowed) => {
-    if (path.includes("risk-limit") || path.includes("position-tiers") || path.includes("query-position-lever")) throw new Error("Margin tier API unavailable");
+    if (path.includes("risk-limit") || path.includes("position-tiers") || path.includes("/market/position-tier")) throw new Error("Margin tier API unavailable");
     return f.request(method, path, values, allowed);
   };
   await assert.rejects(getFuturesContext(exchange, credentials, "BTCUSDT", request), /Margin tier API unavailable/);
-  assert.equal(f.calls.filter(call => call.method === "POST").length, 0);
+  assert.equal(f.calls.filter(call => call.method === "POST" && !call.path.includes("max-open-available")).length, 0);
 });
 
 test("Bybit and Bitget reject cross margin rather than use isolated formulas", async () => {
@@ -141,7 +119,7 @@ test("Bybit and Bitget reject cross margin rather than use isolated formulas", a
   const bitget = fixture("bitget");
   const request: ExchangeRequest = async (...args) => {
     const result = await bitget.request(...args);
-    if (args[1] === "/api/v2/mix/account/account") result.data.marginMode = "crossed";
+    if (args[1] === "/api/v3/account/settings") result.data.symbolConfigList[0].marginMode = "crossed";
     return result;
   };
   await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", request), /requires isolated/);
@@ -160,32 +138,21 @@ test("unknown portfolio or hedge modes are rejected without silently changing ac
   const f = fixture("okx");
   f.responses["/api/v5/account/config"].data[0].posMode = "long_short_mode";
   await assert.rejects(getFuturesContext("okx", credentials, "BTCUSDT", f.request), /one-way/);
-  assert.equal(f.calls.filter(call => call.method === "POST").length, 0);
+  assert.equal(f.calls.filter(call => call.method === "POST" && !call.path.includes("max-open-available")).length, 0);
   assert.equal(futuresSymbol("okx", "BTC/USDT"), "BTC-USDT-SWAP");
 });
 
-test("Bitget account-mode rejection identifies the setting without logging account contents", async t => {
-  const warnings: unknown[][] = [];
-  t.mock.method(console, "warn", (...args: unknown[]) => { warnings.push(args); });
-  for (const [field, value, message] of [
-    ["posMode", "hedge_mode", /Hedge Mode.*One-way Mode/],
-    ["posMode", undefined, /did not confirm One-way Mode \(posMode\)/],
-    ["assetMode", "multi", /Multi-asset Mode.*Single-asset Mode/],
-    ["assetMode", undefined, /did not confirm Single-asset Mode \(assetMode\)/],
-    ["marginMode", "private-account-value", /supported marginMode/],
-  ] as const) {
+test("Bitget UTA refuses hedge and changing account modes without altering account settings", async () => {
+  for (const [field, value] of [["holdMode", "hedge_mode"], ["accountMode", "upgrading"], ["accountLevel", "delta"], ["holdMode", undefined]]) {
     const f = fixture("bitget");
     const request: ExchangeRequest = async (...args) => {
       const result = await f.request(...args);
-      if (args[1] === "/api/v2/mix/account/account") result.data[field] = value;
+      if (args[1] === "/api/v3/account/settings") result.data[field!] = value;
       return result;
     };
-    await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", request), (error: unknown) =>
-      error instanceof TradeRiskError && error.code === "UNSUPPORTED_ACCOUNT_MODE" && message.test(error.message));
-    assert.equal(f.calls.filter(call => call.method === "POST").length, 0);
+    await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", request), { code: "UNSUPPORTED_ACCOUNT_MODE" });
+    assert.ok(!f.calls.some(c => c.path.includes("set-leverage") || c.path.includes("set-hold-mode")));
   }
-  assert.equal(warnings.length, 5);
-  assert.ok(!JSON.stringify(warnings).includes("private-account-value"));
 });
 
 test("exchange transport signs all three formats and uses demo headers only in testnet", async t => {
@@ -206,20 +173,21 @@ test("exchange transport signs all three formats and uses demo headers only in t
   } finally { if (previous === undefined) delete process.env.EXCHANGE_MODE; else process.env.EXCHANGE_MODE = previous; }
 });
 
-test("connection validation requires derivatives permissions, including Bitget positions", async t => {
+test("connection validation requires derivatives permissions and Bitget UTA management and trading", async t => {
   let bybitPermission = true, okxPermission = true, bitgetPermission = true, futuresRead = 0;
   t.mock.method(http, "get", async (url: string) => ({
     data: url.endsWith("/v5/market/time") ? { retCode: 0, time: Date.now() }
       : url.includes("/v5/user/query-api") ? { retCode: 0, result: { readOnly: 0, permissions: { ContractTrade: bybitPermission ? ["Order", "Position"] : ["Order"] } } }
       : url.includes("/api/v5/account/config") ? { code: "0", data: [{ perm: okxPermission ? "read_only,trade" : "read_only", acctLv: "2", posMode: "net_mode" }] }
-      : { code: "00000", data: { userId: "123", authorities: bitgetPermission ? ["coow", "cpow"] : ["stow", "coow"] } },
+      : url.includes("/api/v3/account/settings") ? { code: "00000", data: { accountMode: "unified" } }
+      : url.includes("/api/v3/account/assets") ? (futuresRead++, { code: "00000", data: { assets: [] } })
+      : { code: "00000", data: { userId: "123", permType: "read_and_write", permissions: bitgetPermission ? ["uta_mgt", "uta_trade"] : ["uta_trade"] } },
   }));
-  t.mock.method(http, "request", async () => { futuresRead++; return { data: { code: "00000", data: [] } }; });
   for (const exchange of ["bybit", "okx", "bitget"] as const) await validateCredentials(exchange, credentials);
   assert.equal(futuresRead, 1);
   bybitPermission = false; okxPermission = false; bitgetPermission = false;
   await assert.rejects(validateCredentials("bybit", credentials), /derivatives trading permission/);
   await assert.rejects(validateCredentials("okx", credentials), /Trade permission/);
-  await assert.rejects(validateCredentials("bitget", credentials), /futures order and position/);
+  await assert.rejects(validateCredentials("bitget", credentials), /UTA management and UTA trading/);
   assert.equal(futuresRead, 1);
 });

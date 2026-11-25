@@ -1,3 +1,4 @@
+import { BITGET_CATEGORY, bitgetList, bitgetStrategies, bitgetSymbolSettings, bitgetAvailableBalance } from "./bitgetUtaService.js";
 import type { ExchangeId, RawCredentials } from "../types/index.js";
 import { exchangeApi, type ExchangeRequest } from "./exchangeApiService.js";
 import {
@@ -37,22 +38,6 @@ const busy = () =>
   );
 const unsupportedCross = () => new TradeRiskError("UNSUPPORTED_MARGIN_MODE",
   "Liquidation safety requires isolated margin. Cross account-wide exposure cannot be verified by this planner; select isolated margin on the exchange.");
-function bitgetModeError(field: "posMode" | "assetMode" | "marginMode", value: unknown) {
-  const known = ["one_way_mode", "hedge_mode", "single", "multi", "crossed", "isolated"].includes(String(value));
-  console.warn("[futuresExchange] Unsupported Bitget account setting", {
-    field, value: known ? value : value == null ? "missing" : "unrecognized",
-  });
-  const message = field === "posMode"
-    ? value === "hedge_mode"
-      ? "Bitget USDT-M Futures is in Hedge Mode. Select One-way Mode in Bitget Futures settings before opening a trade."
-      : "Bitget did not confirm One-way Mode (posMode). Check your USDT-M Futures position mode and account API response."
-    : field === "assetMode"
-      ? value === "multi"
-        ? "Bitget USDT-M Futures is in Multi-asset Mode. Select Single-asset Mode before opening a trade."
-        : "Bitget did not confirm Single-asset Mode (assetMode). Check your USDT-M Futures asset mode and account API response."
-      : "Bitget did not return a supported marginMode. This integration requires isolated USDT-M Futures margin.";
-  return new TradeRiskError("UNSUPPORTED_ACCOUNT_MODE", message);
-}
 function array(value: any, name: string): any[] {
   if (!Array.isArray(value))
     throw new TradeRiskError(
@@ -60,22 +45,6 @@ function array(value: any, name: string): any[] {
       `${name} could not be verified.`,
     );
   return value;
-}
-function bitgetPendingOrders(response: any, name: string): any[] {
-  const list = response?.data?.entrustedList;
-  // Bitget can return null instead of [] when there are no pending orders.
-  // Require a successful response and no pagination cursor before treating it as empty.
-  const endId = response?.data?.endId;
-  if (response?.code === "00000" && list === null && (endId === undefined || endId === null || endId === "")) return [];
-  // Record only response types; account/order contents and credentials stay private.
-  // An unrecognized payload cannot establish that the symbol has no open orders.
-  if (!Array.isArray(list)) {
-    const type = (value: unknown) => value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
-    console.warn("[futuresExchange] Invalid Bitget pending-order response", {
-      check: name, dataType: type(response?.data), listType: type(list),
-    });
-  }
-  return array(list, name);
 }
 function amount(value: any, name: string, zero = false) {
   return decimal(value, name, zero).toFixed();
@@ -127,27 +96,17 @@ export async function assertSymbolFree(
     )
       throw busy();
   } else {
-    const params = { symbol, productType: "USDT-FUTURES" };
+    const params = { symbol, category: BITGET_CATEGORY };
     const [positions, orders, stops] = await Promise.all([
-      api("GET", "/api/v2/mix/position/single-position", {
-        ...params,
-        marginCoin: "USDT",
-      }),
-      api("GET", "/api/v2/mix/order/orders-pending", params),
-      api("GET", "/api/v2/mix/order/orders-plan-pending", {
-        ...params,
-        planType: "profit_loss",
-      }),
+      api("GET", "/api/v3/position/current-position", params),
+      api("GET", "/api/v3/trade/unfilled-orders", params),
+      bitgetStrategies(api, symbol),
     ]);
-    const rows = array(positions.data, "Bitget positions");
-    const unsupportedPosition = rows.find((p) => p.posMode && p.posMode !== "one_way_mode");
-    if (unsupportedPosition) throw bitgetModeError("posMode", unsupportedPosition.posMode);
-    if (
-      rows.some((p) => decimal(p.total, "Position size", true).gt(0)) ||
-      bitgetPendingOrders(orders, "Bitget orders").length ||
-      bitgetPendingOrders(stops, "Bitget stops").length
-    )
-      throw busy();
+    const rows = bitgetList(positions.data?.list, "positions");
+    if (rows.some(p => p.holdMode !== "one_way_mode")) throw rejectMode();
+    const pending = bitgetList(orders.data?.list, "open orders");
+    if (orders.data?.cursor && !pending.length) throw new TradeRiskError("INVALID_EXCHANGE_RESPONSE", "Bitget UTA returned an incomplete open-order page.");
+    if (rows.some(p => decimal(p.total, "Position size", true).gt(0)) || pending.length || stops.length) throw busy();
   }
 }
 
@@ -371,71 +330,44 @@ async function bitgetContext(
   api: ExchangeRequest,
   symbol: string,
 ): Promise<FuturesContext> {
-  const params = { symbol, productType: "USDT-FUTURES" };
-  const [instrument, wallet, limits] = await Promise.all([
-    api("GET", "/api/v2/mix/market/contracts", params),
-    api("GET", "/api/v2/mix/account/account", {
-      ...params,
-      marginCoin: "USDT",
-    }),
-    api("GET", "/api/v2/mix/market/query-position-lever", params),
+  const params = { symbol, category: BITGET_CATEGORY };
+  const [instrument, settings, wallet, limits, fees, available] = await Promise.all([
+    api("GET", "/api/v3/market/instruments", params),
+    api("GET", "/api/v3/account/settings"),
+    api("GET", "/api/v3/account/assets"),
+    api("GET", "/api/v3/market/position-tier", params),
+    api("GET", "/api/v3/account/fee-rate", params),
+    bitgetAvailableBalance(api, symbol),
   ]);
-  const info = instrument.data?.find((r: any) => r.symbol === symbol),
-    account = wallet.data;
-  if (
-    !info ||
-    info.symbolStatus !== "normal" ||
-    info.quoteCoin !== "USDT" ||
-    !info.supportMarginCoins?.includes("USDT") ||
-    info.symbolType !== "perpetual"
-  )
-    throw new TradeRiskError(
-      "UNSUPPORTED_INSTRUMENT",
-      "Bitget requires an active classic-account USDT perpetual futures instrument.",
-    );
-  if (account?.posMode !== "one_way_mode") throw bitgetModeError("posMode", account?.posMode);
-  if (account.assetMode !== "single") throw bitgetModeError("assetMode", account.assetMode);
-  if (!["crossed", "isolated"].includes(account.marginMode)) throw bitgetModeError("marginMode", account.marginMode);
-  if (account.marginMode !== "isolated") throw unsupportedCross();
-  const available =
-    account.marginMode === "crossed"
-      ? account.crossedMaxAvailable
-      : account.isolatedMaxAvailable;
+  const info = bitgetList(instrument.data, "instruments").find(r => r.symbol === symbol && r.category === BITGET_CATEGORY);
+  if (!info || info.status !== "online" || info.quoteCoin !== "USDT" || info.type !== "perpetual") {
+    throw new TradeRiskError("UNSUPPORTED_INSTRUMENT", "Bitget UTA requires an active USDT perpetual futures instrument.");
+  }
+  bitgetSymbolSettings(settings.data, symbol);
+  const coin = bitgetList(wallet.data?.assets, "assets").find(r => r.coin === "USDT");
+  if (!coin) throw new TradeRiskError("BALANCE_UNAVAILABLE", "Bitget UTA did not return a USDT balance.");
   return {
-    availableBalance: amount(available, "Bitget available opening margin"),
-    accountBalance: amount(account.accountEquity, "USDT futures equity", true),
-    takerFeeRate: decimal(info.takerFeeRate, "Bitget taker fee", true)
-      .mul(
-        decimal(info.feeRateUpRatio ?? "0", "Fee rate allowance", true).plus(1),
-      )
-      .toFixed(),
-    marginMode: account.marginMode,
+    availableBalance: amount(available, "Bitget available isolated margin"),
+    accountBalance: amount(coin.equity, "USDT equity", true),
+    takerFeeRate: amount(fees.data?.takerFeeRate, "Bitget UTA account taker fee", true),
+    marginMode: "isolated",
     rules: {
       symbol,
-      quantityStep: amount(info.sizeMultiplier, "Quantity step"),
-      minimumQuantity: amount(info.minTradeNum, "Minimum quantity"),
-      maximumQuantity: D.min(
-        decimal(info.maxOrderQty, "Maximum quantity"),
-        decimal(info.maxMarketOrderQty, "Maximum stop-exit quantity"),
-      ).toFixed(),
-      minimumNotional: amount(info.minTradeUSDT, "Minimum notional", true),
-      priceTickSize: decimal(info.priceEndStep, "Price step")
-        .mul(new D(10).pow(-Number(info.pricePlace)))
-        .toFixed(),
+      quantityStep: amount(info.quantityMultiplier, "Quantity step"),
+      minimumQuantity: amount(info.minOrderQty, "Minimum quantity"),
+      maximumQuantity: D.min(decimal(info.maxOrderQty, "Maximum quantity"), decimal(info.maxMarketOrderQty, "Maximum stop-exit quantity")).toFixed(),
+      minimumNotional: amount(info.minOrderAmount, "Minimum notional", true),
+      priceTickSize: amount(info.priceMultiplier, "Price tick"),
       contractSize: "1",
-      minimumLeverage: amount(info.minLever, "Minimum leverage"),
-      maximumLeverage: amount(info.maxLever, "Maximum leverage"),
+      minimumLeverage: amount(info.minLeverage, "Minimum leverage"),
+      maximumLeverage: amount(info.maxLeverage, "Maximum leverage"),
       leverageStep: "1",
-      openingMarginBufferRate: amount(
-        info.openCostUpRatio ?? "0",
-        "Opening margin allowance",
-        true,
-      ),
-      tiers: array(limits.data, "Bitget margin tiers").map((r) => ({
-        maximumNotional: amount(r.endUnit, "Tier position limit"),
-        minimumNotional: amount(r.startUnit, "Bitget tier start", true),
+      openingMarginBufferRate: amount(info.openCostUpRatio, "Opening margin allowance", true),
+      tiers: bitgetList(limits.data, "margin tiers").map(r => ({
+        maximumNotional: amount(r.maxTierValue, "Tier position limit"),
+        minimumNotional: amount(r.minTierValue, "Tier start", true),
         maximumLeverage: amount(r.leverage, "Tier leverage"),
-        maintenanceRate: amount(r.keepMarginRate, "Maintenance rate", true),
+        maintenanceRate: amount(r.mmr, "Maintenance rate", true),
       })),
     },
   };
@@ -518,31 +450,17 @@ export async function configureLeverage(
         "OKX did not confirm isolated leverage for this swap.",
       );
   } else {
-    await request("POST", "/api/v2/mix/account/set-leverage", {
-      symbol,
-      productType: "USDT-FUTURES",
-      marginCoin: "USDT",
-      leverage,
+    const before = await request("GET", "/api/v3/account/settings");
+    bitgetSymbolSettings(before.data, symbol);
+    await request("POST", "/api/v3/account/set-leverage", {
+      symbol, category: BITGET_CATEGORY, marginMode: "isolated",
+      posSide: new D(sizing.stopLossPrice).lt(sizing.entryPrice) ? "long" : "short", leverage,
     });
-    const result = await request("GET", "/api/v2/mix/account/account", {
-      symbol,
-      productType: "USDT-FUTURES",
-      marginCoin: "USDT",
-    });
-    const p = result.data;
-    if (
-      !p ||
-      p.marginMode !== context.marginMode ||
-      p.posMode !== "one_way_mode" ||
-      (context.marginMode === "crossed"
-        ? !new D(p.crossedMarginLeverage).eq(leverage)
-        : !new D(p.isolatedLongLever).eq(leverage) ||
-          !new D(p.isolatedShortLever).eq(leverage))
-    )
-      throw new TradeRiskError(
-        "LEVERAGE_VERIFICATION_FAILED",
-        "Bitget did not confirm the requested leverage and margin mode.",
-      );
+    const result = await request("GET", "/api/v3/account/settings");
+    const config = bitgetSymbolSettings(result.data, symbol);
+    if (!decimal(config.leverage, "Bitget UTA leverage").eq(leverage)) {
+      throw new TradeRiskError("LEVERAGE_VERIFICATION_FAILED", "Bitget UTA did not confirm the requested isolated leverage.");
+    }
   }
 }
 
@@ -588,17 +506,7 @@ export async function refreshAvailableFuturesBalance(
       "Available futures balance",
     );
   }
-  const result = await request("GET", "/api/v2/mix/account/account", {
-    symbol: context.rules.symbol,
-    productType: "USDT-FUTURES",
-    marginCoin: "USDT",
-  });
-  if (result.data?.posMode !== "one_way_mode") throw bitgetModeError("posMode", result.data?.posMode);
-  if (result.data?.marginMode !== context.marginMode) throw bitgetModeError("marginMode", result.data?.marginMode);
-  return amount(
-    context.marginMode === "crossed"
-      ? result.data?.crossedMaxAvailable
-      : result.data?.isolatedMaxAvailable,
-    "Available futures balance",
-  );
+  const settings = await request("GET", "/api/v3/account/settings");
+  bitgetSymbolSettings(settings.data, context.rules.symbol);
+  return bitgetAvailableBalance(request, context.rules.symbol);
 }

@@ -153,13 +153,13 @@ different for each exchange.
 
 | Item            | Bybit                                            | OKX                                    | Bitget                                         |
 | --------------- | ------------------------------------------------ | -------------------------------------- | ---------------------------------------------- |
-| Product         | Linear USDT perpetual                            | Linear USDT swap                       | Classic v2 USDT futures perpetual              |
+| Product         | Linear USDT perpetual                            | Linear USDT swap                       | UTA v3 USDT perpetual futures              |
 | BTC symbol      | BTCUSDT                                          | BTC-USDT-SWAP                          | BTCUSDT                                        |
 | Order quantity  | Base coin                                        | Number of contracts                    | Base coin                                      |
 | Position mode   | One-way, position index 0                        | Net mode                               | One-way mode                                   |
-| Margin mode     | Existing regular cross or isolated               | Explicit isolated margin for this swap | Existing crossed or isolated mode              |
-| Set leverage    | /v5/position/set-leverage                        | /api/v5/account/set-leverage           | /api/v2/mix/account/set-leverage               |
-| Verify leverage | /v5/position/list                                | /api/v5/account/leverage-info          | /api/v2/mix/account/account                    |
+| Margin mode     | Existing regular cross or isolated               | Explicit isolated margin for this swap | Explicit isolated margin              |
+| Set leverage    | /v5/position/set-leverage                        | /api/v5/account/set-leverage           | /api/v3/account/set-leverage               |
+| Verify leverage | /v5/position/list                                | /api/v5/account/leverage-info          | /api/v3/account/settings                    |
 | Stop recovery   | Amend pending order or set position trading stop | Create position OCO protection         | Modify preset protection or set position TP/SL |
 
 An **OCO** order means “one cancels the other”: when one protective exit
@@ -192,20 +192,20 @@ Attached TP/SL uses market execution after the trigger. In OKX requests,
 
 ### Bitget
 
-Uses the Classic v2 futures API, single-asset USDT and one-way mode. It reads
-`crossedMaxAvailable` or `isolatedMaxAvailable` according to the existing margin
-mode. It includes the public taker rate and the reported fee-rate allowance.
+Uses the Unified Trading Account v3 API for account validation, assets, instruments,
+fees, risk tiers, orders, protection and private WebSockets. Classic v2 accounts
+are no longer supported by the Bitget adapter. See [the UTA migration notes](bitget-uta-migration.md).
 
-It does not silently treat a Unified Trading Account's v3 rules as Classic v2
-rules. An incompatible account or missing Classic API data is rejected.
+Opening margin comes from the isolated `max-open-available` feasibility API,
+which excludes trial funds; dashboard equity comes from `account/assets`.
+The account must be in one-way mode and the symbol must explicitly use isolated
+margin. The planner uses the account taker fee and keeps its conservative
+first-tier-only liquidation validation until higher-tier deductions are verified.
 
-In one-way mode, closing means the opposite buy/sell side with
-`reduceOnly: "YES"`. The old open/close-side assumption was corrected.
-
-Pending Bitget TP/SL can be edited. Changing a pending entry's price requires
-cancelling it and opening a newly sized trade. Bitget repricing asynchronously
-replaces the entry order, so this implementation explicitly rejects an in-place
-reprice instead of risking an untracked replacement.
+Entries attach market TP/SL with mark-price triggers. Pending orders use the v3
+modify API with the original order ID and `autoCancel=no`; filled positions use
+v3 TPSL strategy orders. Both pending presets and live protection are checked
+after partial fills. Reduce-only exits use the opposite side with `reduceOnly=yes`.
 
 ## 6. Copier balances and frontend inputs
 
@@ -326,9 +326,8 @@ Keys remain encrypted using the existing AES-256-GCM encryption.
 - Bybit requires a writable derivatives key. The ContractTrade permission
   format needs both Order and Position permissions.
 - OKX requires Trade permission and a passphrase.
-- Bitget requires futures order and position Read/Write permissions
-  (`coow` and `cpow`), a passphrase, and a successful futures-account lookup.
-  A spot-only key does not pass.
+- Bitget requires UTA management and UTA trading Read/Write permissions
+  (`uta_mgt` and `uta_trade`), a passphrase, UTA account settings and readable UTA assets.
 
 These flows do not require exchange withdrawal permission.
 
@@ -344,7 +343,7 @@ These flows do not require exchange withdrawal permission.
 | -------- | ----------------------------------- | ----------------------------------------- |
 | Bybit    | wss://stream.bybit.com/v5/private   | wss://stream-testnet.bybit.com/v5/private |
 | OKX      | wss://ws.okx.com:8443/ws/v5/private | wss://wspap.okx.com:8443/ws/v5/private    |
-| Bitget   | wss://ws.bitget.com/v2/ws/private   | wss://wspap.bitget.com/v2/ws/private      |
+| Bitget   | wss://ws.bitget.com/v3/ws/private   | wss://wspap.bitget.com/v3/ws/private      |
 
 `EXCHANGE_MODE=testnet` selects Bybit testnet and OKX/Bitget demo trading.
 OKX uses the simulated-trading header; Bitget uses the demo-trading header.

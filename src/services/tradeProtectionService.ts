@@ -1,8 +1,10 @@
+import { BITGET_CATEGORY, bitgetStrategies, bitgetOrderHistory, bitgetProtectionParams, bitgetProtectionSide } from "./bitgetUtaService.js";
+export { bitgetProtectionSide } from "./bitgetUtaService.js";
 import { randomUUID } from "node:crypto";
 import type { ExchangeId, RawCredentials } from "../types/index.js";
 import { exchangeApi, type ExchangeRequest } from "./exchangeApiService.js";
 import { futuresSymbol } from "./futuresExchangeService.js";
-import { D, TradeRiskError, type RiskSnapshot } from "./tradeRiskService.js";
+import { D, decimal, TradeRiskError, type RiskSnapshot } from "./tradeRiskService.js";
 import { Trade } from "../models/tradeModel.js";
 import { ExchangeConnection } from "../models/exchangeConnectionModel.js";
 import { decryptCredentials } from "./exchangeConnectionService.js";
@@ -35,18 +37,27 @@ export async function readEntry(exchange: ExchangeId, api: ExchangeRequest, symb
     if (!row) throw new TradeRiskError("ORDER_REVIEW_REQUIRED", "OKX order details are unavailable.");
     return { row, state: row.state, pending: ["live", "partially_filled"].includes(row.state), filled: new D(row.accFillSz || "0").gt(0), quantity: row.sz, price: row.avgPx };
   }
-  const result = await api("GET", "/api/v2/mix/order/detail", { symbol, productType: "USDT-FUTURES", ...(id ? { orderId: id } : { clientOid: clientId }) });
+  const result = await api("GET", "/api/v3/trade/order-info", { ...(id ? { orderId: id } : { clientOid: clientId }) });
   const row = result.data;
   if (!row) throw new TradeRiskError("ORDER_REVIEW_REQUIRED", "Bitget order details are unavailable.");
-  const state = row.state || row.status;
-  return { row, state, pending: ["live", "new", "partially_filled", "partial_fill"].includes(state), filled: new D(row.baseVolume || row.filledQty || "0").gt(0) || ["filled", "full_fill"].includes(state), quantity: row.size, price: row.priceAvg };
+  const state = row.orderStatus;
+  if (!["live", "new", "partially_filled", "filled", "cancelled"].includes(state)) throw new TradeRiskError("ORDER_REVIEW_REQUIRED", "Bitget UTA returned an unrecognized order state.");
+  if (row.symbol && row.symbol !== symbol) throw new TradeRiskError("ORDER_REVIEW_REQUIRED", "Bitget returned a different symbol for this order.");
+  return { row, state, pending: ["live", "new", "partially_filled"].includes(state), filled: new D(row.cumExecQty || "0").gt(0) || state === "filled", quantity: row.qty, price: row.avgPrice };
 }
 export async function position(exchange: ExchangeId, api: ExchangeRequest, symbol: string) {
   const result = exchange === "bybit" ? await api("GET", "/v5/position/list", { category: "linear", symbol })
     : exchange === "okx" ? await api("GET", "/api/v5/account/positions", { instId: symbol })
-    : await api("GET", "/api/v2/mix/position/single-position", { symbol, productType: "USDT-FUTURES", marginCoin: "USDT" });
-  const rows = exchange === "bybit" ? result.result?.list : result.data;
+    : await api("GET", "/api/v3/position/current-position", { symbol, category: BITGET_CATEGORY });
+  const rows = exchange === "bybit" ? result.result?.list : exchange === "bitget" ? result.data?.list : result.data;
   if (!Array.isArray(rows)) throw new Error("Position could not be verified.");
+  if (exchange === "bitget") {
+    const active = rows.filter((p: any) => decimal(p.total, "Bitget UTA position size", true).gt(0));
+    if (active.length > 1 || active.some((p: any) => p.symbol !== symbol || p.category !== BITGET_CATEGORY ||
+        p.holdMode !== "one_way_mode" || p.marginMode !== "isolated" || !["long", "short"].includes(p.posSide))) {
+      throw new TradeRiskError("POSITION_CHANGED", "Bitget UTA position mode or identity changed. Review the position on Bitget.");
+    }
+  }
   return rows.find((p: any) => new D(exchange === "bybit" ? p.size : exchange === "okx" ? p.pos : p.total).abs().gt(0));
 }
 function positionQuantity(exchange: ExchangeId, row: any) { return new D(exchange === "bybit" ? row.size : exchange === "okx" ? row.pos : row.total).abs(); }
@@ -57,10 +68,10 @@ export async function readConfirmedExit(exchange: ExchangeId, api: ExchangeReque
   if (!opened) return null;
   const result = exchange === "bybit" ? await api("GET", "/v5/order/history", { category: "linear", symbol, limit: 50 })
     : exchange === "okx" ? await api("GET", "/api/v5/trade/orders-history", { instType: "SWAP", instId: symbol, state: "filled", limit: 100 })
-    : await api("GET", "/api/v2/mix/order/orders-history", { symbol, productType: "USDT-FUTURES", startTime: String(opened), endTime: String(Date.now()), limit: 100 });
-  const rows: any[] = exchange === "bybit" ? result.result?.list : exchange === "okx" ? result.data : result.data?.entrustedList;
+    : { data: await bitgetOrderHistory(api, symbol, opened) };
+  const rows: any[] = exchange === "bybit" ? result.result?.list : result.data;
   if (!Array.isArray(rows)) return null;
-  const filledQty = new D(exchange === "bybit" ? entry.row.cumExecQty : exchange === "okx" ? entry.row.accFillSz : entry.row.baseVolume);
+  const filledQty = new D(exchange === "bybit" ? entry.row.cumExecQty : exchange === "okx" ? entry.row.accFillSz : entry.row.cumExecQty);
   let quantity = new D(0), value = new D(0);
   for (const row of rows) {
     const time = Number(row.createdTime ?? row.cTime);
@@ -68,7 +79,7 @@ export async function readConfirmedExit(exchange: ExchangeId, api: ExchangeReque
     const side = String(row.side || "").toLowerCase();
     const filled = ["Filled", "filled", "full_fill"].includes(row.orderStatus ?? row.state ?? row.status);
     if (!reduce || !filled || time < opened || side !== (direction === "buy" ? "sell" : "buy")) continue;
-    const qty = new D(exchange === "bybit" ? row.cumExecQty : exchange === "okx" ? row.accFillSz : row.baseVolume);
+    const qty = new D(exchange === "bybit" ? row.cumExecQty : exchange === "okx" ? row.accFillSz : row.cumExecQty);
     const price = new D(row.avgPrice ?? row.avgPx ?? row.priceAvg);
     if (!qty.gt(0) || !price.gt(0)) continue;
     quantity = quantity.plus(qty); value = value.plus(qty.mul(price));
@@ -76,18 +87,14 @@ export async function readConfirmedExit(exchange: ExchangeId, api: ExchangeReque
   return quantity.gt(0) && quantity.eq(filledQty) ? { exitPrice: value.div(quantity).toFixed(), orderQuantity: quantity.toFixed() } : null;
 }
 
-export function bitgetProtectionSide(row: any, direction: "buy" | "sell") {
-  return [direction === "buy" ? "long" : "short", direction].includes(row.holdSide ?? row.posSide) ||
-    (row.posSide === "net" && String(row.side).toLowerCase() === (direction === "buy" ? "sell" : "buy"));
-}
 
 export async function hasProtection(exchange: ExchangeId, p: ProtectedOrder, api: ExchangeRequest) {
   const symbol = futuresSymbol(exchange, p.pair), entry = await readEntry(exchange, api, symbol, p.orderId);
   if (!same(entry.quantity, p.orderQuantity) || (!entry.pending && !entry.filled)) return false;
   const live = await position(exchange, api, symbol);
-  if (entry.pending && !same(entry.row.price ?? entry.row.px, p.entryPrice)) return false;
+  if (entry.pending && !(exchange === "bitget" && entry.filled) && !same(entry.row.price ?? entry.row.px, p.entryPrice)) return false;
   if (live) {
-    const long = exchange === "bybit" ? live.side === "Buy" : exchange === "okx" ? new D(live.pos).gt(0) : live.holdSide === "long";
+    const long = exchange === "bybit" ? live.side === "Buy" : exchange === "okx" ? new D(live.pos).gt(0) : live.posSide === "long";
     if (long !== (p.direction === "buy")) return false;
     const liquidation = live.liqPrice ?? live.liqPx ?? live.liquidationPrice;
     if (liquidation && new D(liquidation).gt(0) && (p.direction === "buy" ? new D(liquidation).gte(p.sl) : new D(liquidation).lte(p.sl))) return false;
@@ -114,13 +121,16 @@ export async function hasProtection(exchange: ExchangeId, p: ProtectedOrder, api
     }
     return false;
   }
-  if (!live) return same(entry.row.presetStopLossPrice, p.sl) && same(entry.row.presetStopSurplusPrice, p.tp) && new D(entry.row.presetStopLossExecutePrice || "0").eq(0);
-  const orders = await api("GET", "/api/v2/mix/order/orders-plan-pending", { symbol, productType: "USDT-FUTURES", planType: "profit_loss" });
-  const rows = orders.data?.entrustedList;
-  if (!Array.isArray(rows)) return false;
-  const match = (r: any, price: string, types: string[]) => types.includes(r.planType) && same(r.triggerPrice, price) &&
-    bitgetProtectionSide(r, p.direction) && new D(r.executePrice || "0").eq(0) && (["pos_loss", "pos_profit"].includes(r.planType) || new D(r.size || "0").gte(positionQuantity(exchange, live)));
-  return rows.some(r => match(r, p.sl, ["loss_plan", "pos_loss"])) && rows.some(r => match(r, p.tp, ["profit_plan", "pos_profit"]));
+  const levelsMatch = (r: any, field: "stopLoss" | "takeProfit", price: string) =>
+    same(r[field], price) && r[field === "stopLoss" ? "slTriggerBy" : "tpTriggerBy"] === "mark" &&
+    r[field === "stopLoss" ? "slOrderType" : "tpOrderType"] === "market";
+  const pendingProtected = levelsMatch(entry.row, "stopLoss", p.sl) && levelsMatch(entry.row, "takeProfit", p.tp);
+  if (entry.pending && !pendingProtected) return false;
+  if (!live) return pendingProtected;
+  const rows = await bitgetStrategies(api, symbol, "tpsl");
+  const covers = (r: any) => r.status === "pending" && bitgetProtectionSide(r, p.direction) &&
+    decimal(r.qty, "Bitget UTA protection quantity", true).gte(positionQuantity(exchange, live));
+  return rows.some(r => covers(r) && levelsMatch(r, "stopLoss", p.sl)) && rows.some(r => covers(r) && levelsMatch(r, "takeProfit", p.tp));
 }
 
 export async function repairProtection(exchange: ExchangeId, p: ProtectedOrder, api: ExchangeRequest) {
@@ -136,12 +146,51 @@ export async function repairProtection(exchange: ExchangeId, p: ProtectedOrder, 
       ordType: "oco", sz: positionQuantity(exchange, live).toFixed(), reduceOnly: true, algoClOrdId: `${p.clientOrderId}r`.slice(0, 32),
       tpTriggerPx: p.tp, tpOrdPx: "-1", slTriggerPx: p.sl, slOrdPx: "-1", tpTriggerPxType: "mark", slTriggerPxType: "mark" });
   } else if (live) {
-    await api("POST", "/api/v2/mix/order/place-pos-tpsl", { symbol, productType: "USDT-FUTURES", marginCoin: "USDT", holdSide: p.direction,
-      stopLossTriggerPrice: p.sl, stopLossTriggerType: "mark_price", stopLossExecutePrice: "0",
-      stopSurplusTriggerPrice: p.tp, stopSurplusTriggerType: "mark_price", stopSurplusExecutePrice: "0" });
+    const entry = await readEntry(exchange, api, symbol, p.orderId);
+    if (entry.pending) await api("POST", "/api/v3/trade/modify-order", {
+      category: BITGET_CATEGORY, symbol, orderId: p.orderId, qty: entry.quantity, autoCancel: "no",
+      ...bitgetProtectionParams(p.tp, p.sl),
+    });
+    await setBitgetPositionProtection(api, symbol, p, positionQuantity(exchange, live).toFixed());
   } else {
-    await api("POST", "/api/v2/mix/order/modify-order", { symbol, productType: "USDT-FUTURES", orderId: p.orderId, newClientOid: `${p.clientOrderId}r`.slice(0, 32), newPresetStopLossPrice: p.sl, newPresetStopSurplusPrice: p.tp });
+    await api("POST", "/api/v3/trade/modify-order", {
+      category: BITGET_CATEGORY, symbol, orderId: p.orderId, price: p.entryPrice, autoCancel: "no",
+      ...bitgetProtectionParams(p.tp, p.sl),
+    });
   }
+}
+
+export async function setBitgetPositionProtection(api: ExchangeRequest, symbol: string, p: Pick<ProtectedOrder, "direction" | "tp" | "sl" | "clientOrderId">, quantity: string) {
+  const rows = (await bitgetStrategies(api, symbol, "tpsl")).filter(r => bitgetProtectionSide(r, p.direction) && r.status === "pending");
+  if (rows.length) {
+    const loss = rows.filter(r => new D(r.stopLoss || "0").gt(0));
+    const profit = rows.filter(r => new D(r.takeProfit || "0").gt(0));
+    if (loss.length > 1 || profit.length > 1 || rows.some(r => !r.orderId)) {
+      throw new TradeRiskError("PROTECTION_ID_UNAVAILABLE", "Bitget UTA position protection could not be identified uniquely.");
+    }
+    // Amend existing protection before adding any missing leg. Never duplicate a confirmed leg.
+    for (const row of rows) {
+      const params = bitgetProtectionParams(p.tp, p.sl);
+      await api("POST", "/api/v3/trade/modify-strategy-order", { orderId: row.orderId, qty: quantity,
+        ...(new D(row.stopLoss || "0").gt(0) ? { stopLoss: params.stopLoss, slTriggerBy: params.slTriggerBy, slOrderType: params.slOrderType } : {}),
+        ...(new D(row.takeProfit || "0").gt(0) ? { takeProfit: params.takeProfit, tpTriggerBy: params.tpTriggerBy, tpOrderType: params.tpOrderType } : {}),
+      });
+    }
+    if (loss.length && profit.length) return;
+    const missing = bitgetProtectionParams(p.tp, p.sl);
+    await api("POST", "/api/v3/trade/place-strategy-order", {
+      category: BITGET_CATEGORY, symbol, type: "tpsl", tpslMode: "partial", qty: quantity, marginMode: "isolated",
+      side: p.direction === "buy" ? "sell" : "buy", reduceOnly: "yes", clientOid: `${p.clientOrderId}r`.slice(0, 32),
+      ...(!loss.length ? { stopLoss: missing.stopLoss, slTriggerBy: missing.slTriggerBy, slOrderType: missing.slOrderType } : {}),
+      ...(!profit.length ? { takeProfit: missing.takeProfit, tpTriggerBy: missing.tpTriggerBy, tpOrderType: missing.tpOrderType } : {}),
+    });
+    return;
+  }
+  await api("POST", "/api/v3/trade/place-strategy-order", {
+    category: BITGET_CATEGORY, symbol, type: "tpsl", tpslMode: "partial", qty: quantity, marginMode: "isolated",
+    side: p.direction === "buy" ? "sell" : "buy", reduceOnly: "yes", clientOid: `${p.clientOrderId}r`.slice(0, 32),
+    ...bitgetProtectionParams(p.tp, p.sl),
+  });
 }
 
 async function recoverUnprotected(exchange: ExchangeId, p: ProtectedOrder, api: ExchangeRequest): Promise<ProtectionFailure> {
@@ -149,8 +198,8 @@ async function recoverUnprotected(exchange: ExchangeId, p: ProtectedOrder, api: 
   try {
     let entry = await readEntry(exchange, api, symbol, p.orderId);
     if (entry.pending) {
-      const path = exchange === "bybit" ? "/v5/order/cancel" : exchange === "okx" ? "/api/v5/trade/cancel-order" : "/api/v2/mix/order/cancel-order";
-      await api("POST", path, exchange === "bybit" ? { category: "linear", symbol, orderId: p.orderId } : exchange === "okx" ? { instId: symbol, ordId: p.orderId } : { symbol, productType: "USDT-FUTURES", orderId: p.orderId });
+      const path = exchange === "bybit" ? "/v5/order/cancel" : exchange === "okx" ? "/api/v5/trade/cancel-order" : "/api/v3/trade/cancel-order";
+      await api("POST", path, exchange === "bybit" ? { category: "linear", symbol, orderId: p.orderId } : exchange === "okx" ? { instId: symbol, ordId: p.orderId } : { symbol, category: BITGET_CATEGORY, orderId: p.orderId });
       entry = await readEntry(exchange, api, symbol, p.orderId);
       if (entry.pending) return new ProtectionFailure(p.orderId, "review");
     }
@@ -163,7 +212,7 @@ async function recoverUnprotected(exchange: ExchangeId, p: ProtectedOrder, api: 
       ? await api("POST", "/v5/order/create", { category: "linear", symbol, side: side === "buy" ? "Buy" : "Sell", orderType: "Market", qty, positionIdx: 0, reduceOnly: true, orderLinkId: clientId })
       : exchange === "okx"
         ? await api("POST", "/api/v5/trade/order", { instId: symbol, tdMode: p.marginMode, side, posSide: "net", ordType: "market", sz: qty, reduceOnly: true, clOrdId: clientId })
-        : await api("POST", "/api/v2/mix/order/place-order", { symbol, productType: "USDT-FUTURES", marginCoin: "USDT", marginMode: p.marginMode, side, orderType: "market", size: qty, reduceOnly: "YES", clientOid: clientId });
+        : await api("POST", "/api/v3/trade/place-order", { symbol, category: BITGET_CATEGORY, marginMode: "isolated", side, orderType: "market", qty, reduceOnly: "yes", clientOid: clientId });
     const id = exchange === "bybit" ? close.result?.orderId : exchange === "okx" ? close.data?.[0]?.ordId : close.data?.orderId;
     for (let attempt = 0; attempt < 3; attempt++) {
       const exit = await readEntry(exchange, api, symbol, String(id || ""), clientId);
@@ -224,8 +273,8 @@ export function enforceStoredTradeProtection(id: string): Promise<boolean> {
       }
       if (entry.filled && !live) {
         if (entry.pending) {
-          await api("POST", exchange === "bybit" ? "/v5/order/cancel" : exchange === "okx" ? "/api/v5/trade/cancel-order" : "/api/v2/mix/order/cancel-order",
-            exchange === "bybit" ? { category: "linear", symbol, orderId } : exchange === "okx" ? { instId: symbol, ordId: orderId } : { symbol, productType: "USDT-FUTURES", orderId });
+          await api("POST", exchange === "bybit" ? "/v5/order/cancel" : exchange === "okx" ? "/api/v5/trade/cancel-order" : "/api/v3/trade/cancel-order",
+            exchange === "bybit" ? { category: "linear", symbol, orderId } : exchange === "okx" ? { instId: symbol, ordId: orderId } : { symbol, category: BITGET_CATEGORY, orderId });
           if ((await readEntry(exchange, api, symbol, orderId)).pending) throw new Error("Remaining entry cancellation is unconfirmed.");
         }
         const exit = await readConfirmedExit(exchange, api, symbol, entry, trade.direction as "buy" | "sell");

@@ -12,9 +12,9 @@ function fixture(exchange: ExchangeId, filled = false, repairWorks = false) {
   const mutations: Array<{ path: string; values: any }> = [];
   const entry = (): any => exchange === "bybit" ? { orderId: "entry", qty: "1", price: "100", orderStatus: cancelled ? "Cancelled" : filled ? "Filled" : "New", cumExecQty: filled ? "1" : "0", avgPrice: filled ? "100" : "", ...(protectedOrder ? { stopLoss: "95", takeProfit: "110", tpslMode: "Full", slLimitPrice: "", slTriggerBy: "MarkPrice" } : {}) }
     : exchange === "okx" ? { ordId: "entry", sz: "1", px: "100", state: cancelled ? "canceled" : filled ? "filled" : "live", accFillSz: filled ? "1" : "0", avgPx: filled ? "100" : "", attachAlgoOrds: protectedOrder ? [{ slTriggerPx: "95", tpTriggerPx: "110", slOrdPx: "-1" }] : [] }
-    : { orderId: "entry", size: "1", price: "100", state: cancelled ? "cancelled" : filled ? "filled" : "live", baseVolume: filled ? "1" : "0", priceAvg: filled ? "100" : "", ...(protectedOrder ? { presetStopLossPrice: "95", presetStopSurplusPrice: "110" } : {}) };
+    : { orderId: "entry", qty: "1", price: "100", orderStatus: cancelled ? "cancelled" : filled ? "filled" : "live", cumExecQty: filled ? "1" : "0", avgPrice: filled ? "100" : "", ...(protectedOrder ? { stopLoss: "95", takeProfit: "110", slTriggerBy: "mark", tpTriggerBy: "mark", slOrderType: "market", tpOrderType: "market" } : {}) };
   const live = () => !filled || closed ? [] : exchange === "bybit" ? [{ size: "1", side: "Buy", avgPrice: "100", liqPrice: "50", ...(protectedOrder ? { stopLoss: "95", takeProfit: "110" } : {}) }]
-    : exchange === "okx" ? [{ pos: "1", avgPx: "100", liqPx: "50" }] : [{ total: "1", holdSide: "long", openPriceAvg: "100", liquidationPrice: "50" }];
+    : exchange === "okx" ? [{ pos: "1", avgPx: "100", liqPx: "50" }] : [{ total: "1", symbol: "BTCUSDT", category: "USDT-FUTURES", holdMode: "one_way_mode", marginMode: "isolated", posSide: "long", avgPrice: "100", liquidationPrice: "50" }];
   const request: ExchangeRequest = async (method, path, values = {}) => {
     if (method === "POST") {
       mutations.push({ path, values });
@@ -28,11 +28,12 @@ function fixture(exchange: ExchangeId, filled = false, repairWorks = false) {
       return {};
     }
     if (path.includes("position/list")) return { result: { list: live() } };
-    if (path.includes("account/positions") || path.includes("single-position")) return { data: live() };
+    if (path.includes("account/positions")) return { data: live() };
+    if (path.includes("current-position")) return { data: { list: live() } };
     if (path.includes("orders-algo-pending")) return { data: protectedOrder ? [{ slTriggerPx: "95", tpTriggerPx: "110", slOrdPx: "-1", sz: "1", side: "sell" }] : [] };
-    if (path.includes("orders-plan-pending")) return { data: { entrustedList: protectedOrder ? [{ planType: "pos_loss", triggerPrice: "95", posSide: "net", side: "sell", executePrice: "0", size: "" }, { planType: "pos_profit", triggerPrice: "110", posSide: "net", side: "sell", executePrice: "0", size: "" }] : [] } };
+    if (path.includes("unfilled-strategy-orders")) return { data: protectedOrder ? [{ orderId: "protection", category: "USDT-FUTURES", symbol: "BTCUSDT", status: "pending", side: "sell", posSide: "long", qty: "1", stopLoss: "95", takeProfit: "110", slTriggerBy: "mark", tpTriggerBy: "mark", slOrderType: "market", tpOrderType: "market" }] : [] };
     const isExit = values.orderId === "exit" || values.ordId === "exit";
-    const row: any = isExit ? exchange === "bybit" ? { orderId: "exit", qty: "1", orderStatus: "Filled", cumExecQty: "1", avgPrice: "99" } : exchange === "okx" ? { ordId: "exit", sz: "1", state: "filled", accFillSz: "1", avgPx: "99" } : { orderId: "exit", size: "1", state: "filled", baseVolume: "1", priceAvg: "99" } : entry();
+    const row: any = isExit ? exchange === "bybit" ? { orderId: "exit", qty: "1", orderStatus: "Filled", cumExecQty: "1", avgPrice: "99" } : exchange === "okx" ? { ordId: "exit", sz: "1", state: "filled", accFillSz: "1", avgPx: "99" } : { orderId: "exit", qty: "1", orderStatus: "filled", cumExecQty: "1", avgPrice: "99" } : entry();
     return exchange === "bybit" ? { result: { list: [row] } } : exchange === "okx" ? { data: [row] } : { data: row };
   };
   return { request, mutations, protect: () => { protectedOrder = true; } };
@@ -41,7 +42,7 @@ for (const exchange of ["bybit", "okx", "bitget"] as const) {
   test(`${exchange}: recover the exact order by saved client ID using only reads`, async () => {
     const row = exchange === "bybit" ? { orderId: "recovered", orderLinkId: "sc123" }
       : exchange === "okx" ? { ordId: "recovered", clOrdId: "sc123" }
-      : { orderId: "recovered", clientOid: "sc123" };
+      : { orderId: "recovered", clientOid: "sc123", orderStatus: "live", qty: "1", cumExecQty: "0" };
     const api: ExchangeRequest = async (method, _path, values) => {
       assert.equal(method, "GET");
       assert.equal(values?.orderId ?? values?.ordId, undefined);

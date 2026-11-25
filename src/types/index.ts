@@ -76,6 +76,9 @@ export interface OkxAccountInfo {
 }
 
 export interface BitgetAccountInfo {
+  accountMode?: string;
+  accountLevel?: string;
+  apiVersion?: "v3";
   userId: string;
   inviterId: string;
   ips: string;

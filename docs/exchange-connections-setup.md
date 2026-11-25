@@ -5,6 +5,13 @@ Each guide explains the API creation form's fields before the user submits it.
 These connections use system-generated HMAC keys, rather than RSA keys or an
 exchange's registered third-party app binding flow.
 
+## Bitget Unified Trading Account
+
+Bitget connections now use UTA v3. Enable UTA management and UTA trading
+Read-write permissions. Trading requires One-way Mode and isolated margin for
+each USDT futures symbol; Classic Single-asset Mode instructions no longer apply.
+See [the migration and deployment notes](bitget-uta-migration.md).
+
 ## Public server IP endpoint
 
 `GET /api/exchanges/server-ip` requires no login and returns:

@@ -37,6 +37,18 @@ test("the Bitget REST override is normalized and shared by every trading environ
   }
 });
 
+test("Bitget UTA uses v3 WebSockets, including old official endpoint overrides", () => {
+  for (const mode of ["live", "testnet"]) {
+    const host = mode === "live" ? "ws" : "wspap";
+    withEnv({ EXCHANGE_MODE: mode, BITGET_WS_URL: undefined, BITGET_TEST_WS_URL: undefined }, () => {
+      assert.equal(getExchangeWebSocketUrl("bitget"), `wss://${host}.bitget.com/v3/ws/private`);
+    });
+    withEnv({ EXCHANGE_MODE: mode, BITGET_WS_URL: "wss://ws.bitget.com/v2/ws/private", BITGET_TEST_WS_URL: "wss://wspap.bitget.com/v2/ws/private" }, () => {
+      assert.equal(getExchangeWebSocketUrl("bitget"), `wss://${host}.bitget.com/v3/ws/private`);
+    });
+  }
+});
+
 test("exchange defaults use production live accounts and development test accounts consistently", () => {
   for (const environment of ["production", "development"]) {
     withEnv({ EXCHANGE_MODE: undefined, NODE_ENV: environment }, () => {

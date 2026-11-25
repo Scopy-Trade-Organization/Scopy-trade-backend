@@ -21,32 +21,42 @@ test("Bitget HTTP errors preserve a safe actionable reason without logging crede
   assert.ok(!credentialValidationMessage(new Error(credentials.apiSecret)).includes(credentials.apiSecret));
 });
 
-test("Bitget validates metadata and futures access in the configured mode and signs the full query", async (t) => {
+test("Bitget validates UTA permissions, settings and balances with signed demo/live requests", async (t) => {
   const previous = process.env.EXCHANGE_MODE;
   t.after(() => { if (previous === undefined) delete process.env.EXCHANGE_MODE; else process.env.EXCHANGE_MODE = previous; });
-  let rejectFutures = false;
-  t.mock.method(http, "get", async (_url: string, options: any) => {
+  let rejectAssets = false;
+  const paths: string[] = [];
+  t.mock.method(http, "get", async (url: string, options: any) => {
     assert.equal(options.headers.paptrading, process.env.EXCHANGE_MODE === "testnet" ? "1" : undefined);
-    return { data: { code: "00000", data: { userId: "123", authorities: ["coow", "cpow"] } } };
-  });
-  t.mock.method(http, "request", async (options: any) => {
-    assert.equal(options.headers.paptrading, process.env.EXCHANGE_MODE === "testnet" ? "1" : undefined);
-    const target = new URL(options.url).pathname + new URL(options.url).search;
-    assert.equal(target, "/api/v2/mix/account/accounts?productType=USDT-FUTURES");
+    const target = new URL(url).pathname;
+    paths.push(target);
     assert.equal(options.headers["ACCESS-SIGN"], crypto.createHmac("sha256", credentials.apiSecret).update(options.headers["ACCESS-TIMESTAMP"] + "GET" + target).digest("base64"));
-    return { data: { code: rejectFutures ? "40014" : "00000", msg: credentials.apiSecret } };
+    const data = target.endsWith("/info") ? { userId: "123", permType: "read-and-write", permissions: ["uta_mgt", "uta_trade"] }
+      : target.endsWith("/settings") ? { accountMode: "unified", accountLevel: "isolated" } : { assets: [] };
+    return { data: { code: rejectAssets && target.endsWith("/assets") ? "40014" : "00000", data, msg: credentials.apiSecret } };
   });
   for (const mode of ["live", "testnet"]) {
     process.env.EXCHANGE_MODE = mode;
-    assert.equal((await validateCredentials("bitget", credentials) as { userId: string }).userId, "123");
+    const account = await validateCredentials("bitget", credentials) as { userId: string; apiVersion: string };
+    assert.equal(account.userId, "123");
+    assert.equal(account.apiVersion, "v3");
   }
-  rejectFutures = true;
+  assert.deepEqual(paths.slice(0, 3), ["/api/v3/account/info", "/api/v3/account/settings", "/api/v3/account/assets"]);
+  rejectAssets = true;
   await assert.rejects(validateCredentials("bitget", credentials), /permissions.*40014/);
 });
 
 test("Bitget HTTP 200 rejections also return safe error codes", async (t) => {
   t.mock.method(http, "get", async () => ({ data: { code: "40036", msg: credentials.passphrase } }));
   await assert.rejects(validateCredentials("bitget", credentials), /API passphrase.*40036/);
+});
+
+test("Bitget account-mode endpoint errors receive an account compatibility explanation", async (t) => {
+  t.mock.method(console, "error", () => {});
+  t.mock.method(http, "get", async () => {
+    throw { isAxiosError: true, response: { status: 400, data: { code: "40085" } } };
+  });
+  await assert.rejects(validateCredentials("bitget", credentials), /Unified Trading Account.*40085/);
 });
 
 test("connect endpoint returns the Bitget rejection reason in its 422 response", async (t) => {

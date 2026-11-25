@@ -143,7 +143,7 @@ export function validateLiquidationSafety(input: {
     let deduction = new D(0);
     if (input.exchange === "bybit") deduction = decimal(tier.maintenanceDeduction!, "Bybit maintenance deduction", true);
     if (input.exchange === "bitget") {
-      // Classic v2 tiers do not expose MM deductions. Only the verified first
+      // UTA v3 tiers do not expose MM deductions. Only the verified first
       // tier (starting at zero, zero deduction) is supported; never guess higher tiers.
       if (!lower.isZero() || tier.minimumNotional !== "0" || q.mul(e).gt(upper)) break;
     }
@@ -156,7 +156,7 @@ export function validateLiquidationSafety(input: {
     if (tierValue.gte(tierLower) && tierValue.lte(upper)) candidates.push(D.max(0, boundary));
     lower = upper;
   }
-  if (!candidates.length) throw new TradeRiskError("LIQUIDATION_UNVERIFIABLE", `${input.exchange}: no verified maintenance tier covers the estimated liquidation boundary (Bitget Classic supports the first tier only).`);
+  if (!candidates.length) throw new TradeRiskError("LIQUIDATION_UNVERIFIABLE", `${input.exchange}: no verified maintenance tier covers the estimated liquidation boundary (Bitget UTA supports the first tier only).`);
   const boundary = input.direction === "buy" ? D.max(...candidates) : D.min(...candidates);
   const clearance = stop.minus(boundary).mul(sign);
   const required = D.max(e.minus(stop).abs().mul(buffer), decimal(input.rules.priceTickSize, "Liquidation price tick"));

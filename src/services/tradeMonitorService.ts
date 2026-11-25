@@ -1,3 +1,4 @@
+import { BITGET_ORDER_SUBSCRIPTION } from "./bitgetUtaService.js";
 import { enforceStoredTradeProtection } from "./tradeProtectionService.js";
 /**
  * tradeMonitorService.ts
@@ -659,8 +660,6 @@ export class TradeMonitorService extends EventEmitter {
         console.log(
           `[TradeMonitor][Bitget] WS connected for user ${wsConn.userId}`,
         );
-        wsConn.isConnected = true;
-        wsConn.reconnectAttempts = 0;
 
         // Authenticate
         this.authenticateBitget(wsConn);
@@ -692,6 +691,7 @@ export class TradeMonitorService extends EventEmitter {
 
       ws.on("error", (err) => {
         console.error("[TradeMonitor][Bitget] WS error:", err);
+        void this.setConnectionMonitoringState(wsConn, "reconnecting", "Bitget UTA WebSocket connection failed.");
       });
 
       ws.on("close", () => {
@@ -700,6 +700,9 @@ export class TradeMonitorService extends EventEmitter {
         );
         wsConn.isConnected = false;
         wsConn.ws = null;
+        if (!this.isShuttingDown && wsConn.activeTrades.size > 0) {
+          void this.setConnectionMonitoringState(wsConn, "reconnecting", "Bitget UTA WebSocket disconnected.");
+        }
 
         if (wsConn.keepaliveTimer) {
           clearInterval(wsConn.keepaliveTimer);
@@ -751,9 +754,7 @@ export class TradeMonitorService extends EventEmitter {
       op: "subscribe",
       args: [
         {
-          instType: "USDT-FUTURES",
-          channel: "orders",
-          instId: "default",
+          ...BITGET_ORDER_SUBSCRIPTION,
         },
       ],
     };
@@ -772,22 +773,33 @@ export class TradeMonitorService extends EventEmitter {
         console.log("[TradeMonitor][Bitget] Authenticated successfully");
         this.subscribeBitgetOrders(wsConn);
       } else {
-        console.error(
-          "[TradeMonitor][Bitget] Authentication failed:",
-          msg.msg,
-        );
+        wsConn.isConnected = false;
+        await this.setConnectionMonitoringState(wsConn, "reconnecting", "Bitget UTA WebSocket authentication failed.");
+        wsConn.ws?.close();
       }
       return;
     }
 
     // Handle subscription confirmation
     if (msg.event === "subscribe") {
-      console.log("[TradeMonitor][Bitget] Subscription confirmed:", msg.arg);
+      if (msg.arg?.instType === "UTA" && msg.arg?.topic === "order" &&
+          (msg.code === undefined || msg.code === "0" || msg.code === 0)) {
+        wsConn.isConnected = true;
+        wsConn.reconnectAttempts = 0;
+        await this.setConnectionMonitoringState(wsConn, "connected");
+      }
+      return;
+    }
+
+    if (msg.event === "error") {
+      wsConn.isConnected = false;
+      await this.setConnectionMonitoringState(wsConn, "reconnecting", "Bitget UTA WebSocket rejected the subscription.");
+      wsConn.ws?.close();
       return;
     }
 
     // Handle order updates
-    if (msg.action === "snapshot" || msg.action === "update") {
+    if (msg.arg?.topic === "order" && msg.arg?.instType === "UTA") {
       if (!msg.data || !Array.isArray(msg.data)) return;
 
       for (const order of msg.data) {
@@ -796,7 +808,7 @@ export class TradeMonitorService extends EventEmitter {
 
         const monitored = wsConn.activeTrades.get(orderId) ?? [...wsConn.activeTrades.values()].find(trade =>
           trade.pair.replace(/[-/]/g, "").toUpperCase() === String(order.instId || order.symbol || "").replace(/[-/]/g, "").toUpperCase() &&
-          (order.reduceOnly === true || order.reduceOnly === "YES" || order.tradeSide === "close"));
+          (order.reduceOnly === true || ["YES", "yes"].includes(order.reduceOnly) || order.tradeSide === "close"));
         if (!monitored) continue;
 
         await this.reconcileEntryOrder(wsConn, monitored);
