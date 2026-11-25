@@ -1,4 +1,4 @@
-import { BITGET_CATEGORY, bitgetStrategies, bitgetOrderHistory, bitgetProtectionParams, bitgetProtectionSide } from "./bitgetUtaService.js";
+import { BITGET_CATEGORY, bitgetPositions, bitgetStrategies, bitgetOrderHistory, bitgetProtectionParams, bitgetProtectionSide } from "./bitgetUtaService.js";
 export { bitgetProtectionSide } from "./bitgetUtaService.js";
 import { randomUUID } from "node:crypto";
 import type { ExchangeId, RawCredentials } from "../types/index.js";
@@ -49,7 +49,7 @@ export async function position(exchange: ExchangeId, api: ExchangeRequest, symbo
   const result = exchange === "bybit" ? await api("GET", "/v5/position/list", { category: "linear", symbol })
     : exchange === "okx" ? await api("GET", "/api/v5/account/positions", { instId: symbol })
     : await api("GET", "/api/v3/position/current-position", { symbol, category: BITGET_CATEGORY });
-  const rows = exchange === "bybit" ? result.result?.list : exchange === "bitget" ? result.data?.list : result.data;
+  const rows = exchange === "bybit" ? result.result?.list : exchange === "bitget" ? bitgetPositions(result) : result.data;
   if (!Array.isArray(rows)) throw new Error("Position could not be verified.");
   if (exchange === "bitget") {
     const active = rows.filter((p: any) => decimal(p.total, "Bitget UTA position size", true).gt(0));

@@ -1,4 +1,4 @@
-import { BITGET_CATEGORY, bitgetList, bitgetStrategies, bitgetSymbolSettings, bitgetAvailableBalance } from "./bitgetUtaService.js";
+import { BITGET_CATEGORY, bitgetList, bitgetPositions, bitgetStrategies, bitgetSymbolSettings, bitgetAvailableBalance } from "./bitgetUtaService.js";
 import type { ExchangeId, RawCredentials } from "../types/index.js";
 import { exchangeApi, type ExchangeRequest } from "./exchangeApiService.js";
 import {
@@ -102,7 +102,7 @@ export async function assertSymbolFree(
       api("GET", "/api/v3/trade/unfilled-orders", params),
       bitgetStrategies(api, symbol),
     ]);
-    const rows = bitgetList(positions.data?.list, "positions");
+    const rows = bitgetPositions(positions);
     if (rows.some(p => p.holdMode !== "one_way_mode")) throw rejectMode();
     const pending = bitgetList(orders.data?.list, "open orders");
     if (orders.data?.cursor && !pending.length) throw new TradeRiskError("INVALID_EXCHANGE_RESPONSE", "Bitget UTA returned an incomplete open-order page.");

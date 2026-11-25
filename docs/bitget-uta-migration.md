@@ -36,8 +36,10 @@ accounts. Bybit and OKX keep their existing adapters.
 
 The product category is `USDT-FUTURES`; order quantity is base coin in `qty`.
 Entry protection uses `takeProfit` and `stopLoss`, mark-price triggers and market
-execution. Exits use the opposite side with `reduceOnly=yes`. Open-order and
-position lists use `data.list`, while strategy orders use a `data` array.
+execution. Exits use the opposite side with `reduceOnly=yes`. Open orders use
+`data.list`; the shared position parser accepts a `data` array or `data.list`.
+Strategy orders use a `data` array. Missing or null position data remains an
+error, with data/list types logged for diagnosis without account contents.
 History reconciliation follows `cursor` pagination and requires confirmed
 cumulative fills before recording an exit price. Unknown order states,
 unverifiable responses and changed position identity require review.

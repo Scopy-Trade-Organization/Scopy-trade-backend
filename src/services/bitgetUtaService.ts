@@ -9,6 +9,21 @@ export function bitgetList(value: unknown, name: string): any[] {
   return value;
 }
 
+/** Normalize position envelopes without treating missing data as a flat account. */
+export function bitgetPositions(response: any): any[] {
+  const data = response?.data;
+  const rows = Array.isArray(data) ? data : data?.list;
+  if (!Array.isArray(rows)) {
+    const type = (value: unknown) => value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+    console.warn("[bitgetUta] Invalid position response shape", {
+      endpoint: "/api/v3/position/current-position",
+      dataType: type(data), listType: type(data?.list),
+    });
+    throw new TradeRiskError("INVALID_EXCHANGE_RESPONSE", "Bitget UTA positions could not be verified.");
+  }
+  return rows;
+}
+
 /** UTA strategy reads cover the whole category; callers must filter by symbol. */
 export async function bitgetStrategies(api: ExchangeRequest, symbol: string, type?: string) {
   const result = await api("GET", "/api/v3/trade/unfilled-strategy-orders", {
