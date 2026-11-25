@@ -202,6 +202,13 @@ The account must be in one-way mode and the symbol must explicitly use isolated
 margin. The planner uses the account taker fee and keeps its conservative
 first-tier-only liquidation validation until higher-tier deductions are verified.
 
+Connection creation, credential updates and connection tests automatically prepare
+isolated settings for the ten supported pairs. Setup preserves existing isolated
+leverage, checks for positions and orders before each change, and verifies the
+result by reading account settings. Execution prepares the selected pair under
+the connection execution lock before planning; read-only previews never run setup.
+Account-wide One-way Mode and Delta-Neutral settings remain user-controlled.
+
 Entries attach market TP/SL with mark-price triggers. Pending orders use the v3
 modify API with the original order ID and `autoCancel=no`; filled positions use
 v3 TPSL strategy orders. Both pending presets and live protection are checked

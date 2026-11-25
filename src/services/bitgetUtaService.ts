@@ -55,15 +55,19 @@ export async function bitgetOrderHistory(api: ExchangeRequest, symbol: string, o
   throw new TradeRiskError("ORDER_REVIEW_REQUIRED", "Bitget UTA order history is incomplete. The actual exit requires review.");
 }
 
-export function bitgetSymbolSettings(data: any, symbol: string) {
+export function assertBitgetAccountSettings(data: any) {
   if (!data || !["unified", "hybrid"].includes(data.accountMode) ||
       !["isolated", "basic", "advanced"].includes(data.accountLevel) || data.holdMode !== "one_way_mode" || data.deltaSwitch !== "no") {
     throw new TradeRiskError("UNSUPPORTED_ACCOUNT_MODE", "Bitget UTA requires a supported unified account in One-way Mode with delta-neutral mode disabled.");
   }
+}
+
+export function bitgetSymbolSettings(data: any, symbol: string) {
+  assertBitgetAccountSettings(data);
   const config = bitgetList(data.symbolConfigList, "symbol settings")
-    .find(r => r.symbol === symbol && r.category === BITGET_CATEGORY);
+    .find(r => r.symbol === symbol && r.category === BITGET_CATEGORY && r.marginMode === "isolated");
   if (!config || config.marginMode !== "isolated") {
-    throw new TradeRiskError("UNSUPPORTED_MARGIN_MODE", "Bitget UTA liquidation safety requires isolated margin for this symbol. Select isolated margin in Bitget before opening a trade.");
+    throw new TradeRiskError("UNSUPPORTED_MARGIN_MODE", "Bitget UTA isolated margin could not be confirmed for this symbol. Test the connection to retry automatic setup.");
   }
   return config;
 }

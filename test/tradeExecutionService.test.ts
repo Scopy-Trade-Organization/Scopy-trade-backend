@@ -12,6 +12,8 @@ import { D, TradeRiskError, type InstrumentRules } from "../src/services/tradeRi
 import { ProtectionFailure, enforceStoredTradeProtection } from "../src/services/tradeProtectionService.js";
 import { previewTradeWithDependencies } from "../src/controllers/tradeController.js";
 import { closeProTrade } from "../src/controllers/proTraderDashboardController.js";
+import { testConnection } from "../src/controllers/exchangeController.js";
+import { setupBitgetConnection } from "../src/services/bitgetSetupService.js";
 
 const rules: InstrumentRules = { symbol: "BTCUSDT", quantityStep: "0.0001", minimumQuantity: "0.0001", maximumQuantity: "100",
   minimumNotional: "5", priceTickSize: "0.1", contractSize: "1", minimumLeverage: "1", maximumLeverage: "100", leverageStep: "1",
@@ -60,7 +62,9 @@ test("LINKUSDT pro payload opens a protected Bitget UTA trade through the real e
     const encrypted = encryptCredentials("bitget", { apiKey: "test-key", apiSecret: "test-secret", passphrase: "test-passphrase" });
     const connection = await ExchangeConnection.create({ userId, exchange: "bitget", encryptedApiKey: encrypted.apiKey, encryptedApiSecret: encrypted.apiSecret, encryptedPassphrase: encrypted.passphrase });
     const payload = { pair: "LINKUSDT", entry: 8.618, tp: 8.561, sl: 8.65, direction: "sell", notes: "", balance: 51.24649142, exchangeConnectionId: String(connection._id) };
-    let leverage = "1";
+    let leverage = filled ? "1" : "20";
+    let isolated = filled;
+    const setupSides: string[] = [];
     let submitted: any;
     let submissions = 0;
     let protectionReads = 0;
@@ -88,7 +92,7 @@ test("LINKUSDT pro payload opens a protected Bitget UTA trade through the real e
           data = [{ symbol: "LINKUSDT", category: "USDT-FUTURES", quoteCoin: "USDT", status: "online", type: "perpetual", quantityMultiplier: "1", minOrderQty: "1", maxOrderQty: "49000", maxMarketOrderQty: "6500", priceMultiplier: "0.001", minOrderAmount: "5", minLeverage: "1", maxLeverage: "75", openCostUpRatio: "0.01" }];
           break;
         case "/api/v3/account/settings":
-          data = { accountMode: "unified", accountLevel: "isolated", holdMode: "one_way_mode", deltaSwitch: "no", symbolConfigList: [{ category: "USDT-FUTURES", symbol: "LINKUSDT", marginMode: "isolated", leverage }] };
+          data = { accountMode: "unified", accountLevel: "basic", holdMode: "one_way_mode", deltaSwitch: "no", symbolConfigList: [{ category: "USDT-FUTURES", symbol: "LINKUSDT", marginMode: isolated ? "isolated" : "crossed", leverage }] };
           break;
         case "/api/v3/account/assets":
           data = { usdtEquity: "51.24649142", assets: [{ coin: "USDT", equity: "51.24649142", available: "51.24649142", locked: "0" }] };
@@ -98,7 +102,9 @@ test("LINKUSDT pro payload opens a protected Bitget UTA trade through the real e
         case "/api/v3/account/max-open-available":
           assert.equal(body.marginMode, "isolated"); data = { available: "51.24649142" }; break;
         case "/api/v3/account/set-leverage":
-          assert.equal(body.posSide, "short"); assert.equal(body.marginMode, "isolated"); leverage = body.leverage; data = "success"; break;
+          if (body.leverage === "1") setupSides.push(body.posSide);
+          else assert.equal(body.posSide, "short");
+          assert.equal(body.marginMode, "isolated"); isolated = true; leverage = body.leverage; data = "success"; break;
         case "/api/v3/trade/place-order":
           assert.equal(options["axios-retry"].retries, 0);
           assert.equal(leverage, "5");
@@ -118,6 +124,8 @@ test("LINKUSDT pro payload opens a protected Bitget UTA trade through the real e
     try {
       const outcome = await executeTrade(userId, payload, true, { startMonitoring: async id => {
         assert.ok(protectionReads > 0);
+        const setup = await setupBitgetConnection(String(connection._id), { apiKey: "test-key", apiSecret: "test-secret", passphrase: "test-passphrase" });
+        assert.ok(setup.pairs.every(pair => pair.status === "blocked"));
         assert.equal(await enforceStoredTradeProtection(id), true);
       } });
       assert.equal(outcome.status, 201, JSON.stringify(outcome.body));
@@ -127,6 +135,7 @@ test("LINKUSDT pro payload opens a protected Bitget UTA trade through the real e
       assert.equal(outcome.body.trade.protectionStatus, "confirmed");
       assert.equal(outcome.body.trade.quantity, "24");
       assert.equal(outcome.body.trade.leverage, 5);
+      assert.deepEqual(setupSides, filled ? [] : ["long", "short"]);
       assert.equal(outcome.body.trade.sizing.riskAmount, "1.0249298284");
       assert.ok(new D(outcome.body.trade.sizing.estimatedRiskAmount).lte("1.0249298284"));
       assert.ok(calls.indexOf("/api/v3/account/set-leverage") < calls.indexOf("/api/v3/trade/place-order"));
@@ -137,6 +146,46 @@ test("LINKUSDT pro payload opens a protected Bitget UTA trade through the real e
       getMock.mock.restore(); requestMock.mock.restore();
     }
   }
+});
+
+test("testing an existing Bitget connection prepares every supported pair and saves readiness", async t => {
+  const userId = new mongoose.Types.ObjectId();
+  const encrypted = encryptCredentials("bitget", { apiKey: "test-key", apiSecret: "test-secret", passphrase: "test-passphrase" });
+  const connection = await ExchangeConnection.create({ userId, exchange: "bitget", encryptedApiKey: encrypted.apiKey, encryptedApiSecret: encrypted.apiSecret, encryptedPassphrase: encrypted.passphrase });
+  const configured = new Set<string>();
+  let writes = 0;
+  const settings = () => ({ accountMode: "unified", accountLevel: "basic", holdMode: "one_way_mode", deltaSwitch: "no", symbolConfigList: [...configured].map(symbol => ({ category: "USDT-FUTURES", symbol, marginMode: "isolated", leverage: "1" })) });
+  t.mock.method(http, "get", async (url: string) => ({ data: { code: "00000", data:
+    url.endsWith("/info") ? { userId: "123", permType: "read_and_write", permissions: ["uta_mgt", "uta_trade"] }
+      : url.endsWith("/settings") ? settings() : { assets: [] } } }));
+  t.mock.method(http, "request", async (options: any) => {
+    const url = new URL(options.url), path = url.pathname;
+    const body = options.data ? JSON.parse(options.data) : {};
+    if (options.method === "POST") {
+      assert.equal(path, "/api/v3/account/set-leverage");
+      assert.ok((await ExchangeConnection.findById(connection._id))?.executionLockToken);
+      configured.add(body.symbol); writes++;
+      return { data: { code: "00000", data: "success" } };
+    }
+    const data = path.endsWith("/settings") ? settings()
+      : path.endsWith("/instruments") ? [{ category: "USDT-FUTURES", symbol: url.searchParams.get("symbol"), status: "online", type: "perpetual", quoteCoin: "USDT", minLeverage: "1" }]
+        : path.endsWith("/current-position") ? { list: null } : path.endsWith("/unfilled-orders") ? { list: [] } : [];
+    return { data: { code: "00000", data } };
+  });
+  let status = 0, body: any;
+  const response = { status(value: number) { status = value; return this; }, json(value: any) { body = value; return this; } };
+  await testConnection({ user: userId, params: { connectionId: String(connection._id) } } as any, response as any);
+  assert.equal(status, 200, JSON.stringify(body));
+  assert.equal(writes, 20);
+  assert.equal(body.accountInfo.isolatedMarginSetup.pairs.length, 10);
+  assert.ok(body.accountInfo.isolatedMarginSetup.pairs.every((pair: any) => pair.status === "configured"));
+  const stored = await ExchangeConnection.findById(connection._id);
+  assert.equal(stored?.executionLockToken, null);
+  assert.equal((stored?.accountInfo as any).isolatedMarginSetup.pairs.length, 10);
+  await testConnection({ user: userId, params: { connectionId: String(connection._id) } } as any, response as any);
+  assert.equal(status, 200);
+  assert.equal(writes, 20);
+  assert.ok(body.accountInfo.isolatedMarginSetup.pairs.every((pair: any) => pair.status === "ready"));
 });
 test("frontend balance is ignored, leverage precedes submission, protection precedes success, snapshot persists", async () => {
   for (const balance of [undefined, -1, "tampered", 1_000_000_000]) {

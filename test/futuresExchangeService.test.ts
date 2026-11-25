@@ -122,7 +122,7 @@ test("Bybit and Bitget reject cross margin rather than use isolated formulas", a
     if (args[1] === "/api/v3/account/settings") result.data.symbolConfigList[0].marginMode = "crossed";
     return result;
   };
-  await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", request), /requires isolated/);
+  await assert.rejects(getFuturesContext("bitget", credentials, "BTCUSDT", request), { code: "UNSUPPORTED_MARGIN_MODE" });
 });
 
 test("incomplete Bybit and OKX tier responses cannot establish liquidation safety", async () => {

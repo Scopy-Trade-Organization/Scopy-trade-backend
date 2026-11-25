@@ -75,7 +75,13 @@ export interface OkxAccountInfo {
   uid: string;
 }
 
+export interface BitgetMarginSetup {
+  checkedAt: string;
+  pairs: Array<{ symbol: string; status: "ready" | "configured" | "blocked" | "failed"; message?: string }>;
+}
+
 export interface BitgetAccountInfo {
+  isolatedMarginSetup?: BitgetMarginSetup;
   accountMode?: string;
   accountLevel?: string;
   apiVersion?: "v3";

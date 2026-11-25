@@ -16,6 +16,28 @@ accounts. Bybit and OKX keep their existing adapters.
   Basic, advanced and isolated UTA account levels are recognized. Cross-margin
   positions and hedge mode remain outside the risk planner's supported scope.
 
+## Automatic isolated-margin setup
+
+Connecting, updating credentials, or testing a Bitget connection prepares the
+same ten pairs offered by the frontend: BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT,
+DOGEUSDT, BNBUSDT, LINKUSDT, SUIUSDT, AVAXUSDT and ADAUSDT. Existing connections
+can run setup using the refresh button in Exchange Settings. The connection
+card shows readiness and any blocked or failed pairs.
+
+Existing isolated settings and leverage are preserved. For a missing isolated
+configuration, setup checks positions, ordinary orders and strategy orders before
+each write, configures both sides through `account/set-leverage` at the instrument's
+minimum leverage, then verifies isolated settings by reading `account/settings`.
+An exchange acknowledgement alone does not mark a pair ready. Pairs with exposure
+are left unchanged; a blocked pair does not stop setup of other pairs.
+
+Setup and trade execution share the connection execution lock. Execution also
+prepares the selected pair before risk planning, covering connections created
+before this feature. The trade planner subsequently selects and verifies leverage
+for the actual trade. Read-only previews do not change account settings.
+One-way Mode and Delta-Neutral remain settings the account owner must configure;
+automatic setup never changes them or closes positions/orders.
+
 ## API coverage
 
 | Flow | v3 API |
@@ -61,7 +83,7 @@ the periodic REST reconciliation also remains active.
 
 1. Deploy backend and frontend changes together. Existing encrypted credentials
    do not need a database migration. Re-test each Bitget connection to refresh
-   its account snapshot and verify UTA permissions.
+   its account snapshot, verify UTA permissions and prepare supported pairs.
 2. Keep `EXCHANGE_MODE=live` for live keys or `testnet` for Bitget Demo API Keys.
    Demo requests retain `paptrading: 1`; there is no fallback between modes.
 3. Update `BITGET_WS_URL` and `BITGET_TEST_WS_URL` to the v3 endpoints above if

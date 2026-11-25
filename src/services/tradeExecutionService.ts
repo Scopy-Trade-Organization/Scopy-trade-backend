@@ -1,4 +1,5 @@
 import { planTrade } from "./tradePlanningService.js";
+import { prepareBitgetPair } from "./bitgetSetupService.js";
 import { TradeRiskError, D } from "./tradeRiskService.js";
 import { getFuturesContext, configureLeverage, refreshAvailableFuturesBalance } from "./futuresExchangeService.js";
 import { verifyOrRecoverProtection, ProtectionFailure } from "./tradeProtectionService.js";
@@ -244,6 +245,7 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
     const rawCreds = decryptCredentials(storedCreds);
 
     const exchange = connection.exchange as ExchangeId;
+    if (exchange === "bitget") await prepareBitgetPair(rawCreds, normalizedPair);
     const { sizing, context, signalPricesRebased: rebaseForTestnet } = await planTrade(exchange, rawCreds, signal, dependencies);
     await (dependencies.configureLeverage ?? configureLeverage)(exchange, rawCreds, context, sizing);
     const availableAtSubmission = await (dependencies.refreshAvailableFuturesBalance ?? refreshAvailableFuturesBalance)(exchange, rawCreds, context);

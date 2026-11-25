@@ -15,6 +15,7 @@ import {
   EncryptedCredentials,
 } from "../types/index.js";
 import AuditLog from "../models/auditLogModel.js";
+import { setupBitgetConnection } from "../services/bitgetSetupService.js";
 
 export const getSupportedExchanges = async (req: Request, res: Response) => {
   try {
@@ -115,6 +116,14 @@ export const connectExchange = async (req: Request, res: Response) => {
       isActive: true,
       connectedAt: new Date(),
     });
+
+    if (exchange === "bitget") {
+      accountInfo = { ...accountInfo, isolatedMarginSetup: await setupBitgetConnection(String(connection._id), {
+        apiKey, apiSecret, ...(passphrase !== undefined && { passphrase }),
+      }) };
+      connection.accountInfo = accountInfo;
+      await connection.save();
+    }
 
     const summary: ConnectionSummary = {
       id: connection._id,
@@ -263,6 +272,9 @@ export const testConnection = async (req: Request, res: Response) => {
       });
     }
 
+    if (connection.exchange === "bitget") {
+      accountInfo = { ...accountInfo, isolatedMarginSetup: await setupBitgetConnection(String(connection._id), credentials) };
+    }
     connection.accountInfo = accountInfo;
     connection.lastTestedAt = new Date();
     connection.lastTestStatus = "ok";
@@ -335,6 +347,13 @@ export const updateConnectionCredentials = async (
     connection.lastTestedAt = new Date();
 
     await connection.save();
+
+    if (connection.exchange === "bitget") {
+      connection.accountInfo = { ...accountInfo, isolatedMarginSetup: await setupBitgetConnection(String(connection._id), {
+        apiKey, apiSecret, ...(passphrase && { passphrase }),
+      }) };
+      await connection.save();
+    }
 
     await AuditLog.create({
       userId,
