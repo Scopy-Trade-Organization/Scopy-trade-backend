@@ -140,6 +140,18 @@ for position checks. Strategy snapshots are limited to 20 rows and indicate
 truncation. These details follow the existing persistence, response and logging
 paths; they do not relax verification or change recovery behavior.
 
+The reported LINKUSDT short response exposed two adapter issues: a correct
+pending buy-to-close TP/SL strategy returned `posSide=long`, while the live
+one-way position correctly returned `posSide=short`; and protection placement
+rejected a missing `posSide` with `40019`. For verified one-way positions,
+strategy matching now uses the opposite closing `side`, accepting either valid
+strategy position-side label. The held position direction, quantity, prices,
+mark triggers, market execution and pending strategy status remain checked.
+New TP/SL strategy requests explicitly include the held position's `posSide`.
+Regression fixtures reproduce the reported 3 LINK short and mirror the long
+case, including repair and invalid-protection cases. These mocked checks do not
+replace verification against Bitget Demo.
+
 ## Official references
 
 - [Classic-to-UTA API migration guide](https://www.bitget.com/legacy-docs/classic/uta-api-upgrade-guide)

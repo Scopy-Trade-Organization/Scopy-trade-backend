@@ -208,6 +208,7 @@ export async function setBitgetPositionProtection(api: ExchangeRequest, symbol: 
     const missing = bitgetProtectionParams(p.tp, p.sl);
     await api("POST", "/api/v3/trade/place-strategy-order", {
       category: BITGET_CATEGORY, symbol, type: "tpsl", tpslMode: "partial", qty: quantity, marginMode: "isolated",
+      posSide: p.direction === "buy" ? "long" : "short",
       side: p.direction === "buy" ? "sell" : "buy", reduceOnly: "yes", clientOid: `${p.clientOrderId}r`.slice(0, 32),
       ...(!loss.length ? { stopLoss: missing.stopLoss, slTriggerBy: missing.slTriggerBy, slOrderType: missing.slOrderType } : {}),
       ...(!profit.length ? { takeProfit: missing.takeProfit, tpTriggerBy: missing.tpTriggerBy, tpOrderType: missing.tpOrderType } : {}),
@@ -216,6 +217,7 @@ export async function setBitgetPositionProtection(api: ExchangeRequest, symbol: 
   }
   await api("POST", "/api/v3/trade/place-strategy-order", {
     category: BITGET_CATEGORY, symbol, type: "tpsl", tpslMode: "partial", qty: quantity, marginMode: "isolated",
+    posSide: p.direction === "buy" ? "long" : "short",
     side: p.direction === "buy" ? "sell" : "buy", reduceOnly: "yes", clientOid: `${p.clientOrderId}r`.slice(0, 32),
     ...bitgetProtectionParams(p.tp, p.sl),
   });

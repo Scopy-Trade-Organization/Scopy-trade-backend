@@ -85,8 +85,10 @@ export const bitgetProtectionParams = (tp: string, sl: string) => ({
 });
 
 export function bitgetProtectionSide(row: any, direction: "buy" | "sell") {
-  // One-way protection closes on the opposite order side. A missing side is not confirmation.
+  // Callers support verified one-way positions only. Bitget's strategy posSide can
+  // label the closing order (buy/long for a short) rather than the held position.
+  // Use the actual closing side; retain quantity/levels/trigger checks at the caller.
   return row.side === (direction === "buy" ? "sell" : "buy") &&
-    (!row.posSide || row.posSide === (direction === "buy" ? "long" : "short"));
+    (!row.posSide || ["long", "short"].includes(row.posSide));
 }
 
