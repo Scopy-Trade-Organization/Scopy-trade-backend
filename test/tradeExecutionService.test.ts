@@ -290,11 +290,15 @@ test("leverage refusal, changed available margin and exchange minimum failures s
 });
 test("protection failure is persisted and never returned as a successful opened trade", async () => {
   const f = await fixture();
-  f.dependencies.verifyOrRecoverProtection = async () => { throw new ProtectionFailure("entry", "cancelled"); };
+  const failure = new ProtectionFailure("entry", "cancelled");
+  failure.diagnostics = [{ stage: "repair", code: "EXCHANGE_REJECTED", message: "BITGET rejected the request (code 43011)." }];
+  f.dependencies.verifyOrRecoverProtection = async () => { throw failure; };
   const result = await executeTrade(f.userId, f.body, true, f.dependencies);
   assert.equal(result.status, 502); assert.equal(result.body.success, false);
   const trade = await Trade.findById(result.body.tradeId).lean();
   assert.equal(trade?.status, "cancelled"); assert.equal(trade?.protectionStatus, "failed");
+  assert.deepEqual(trade?.protectionDiagnostics, failure.diagnostics);
+  assert.deepEqual(result.body.protectionDiagnostics, failure.diagnostics);
 });
 test("a protection failure discovered by initial monitoring overrides the earlier pending confirmation", async () => {
   const f = await fixture();

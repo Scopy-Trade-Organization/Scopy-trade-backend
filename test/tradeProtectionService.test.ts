@@ -4,6 +4,7 @@ import { hasProtection, verifyOrRecoverProtection, readConfirmedExit, Protection
 import { closeTradeOrder, resolveExchangeOrderId } from "../src/services/tradeService.js";
 import type { ExchangeId } from "../src/types/index.js";
 import type { ExchangeRequest } from "../src/services/exchangeApiService.js";
+import { TradeRiskError } from "../src/services/tradeRiskService.js";
 
 const order: ProtectedOrder = { credentials: { apiKey: "test", apiSecret: "test", passphrase: "test" }, pair: "BTCUSDT", direction: "buy",
   orderId: "entry", clientOrderId: "sc123", quantity: "1", orderQuantity: "1", entryPrice: "100", sl: "95", tp: "110", marginMode: "isolated" };
@@ -95,7 +96,45 @@ for (const exchange of ["bybit", "okx", "bitget"] as const) {
     assert.equal(await hasProtection(exchange, order, f.request), true);
     assert.equal(f.mutations.filter(m => m.values.orderType === "market" || m.values.orderType === "Market" || m.values.ordType === "market").length, 0);
   });
+  test(`${exchange}: transient read failure after repair retries before closing exposure`, async () => {
+    const f = fixture(exchange, true, true);
+    let interrupted = false;
+    const api: ExchangeRequest = async (method, path, values) => {
+      if (method === "GET" && f.mutations.length && !interrupted) {
+        interrupted = true;
+        throw new Error("Transient read timeout");
+      }
+      return f.request(method, path, values);
+    };
+    await verifyOrRecoverProtection(exchange, order, api);
+    assert.equal(interrupted, true);
+    assert.equal(f.mutations.length, 1);
+    assert.equal(await hasProtection(exchange, order, api), true);
+  });
 }
+
+test("protection failure retains safe verification and repair diagnostics", async () => {
+  const f = fixture("bitget", true);
+  const api: ExchangeRequest = async (method, path, values) => {
+    if (path.endsWith("place-strategy-order")) throw new TradeRiskError("EXCHANGE_REJECTED", "BITGET rejected the request (code 43011).");
+    return f.request(method, path, values);
+  };
+  await assert.rejects(verifyOrRecoverProtection("bitget", order, api), (error: any) => {
+    assert.equal(error.recovery, "closed");
+    assert.ok(error.diagnostics.some((d: any) => d.stage === "verification" && d.code === "NATIVE_PROTECTION_MISMATCH"));
+    assert.ok(error.diagnostics.some((d: any) => d.stage === "repair" && d.message.includes("43011")));
+    return true;
+  });
+});
+
+test("arbitrary request errors are excluded from protection diagnostics", async () => {
+  await assert.rejects(verifyOrRecoverProtection("bitget", order, async () => { throw new Error("secret signed request"); }), (error: any) => {
+    assert.equal(error.recovery, "review");
+    assert.ok(error.diagnostics.length > 0);
+    assert.equal(JSON.stringify(error.diagnostics).includes("secret"), false);
+    return true;
+  });
+});
 test("unavailable read-back and recovery stays unresolved rather than inventing success", async () => {
   const unavailable: ExchangeRequest = async () => { throw new Error("Timeout"); };
   await assert.rejects(verifyOrRecoverProtection("bybit", order, unavailable), (error: any) => error instanceof ProtectionFailure && error.recovery === "review" && error.exitPrice === null);

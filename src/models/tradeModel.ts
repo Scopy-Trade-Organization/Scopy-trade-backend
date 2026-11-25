@@ -121,6 +121,7 @@ const tradeSchema = new Schema(
     },
     protectionCheckedAt: { type: Date, default: null },
     protectionError: { type: String, default: null },
+    protectionDiagnostics: { type: Schema.Types.Mixed, default: null },
     // Last status check snapshot from the exchange
     lastCheckedAt: {
       type: Date,

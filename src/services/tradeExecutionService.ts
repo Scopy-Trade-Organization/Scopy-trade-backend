@@ -283,6 +283,7 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
       if (error instanceof ProtectionFailure) {
         attempt.protectionStatus = error.recovery === "review" ? "review" : "failed";
         attempt.protectionError = error.message;
+        attempt.protectionDiagnostics = error.diagnostics;
         attempt.monitoringError = error.message;
         if (error.closedQuantity) attempt.quantity = error.closedQuantity;
         if (error.entryFillPrice) attempt.entryFillPrice = error.entryFillPrice;
@@ -291,7 +292,7 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
         if (error.recovery === "closed" && error.exitPrice) await processTradeClose(String(attempt._id), error.exitPrice, "manual");
         if (error.recovery === "review") await (dependencies.startMonitoring ?? (id => getTradeMonitorService().startMonitoring(id)))(String(attempt._id)).catch(() => undefined);
         return tradeOutcome(502, { success: false, code: error.recovery === "review" ? "ORDER_REVIEW_REQUIRED" : error.code,
-          message: error.message, tradeId: String(attempt._id), exchangeOrderId: placed.orderId, recovery: error.recovery });
+          message: error.message, tradeId: String(attempt._id), exchangeOrderId: placed.orderId, recovery: error.recovery, protectionDiagnostics: error.diagnostics });
       }
       throw error;
     }
@@ -325,7 +326,8 @@ export async function executeTrade(userId: mongoose.Types.ObjectId, body: Record
     trade = await Trade.findById(trade._id) ?? trade;
     if (trade.protectionStatus !== "confirmed") {
       return tradeOutcome(502, { success: false, code: trade.protectionStatus === "review" ? "ORDER_REVIEW_REQUIRED" : "STOP_LOSS_PROTECTION_FAILED",
-        message: trade.protectionError || "Stop-loss protection requires exchange review.", tradeId: String(trade._id), exchangeOrderId: trade.exchangeOrderId });
+        message: trade.protectionError || "Stop-loss protection requires exchange review.", tradeId: String(trade._id), exchangeOrderId: trade.exchangeOrderId,
+        protectionDiagnostics: trade.protectionDiagnostics });
     }
     queueTradeEmail(userId, isProTrade ? "opened" : "copied", {
       pair: trade.pair,

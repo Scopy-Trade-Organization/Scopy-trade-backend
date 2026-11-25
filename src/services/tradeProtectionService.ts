@@ -15,7 +15,13 @@ export interface ProtectedOrder {
   orderId: string; clientOrderId: string; quantity: string; orderQuantity: string;
   entryPrice: string; tp: string; sl: string; marginMode: string; sizing?: RiskSnapshot;
 }
+export interface ProtectionDiagnostic {
+  stage: "verification" | "repair" | "verification_after_repair";
+  code: string;
+  message?: string;
+}
 export class ProtectionFailure extends TradeRiskError {
+  diagnostics: ProtectionDiagnostic[] = [];
   constructor(public orderId: string, public recovery: "cancelled" | "closed" | "review", public exitPrice: string | null = null, public closedQuantity?: string, public entryFillPrice?: string) {
     super("STOP_LOSS_PROTECTION_FAILED", recovery === "review"
       ? "Stop-loss protection could not be confirmed and recovery is unresolved. Check your exchange position immediately; this trade needs review."
@@ -88,25 +94,26 @@ export async function readConfirmedExit(exchange: ExchangeId, api: ExchangeReque
 }
 
 
-export async function hasProtection(exchange: ExchangeId, p: ProtectedOrder, api: ExchangeRequest) {
+export async function hasProtection(exchange: ExchangeId, p: ProtectedOrder, api: ExchangeRequest, report?: (code: string) => void) {
+  const fail = (code: string) => { report?.(code); return false; };
   const symbol = futuresSymbol(exchange, p.pair), entry = await readEntry(exchange, api, symbol, p.orderId);
-  if (!same(entry.quantity, p.orderQuantity) || (!entry.pending && !entry.filled)) return false;
+  if (!same(entry.quantity, p.orderQuantity) || (!entry.pending && !entry.filled)) return fail("ENTRY_STATE_OR_QUANTITY_MISMATCH");
   const live = await position(exchange, api, symbol);
-  if (entry.pending && !(exchange === "bitget" && entry.filled) && !same(entry.row.price ?? entry.row.px, p.entryPrice)) return false;
+  if (entry.pending && !(exchange === "bitget" && entry.filled) && !same(entry.row.price ?? entry.row.px, p.entryPrice)) return fail("ENTRY_PRICE_MISMATCH");
   if (live) {
     const long = exchange === "bybit" ? live.side === "Buy" : exchange === "okx" ? new D(live.pos).gt(0) : live.posSide === "long";
-    if (long !== (p.direction === "buy")) return false;
+    if (long !== (p.direction === "buy")) return fail("POSITION_SIDE_MISMATCH");
     const liquidation = live.liqPrice ?? live.liqPx ?? live.liquidationPrice;
-    if (liquidation && new D(liquidation).gt(0) && (p.direction === "buy" ? new D(liquidation).gte(p.sl) : new D(liquidation).lte(p.sl))) return false;
-    if (positionQuantity(exchange, live).gt(p.orderQuantity)) return false;
+    if (liquidation && new D(liquidation).gt(0) && (p.direction === "buy" ? new D(liquidation).gte(p.sl) : new D(liquidation).lte(p.sl))) return fail("LIQUIDATION_BEFORE_STOP_LOSS");
+    if (positionQuantity(exchange, live).gt(p.orderQuantity)) return fail("POSITION_QUANTITY_EXCEEDED");
     const fillPrice = live.avgPrice ?? live.avgPx ?? live.openPriceAvg;
     if (p.sizing && fillPrice) {
       const base = positionQuantity(exchange, live).mul(p.sizing.exchangeInstrumentRules.contractSize);
       const risk = new D(fillPrice).minus(p.sl).abs().mul(base).plus(new D(fillPrice).plus(p.sl).mul(base).mul(p.sizing.takerFeeRate));
-      if (risk.gt(p.sizing.riskAmount)) return false;
+      if (risk.gt(p.sizing.riskAmount)) return fail("FILLED_RISK_BUDGET_EXCEEDED");
     }
   }
-  if (!live && entry.filled) return false; // A missing position is not proof of the exit price.
+  if (!live && entry.filled) return fail("FILLED_POSITION_UNAVAILABLE"); // A missing position is not proof of the exit price.
   if (exchange === "bybit") {
     const levels = live ?? entry.row;
     return same(levels.stopLoss, p.sl) && same(levels.takeProfit, p.tp) &&
@@ -225,18 +232,33 @@ async function recoverUnprotected(exchange: ExchangeId, p: ProtectedOrder, api: 
 }
 
 export async function verifyOrRecoverProtection(exchange: ExchangeId, p: ProtectedOrder, api = exchangeApi(exchange, p.credentials)) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try { if (await hasProtection(exchange, p, api)) return; } catch { /* Retry read-back before any recovery. */ }
-    if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 200));
-  }
+  const diagnostics: ProtectionDiagnostic[] = [];
+  const recordError = (stage: ProtectionDiagnostic["stage"], error: unknown) => {
+    // Never retain arbitrary transport errors, which may contain signed requests or credentials.
+    diagnostics.push(error instanceof TradeRiskError
+      ? { stage, code: error.code, message: error.message }
+      : { stage, code: "PROTECTION_LOOKUP_OR_REQUEST_FAILED" });
+  };
+  const verify = async (stage: "verification" | "verification_after_repair") => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let reason = "NATIVE_PROTECTION_MISMATCH";
+      try {
+        if (await hasProtection(exchange, p, api, code => { reason = code; })) return true;
+        diagnostics.push({ stage, code: reason });
+      } catch (error) { recordError(stage, error); }
+      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    return false;
+  };
+  if (await verify("verification")) return;
   try {
     await repairProtection(exchange, p, api);
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (await hasProtection(exchange, p, api)) return;
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-  } catch { /* Recovery below cancels the remaining entry before reducing exposure. */ }
-  throw await recoverUnprotected(exchange, p, api);
+    if (await verify("verification_after_repair")) return;
+  } catch (error) { recordError("repair", error); }
+  const failure = await recoverUnprotected(exchange, p, api);
+  failure.diagnostics = diagnostics;
+  console.warn("[tradeProtection] Protection failed", { exchange, symbol: p.pair, orderId: p.orderId, recovery: failure.recovery, diagnostics });
+  throw failure;
 }
 
 const checks = new Map<string, Promise<boolean>>();
@@ -290,7 +312,7 @@ export function enforceStoredTradeProtection(id: string): Promise<boolean> {
         ...(sizing ? { sizing } : {}) }, api);
       await Trade.updateOne({ _id: id, status: { $in: ["pending", "filled"] } }, { $set: {
         ...(entry.filled && !entry.pending ? { status: "filled" } : {}),
-        protectionStatus: "confirmed", protectionCheckedAt: new Date(), protectionError: null,
+        protectionStatus: "confirmed", protectionCheckedAt: new Date(), protectionError: null, protectionDiagnostics: null,
         ...(sizing && trade.entryFillPrice ? { "sizing.acceptedEntryPrice": trade.entryFillPrice,
           "sizing.estimatedRiskAtFill": new D(trade.entryFillPrice).minus(trade.sl).abs().mul(trade.quantity)
             .plus(new D(trade.entryFillPrice).plus(trade.sl).mul(trade.quantity).mul(sizing.takerFeeRate)).toFixed() } : {}),
@@ -301,6 +323,7 @@ export function enforceStoredTradeProtection(id: string): Promise<boolean> {
       await Trade.updateOne({ _id: id, status: { $in: ["pending", "filled"] } }, { $set: {
         protectionStatus: failure && failure.recovery !== "review" ? "failed" : "review",
         protectionError: failure?.message ?? "Exchange protection could not be verified; review required.",
+        ...(failure ? { protectionDiagnostics: failure.diagnostics } : {}),
         ...(failure?.recovery === "cancelled" ? { status: "cancelled" } : {}),
         ...(failure?.closedQuantity ? { quantity: failure.closedQuantity } : {}),
         ...(failure?.entryFillPrice ? { entryFillPrice: failure.entryFillPrice } : {}),
@@ -316,6 +339,7 @@ export function enforceStoredTradeProtection(id: string): Promise<boolean> {
 export async function recordProtectionFailure(id: string, failure: ProtectionFailure) {
   await Trade.updateOne({ _id: id, status: { $in: ["pending", "filled"] } }, { $set: {
     protectionStatus: failure.recovery === "review" ? "review" : "failed", protectionError: failure.message,
+    protectionDiagnostics: failure.diagnostics,
     ...(failure.recovery === "cancelled" ? { status: "cancelled", closedAt: new Date() } : {}),
     ...(failure.closedQuantity ? { quantity: failure.closedQuantity } : {}),
     ...(failure.entryFillPrice ? { entryFillPrice: failure.entryFillPrice } : {}),
