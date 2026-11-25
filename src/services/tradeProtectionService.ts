@@ -279,7 +279,7 @@ export async function verifyOrRecoverProtection(exchange: ExchangeId, p: Protect
   } catch (error) { recordError("repair", error); }
   const failure = await recoverUnprotected(exchange, p, api);
   failure.diagnostics = diagnostics;
-  console.warn("[tradeProtection] Protection failed", { exchange, symbol: p.pair, orderId: p.orderId, recovery: failure.recovery, diagnostics });
+  console.warn("[tradeProtection] Protection failed", JSON.stringify({ exchange, symbol: p.pair, orderId: p.orderId, recovery: failure.recovery, diagnostics }));
   throw failure;
 }
 

@@ -35,7 +35,8 @@ function bitgetRejection(code: string, msg: unknown, method: "GET" | "POST", end
   // Extract only a recognized parameter from the documented template. Never copy raw exchange text.
   const match = code === "40019" && typeof msg === "string" && msg.length < 256
     ? /^Parameter\s+["'`]?([A-Za-z][A-Za-z0-9]*)["'`]?\s+can(?:not| not) be empty[.!]?$/i.exec(msg.trim()) : null;
-  const parameter = match && bitgetParameterNames.has(match[1]) ? match[1] : undefined;
+  const candidate = match?.[1];
+  const parameter = candidate && bitgetParameterNames.has(candidate) ? candidate : undefined;
   return new ExchangeRequestError(`BITGET rejected the request (code ${code}). ${parameter
     ? `Parameter ${parameter} cannot be empty.`
     : code === "40019" ? "A required parameter is empty." : "Check account mode, permissions, order prices and available margin."}`,
