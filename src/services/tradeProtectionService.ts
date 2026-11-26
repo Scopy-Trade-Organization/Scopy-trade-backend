@@ -16,7 +16,7 @@ export interface ProtectedOrder {
   entryPrice: string; tp: string; sl: string; marginMode: string; sizing?: RiskSnapshot;
 }
 export interface ProtectionDiagnostic {
-  stage: "verification" | "repair" | "verification_after_repair";
+  stage: "verification" | "repair" | "verification_after_repair" | "connection" | "entry_lookup" | "position_lookup" | "exit_reconciliation";
   code: string;
   message?: string;
   request?: ExchangeFailureDetails;
@@ -67,7 +67,7 @@ export async function position(exchange: ExchangeId, api: ExchangeRequest, symbo
     : exchange === "okx" ? await api("GET", "/api/v5/account/positions", { instId: symbol })
     : await api("GET", "/api/v3/position/current-position", { symbol, category: BITGET_CATEGORY });
   const rows = exchange === "bybit" ? result.result?.list : exchange === "bitget" ? bitgetPositions(result) : result.data;
-  if (!Array.isArray(rows)) throw new Error("Position could not be verified.");
+  if (!Array.isArray(rows)) throw new TradeRiskError("INVALID_EXCHANGE_RESPONSE", "Position could not be verified.");
   if (exchange === "bitget") {
     const active = rows.filter((p: any) => decimal(p.total, "Bitget UTA position size", true).gt(0));
     if (active.length > 1 || active.some((p: any) => p.symbol !== symbol || p.category !== BITGET_CATEGORY ||
@@ -108,7 +108,9 @@ export async function readConfirmedExit(exchange: ExchangeId, api: ExchangeReque
 export async function hasProtection(exchange: ExchangeId, p: ProtectedOrder, api: ExchangeRequest, report?: (code: string, details?: Record<string, unknown>) => void) {
   const fail = (code: string, details?: Record<string, unknown>) => { report?.(code, details); return false; };
   const symbol = futuresSymbol(exchange, p.pair), entry = await readEntry(exchange, api, symbol, p.orderId);
-  if (!same(entry.quantity, p.orderQuantity) || (!entry.pending && !entry.filled)) return fail("ENTRY_STATE_OR_QUANTITY_MISMATCH");
+  if (!same(entry.quantity, p.orderQuantity) || (!entry.pending && !entry.filled)) return fail("ENTRY_STATE_OR_QUANTITY_MISMATCH", {
+    state: entry.state, quantity: entry.quantity, expectedQuantity: p.orderQuantity,
+  });
   const live = await position(exchange, api, symbol);
   if (entry.pending && !(exchange === "bitget" && entry.filled) && !same(entry.row.price ?? entry.row.px, p.entryPrice)) return fail("ENTRY_PRICE_MISMATCH");
   if (live) {
@@ -128,7 +130,9 @@ export async function hasProtection(exchange: ExchangeId, p: ProtectedOrder, api
   if (exchange === "bybit") {
     const levels = live ?? entry.row;
     return same(levels.stopLoss, p.sl) && same(levels.takeProfit, p.tp) &&
-      (!live ? entry.row.tpslMode === "Full" && !new D(entry.row.slLimitPrice || "0").gt(0) && entry.row.slTriggerBy === "MarkPrice" : true);
+      (!live ? entry.row.tpslMode === "Full" && !new D(entry.row.slLimitPrice || "0").gt(0) && entry.row.slTriggerBy === "MarkPrice" : true) ||
+      fail("NATIVE_PROTECTION_MISMATCH", { source: live ? "position" : "entry", expected: { stopLoss: p.sl, takeProfit: p.tp },
+        entry: protectionFields(entry.row), position: protectionFields(live) });
   }
   if (exchange === "okx") {
     if (!live) return entry.row.attachAlgoOrds?.some((r: any) => same(r.slTriggerPx, p.sl) && same(r.tpTriggerPx, p.tp) && r.slOrdPx === "-1") === true;
@@ -293,16 +297,18 @@ export function enforceStoredTradeProtection(id: string): Promise<boolean> {
   const work = (async () => {
     const trade = await Trade.findOne({ _id: id, status: { $in: ["pending", "filled"] } });
     if (!trade) return false;
-    const connection = await ExchangeConnection.findById(trade.exchangeConnectionId).lean();
-    if (!connection?.encryptedApiKey || !connection.encryptedApiSecret) return false;
-    const exchange = connection.exchange as ExchangeId;
-    const credentials = decryptCredentials({ exchange, apiKey: connection.encryptedApiKey, apiSecret: connection.encryptedApiSecret,
-      ...(connection.encryptedPassphrase ? { passphrase: connection.encryptedPassphrase } : {}) });
-    const api = exchangeApi(exchange, credentials), symbol = futuresSymbol(exchange, trade.pair);
+    let stage: ProtectionDiagnostic["stage"] = "connection";
     try {
+      const connection = await ExchangeConnection.findById(trade.exchangeConnectionId).lean();
+      if (!connection?.encryptedApiKey || !connection.encryptedApiSecret) throw new TradeRiskError("CONNECTION_UNAVAILABLE", "The exchange connection is unavailable for protection verification.");
+      const exchange = connection.exchange as ExchangeId;
+      const credentials = decryptCredentials({ exchange, apiKey: connection.encryptedApiKey, apiSecret: connection.encryptedApiSecret,
+        ...(connection.encryptedPassphrase ? { passphrase: connection.encryptedPassphrase } : {}) });
+      const api = exchangeApi(exchange, credentials), symbol = futuresSymbol(exchange, trade.pair);
+      stage = "entry_lookup";
       const entry = await readEntry(exchange, api, symbol, trade.exchangeOrderId || "", trade.exchangeClientOrderId || undefined);
       const orderId = String(exchange === "bybit" ? entry.row.orderId : exchange === "okx" ? entry.row.ordId : entry.row.orderId);
-      if (!orderId || orderId === "undefined") throw new Error("Order ID unavailable.");
+      if (!orderId || orderId === "undefined") throw new TradeRiskError("ORDER_ID_UNAVAILABLE", "Order ID unavailable.");
       trade.exchangeOrderId = orderId;
       if (entry.filled && new D(entry.price || "0").gt(0)) trade.entryFillPrice = entry.price;
       await trade.save();
@@ -312,24 +318,27 @@ export function enforceStoredTradeProtection(id: string): Promise<boolean> {
         const instrument = (await api("GET", "/api/v5/public/instruments", { instType: "SWAP", instId: symbol })).data?.[0];
         quantity = new D(trade.quantity).div(new D(instrument.ctVal).mul(instrument.ctMult)).toFixed();
       }
+      stage = "position_lookup";
       const live = await position(exchange, api, symbol);
       if (!entry.pending && !entry.filled && !live) {
         await Trade.updateOne({ _id: id, status: { $in: ["pending", "filled"] } }, { $set: { status: "cancelled", closedAt: new Date() } });
         return false;
       }
       if (entry.filled && !live) {
+        stage = "exit_reconciliation";
         if (entry.pending) {
           await api("POST", exchange === "bybit" ? "/v5/order/cancel" : exchange === "okx" ? "/api/v5/trade/cancel-order" : "/api/v3/trade/cancel-order",
             exchange === "bybit" ? { category: "linear", symbol, orderId } : exchange === "okx" ? { instId: symbol, ordId: orderId } : { symbol, category: BITGET_CATEGORY, orderId });
-          if ((await readEntry(exchange, api, symbol, orderId)).pending) throw new Error("Remaining entry cancellation is unconfirmed.");
+          if ((await readEntry(exchange, api, symbol, orderId)).pending) throw new TradeRiskError("ORDER_CANCEL_UNCONFIRMED", "Remaining entry cancellation is unconfirmed.");
         }
         const exit = await readConfirmedExit(exchange, api, symbol, entry, trade.direction as "buy" | "sell");
-        if (!exit || await position(exchange, api, symbol)) throw new Error("Actual exit could not be reconciled.");
+        if (!exit || await position(exchange, api, symbol)) throw new TradeRiskError("EXIT_UNVERIFIABLE", "Actual exit could not be reconciled.");
         const multiplier = sizing?.exchangeInstrumentRules.contractSize ?? (exchange === "okx" ? new D(trade.quantity).div(quantity).toFixed() : "1");
         await Trade.updateOne({ _id: id }, { $set: { quantity: new D(exit.orderQuantity).mul(multiplier).toFixed(), ...(entry.price ? { entryFillPrice: entry.price } : {}) } });
         await processTradeClose(id, exit.exitPrice, "manual");
         return false;
       }
+      stage = "verification";
       await verifyOrRecoverProtection(exchange, { credentials, pair: trade.pair, direction: trade.direction as "buy" | "sell",
         orderId, clientOrderId: trade.exchangeClientOrderId || `sc${String(trade._id)}`, quantity: trade.quantity, orderQuantity: quantity,
         entryPrice: trade.entryPrice, sl: trade.sl, tp: trade.tp, marginMode: trade.marginMode || (exchange === "okx" ? "isolated" : "crossed"),
@@ -344,10 +353,18 @@ export function enforceStoredTradeProtection(id: string): Promise<boolean> {
       return true;
     } catch (error) {
       const failure = error instanceof ProtectionFailure ? error : null;
+      // Never persist arbitrary transport messages; they may contain signed URLs.
+      const diagnostics: ProtectionDiagnostic[] = failure?.diagnostics ?? [{ stage,
+        code: error instanceof TradeRiskError ? error.code : "PROTECTION_LOOKUP_OR_REQUEST_FAILED",
+        ...(error instanceof ExchangeRequestError ? { request: error.details } : {}),
+      }];
+      console.warn("[tradeProtection] Stored protection check failed", JSON.stringify({ sourceTradeId: id,
+        pair: trade.pair, entryStatus: trade.status, previousProtectionStatus: trade.protectionStatus,
+        protectionStatus: failure && failure.recovery !== "review" ? "failed" : "review", diagnostics }));
       await Trade.updateOne({ _id: id, status: { $in: ["pending", "filled"] } }, { $set: {
         protectionStatus: failure && failure.recovery !== "review" ? "failed" : "review",
         protectionError: failure?.message ?? "Exchange protection could not be verified; review required.",
-        ...(failure ? { protectionDiagnostics: failure.diagnostics } : {}),
+        protectionDiagnostics: diagnostics, protectionCheckedAt: new Date(),
         ...(failure?.recovery === "cancelled" ? { status: "cancelled" } : {}),
         ...(failure?.closedQuantity ? { quantity: failure.closedQuantity } : {}),
         ...(failure?.entryFillPrice ? { entryFillPrice: failure.entryFillPrice } : {}),
@@ -363,7 +380,7 @@ export function enforceStoredTradeProtection(id: string): Promise<boolean> {
 export async function recordProtectionFailure(id: string, failure: ProtectionFailure) {
   await Trade.updateOne({ _id: id, status: { $in: ["pending", "filled"] } }, { $set: {
     protectionStatus: failure.recovery === "review" ? "review" : "failed", protectionError: failure.message,
-    protectionDiagnostics: failure.diagnostics,
+    protectionDiagnostics: failure.diagnostics, protectionCheckedAt: new Date(),
     ...(failure.recovery === "cancelled" ? { status: "cancelled", closedAt: new Date() } : {}),
     ...(failure.closedQuantity ? { quantity: failure.closedQuantity } : {}),
     ...(failure.entryFillPrice ? { entryFillPrice: failure.entryFillPrice } : {}),

@@ -10,6 +10,10 @@ import { decryptCredentials } from "./exchangeConnectionService.js";
 import { queueCopyFailureEmail } from "./emailService.js";
 import { ExchangeId } from "../types/index.js";
 
+// Wait for background reconciliation (every 60s) without retrying an entry order.
+const SOURCE_PROTECTION_RECHECK_MS = 15_000;
+const MAX_SOURCE_PROTECTION_RECHECKS = 6;
+
 export async function refreshConnectionBalance(connectionId: mongoose.Types.ObjectId, userId: mongoose.Types.ObjectId) {
   const connection = await ExchangeConnection.findOne({ _id: connectionId, userId, isActive: true }).lean();
   if (!connection?.encryptedApiKey || !connection.encryptedApiSecret) throw new Error("Your selected exchange is disconnected. Reconnect it in Exchange Settings.");
@@ -77,9 +81,10 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
         const job = await CopyExecution.findOneAndUpdate({ status: "queued", availableAt: { $lte: new Date() } }, { $set: { status: "processing", startedAt: new Date() } }, { new: true, sort: { createdAt: 1 } }).lean();
         if (!job) break;
         let locked = false, retainLock = false;
+        let failureCode: string | null = null;
         try {
           const subscription = await CopySubscription.findOne({ _id: job.subscriptionId, active: true }).lean();
-          const source = await Trade.findById(job.sourceTradeId).select("userId status protectionStatus createdAt").lean();
+          const source = await Trade.findById(job.sourceTradeId).select("userId pair status protectionStatus protectionCheckedAt protectionError protectionDiagnostics exchangeConnectionId exchangeOrderId createdAt").lean();
           if (!subscription || !source || subscription.startedAt > source.createdAt) {
             await CopyExecution.updateOne({ _id: job._id }, { $set: { status: "skipped", reason: "Subscription was stopped before execution.", completedAt: new Date() } });
             continue;
@@ -87,7 +92,29 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
           if (!await User.exists({ _id: job.copierId, role: "CopyTrader", status: { $in: ["active", "live"] } })) throw new Error("Your account is currently unavailable for copying. Contact support.");
           if (!await User.exists({ _id: source.userId, role: "ProTrader", status: { $in: ["active", "live"] } })) throw new Error("This pro trader is currently unavailable for copying.");
           if (!["pending", "filled"].includes(source.status)) throw new Error("The pro trader's position closed before your copy could be opened.");
-          if (source.protectionStatus !== "confirmed") throw new Error("The pro trader's stop-loss protection is not confirmed. This trade cannot be copied.");
+          if (source.protectionStatus !== "confirmed") {
+            // Preserve the evidence as observed, even if monitoring later clears it.
+            const snapshot = { observedAt: new Date(), sourceTradeId: source._id, pair: source.pair,
+              status: source.status, protectionStatus: source.protectionStatus,
+              protectionCheckedAt: source.protectionCheckedAt, protectionError: source.protectionError,
+              protectionDiagnostics: source.protectionDiagnostics, exchangeConnectionId: source.exchangeConnectionId,
+              exchangeOrderId: source.exchangeOrderId };
+            const checks = job.sourceProtectionChecks ?? 0;
+            const waiting = ["pending", "review"].includes(source.protectionStatus ?? "") && checks < MAX_SOURCE_PROTECTION_RECHECKS;
+            await CopyExecution.updateOne({ _id: job._id, status: "processing" }, { $set: {
+              sourceProtectionSnapshot: snapshot,
+              ...(waiting ? { status: "queued", startedAt: null, availableAt: new Date(Date.now() + SOURCE_PROTECTION_RECHECK_MS),
+                sourceProtectionChecks: checks + 1 } : {}),
+            } });
+            console.warn("[automaticCopy] source protection", JSON.stringify({ executionId: job._id,
+              sourceTradeId: source._id, sourceStatus: source.status, protectionStatus: source.protectionStatus,
+              action: waiting ? "deferred" : "failed", rechecks: checks,
+              diagnosticCodes: Array.isArray(source.protectionDiagnostics)
+                ? source.protectionDiagnostics.map((item: any) => ({ stage: item.stage, code: item.code })) : [] }));
+            if (waiting) continue;
+            failureCode = "SOURCE_PROTECTION_UNCONFIRMED";
+            throw new Error("The pro trader's stop-loss protection is not confirmed. This trade cannot be copied.");
+          }
           const existingTrade = await Trade.findOne({ sourceTradeId: job.sourceTradeId, exchangeConnectionId: job.exchangeConnectionId }).select("status protectionStatus").lean();
           if (existingTrade) {
             if (existingTrade.protectionStatus !== "confirmed" || ["failed", "cancelled"].includes(existingTrade.status)) {
@@ -117,11 +144,12 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
           if ((await getProfitShareSummary(job.copierId)).settlementRequired) throw new Error("Settle your outstanding profit share in your dashboard before copying new trades.");
           const result = await (dependencies.executeTrade ?? executeTrade)(job.copierId, { sourceTradeId: String(job.sourceTradeId), exchangeConnectionId: String(job.exchangeConnectionId) }, false);
           retainLock = result.body.code === "ORDER_REVIEW_REQUIRED";
+          failureCode = typeof result.body.code === "string" ? result.body.code : null;
           if (result.status !== 201) throw new Error(safeFailure(result));
           await CopyExecution.updateOne({ _id: job._id }, { $set: { status: "completed", completedAt: new Date() } });
         } catch (error) {
           const reason = error instanceof Error ? error.message : "Automatic copying failed. Contact support.";
-          await CopyExecution.updateOne({ _id: job._id }, { $set: { status: "failed", reason, completedAt: new Date() } });
+          await CopyExecution.updateOne({ _id: job._id }, { $set: { status: "failed", reason, failureCode, completedAt: new Date() } });
           await notifyFailure(job, reason);
         } finally {
           if (locked && !retainLock) await CopyExecutionLock.deleteOne({ connectionId: job.exchangeConnectionId, executionId: job._id });

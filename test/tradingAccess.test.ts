@@ -126,6 +126,107 @@ test("subscription validates the account and concurrent requests cannot create d
   assert.equal(await CopySubscription.countDocuments({ copierId: copier._id, proTraderId: pro._id }), 1);
 });
 
+test("pending pro entries can be copied before filling, while protection under review waits without executing", async () => {
+  for (const status of ["pending", "filled"] as const) {
+    for (const protectionStatus of ["confirmed", "review"] as const) {
+      const pro = await user("ProTrader", "active"), copier = await user("CopyTrader", "active");
+      const sourceId = new mongoose.Types.ObjectId(), connectionId = new mongoose.Types.ObjectId();
+      const subscription = await CopySubscription.create({ copierId: copier._id, proTraderId: pro._id,
+        exchangeConnectionId: connectionId, startedAt: new Date(Date.now() - 5000) });
+      await Trade.collection.insertOne({ _id: sourceId, userId: pro._id, signalId: new mongoose.Types.ObjectId(),
+        exchangeConnectionId: new mongoose.Types.ObjectId(), tradeOrigin: "pro", pair: "LINKUSDT", status,
+        protectionStatus: "confirmed", createdAt: new Date() });
+      await enqueueAutomaticCopies(String(sourceId));
+      // Protection may change during monitoring after a copy has been queued.
+      await Trade.updateOne({ _id: sourceId }, { $set: { protectionStatus } });
+      let executions = 0;
+      await drainCopyQueue({ executeTrade: async (_copierId, body) => {
+        assert.equal(body.sourceTradeId, String(sourceId));
+        assert.equal((await Trade.findById(sourceId).lean())?.status, status);
+        executions++;
+        return { status: 201, body: {} };
+      } });
+      const job = await CopyExecution.findOne({ subscriptionId: subscription._id }).lean();
+      assert.equal(executions, protectionStatus === "confirmed" ? 1 : 0);
+      assert.equal(job?.status, protectionStatus === "confirmed" ? "completed" : "queued");
+      if (protectionStatus === "review") {
+        assert.equal(job?.sourceProtectionChecks, 1);
+        assert.equal(job?.sourceProtectionSnapshot.protectionStatus, "review");
+        assert.equal(job?.failureNotifiedAt, null);
+        await CopyExecution.deleteOne({ _id: job?._id });
+      }
+    }
+  }
+});
+
+test("source protection recovery resumes a queued copy; persistent review has bounded rechecks and durable evidence", async () => {
+  for (const recovers of [true, false]) {
+    const pro = await user("ProTrader", "active"), copier = await user("CopyTrader", "active");
+    const sourceId = new mongoose.Types.ObjectId(), connectionId = new mongoose.Types.ObjectId();
+    const subscription = await CopySubscription.create({ copierId: copier._id, proTraderId: pro._id,
+      exchangeConnectionId: connectionId, startedAt: new Date(Date.now() - 5000) });
+    await Trade.collection.insertOne({ _id: sourceId, userId: pro._id, signalId: new mongoose.Types.ObjectId(),
+      exchangeConnectionId: new mongoose.Types.ObjectId(), tradeOrigin: "pro", pair: "LINKUSDT", status: "pending",
+      protectionStatus: "confirmed", createdAt: new Date() });
+    await enqueueAutomaticCopies(String(sourceId));
+    await Trade.updateOne({ _id: sourceId }, { $set: { protectionStatus: "review",
+      protectionError: "Exchange protection could not be verified; review required.",
+      protectionDiagnostics: [{ stage: "position_lookup", code: "EXCHANGE_UNAVAILABLE" }] } });
+    let executions = 0;
+    const dependencies = { executeTrade: async () => { executions++; return { status: 201, body: {} }; } };
+    await drainCopyQueue(dependencies);
+    let job = await CopyExecution.findOne({ subscriptionId: subscription._id }).lean();
+    assert.equal(job?.status, "queued");
+    assert.ok(job!.availableAt.getTime() > Date.now());
+    assert.equal(await CopyExecutionLock.countDocuments({ connectionId }), 0);
+    if (recovers) await Trade.updateOne({ _id: sourceId }, { $set: { protectionStatus: "confirmed" } });
+    for (let i = 0; i < (recovers ? 1 : 6); i++) {
+      await CopyExecution.updateOne({ _id: job!._id }, { $set: { availableAt: new Date(0) } });
+      await drainCopyQueue(dependencies);
+    }
+    job = await CopyExecution.findById(job!._id).lean();
+    assert.equal(executions, recovers ? 1 : 0);
+    assert.equal(job?.status, recovers ? "completed" : "failed");
+    assert.equal(job?.sourceProtectionChecks, recovers ? 1 : 6);
+    assert.equal(job?.sourceProtectionSnapshot.status, "pending");
+    assert.deepEqual(job?.sourceProtectionSnapshot.protectionDiagnostics, [{ stage: "position_lookup", code: "EXCHANGE_UNAVAILABLE" }]);
+    if (!recovers) {
+      assert.equal(job?.failureCode, "SOURCE_PROTECTION_UNCONFIRMED");
+      assert.ok(job?.failureNotifiedAt);
+      await drainCopyQueue(dependencies);
+      assert.equal(executions, 0);
+    }
+  }
+});
+
+test("closed sources and failed protection are never executed after a protection deferral", async () => {
+  for (const closed of [true, false]) {
+    const pro = await user("ProTrader", "active"), copier = await user("CopyTrader", "active");
+    const sourceId = new mongoose.Types.ObjectId(), connectionId = new mongoose.Types.ObjectId();
+    const subscription = await CopySubscription.create({ copierId: copier._id, proTraderId: pro._id,
+      exchangeConnectionId: connectionId, startedAt: new Date(Date.now() - 5000) });
+    await Trade.collection.insertOne({ _id: sourceId, userId: pro._id, signalId: new mongoose.Types.ObjectId(),
+      exchangeConnectionId: new mongoose.Types.ObjectId(), tradeOrigin: "pro", pair: "LINKUSDT", status: "pending",
+      protectionStatus: "confirmed", createdAt: new Date() });
+    await enqueueAutomaticCopies(String(sourceId));
+    await Trade.updateOne({ _id: sourceId }, { $set: { protectionStatus: "review" } });
+    let executions = 0;
+    const dependencies = { executeTrade: async () => { executions++; return { status: 201, body: {} }; } };
+    await drainCopyQueue(dependencies);
+    const job = await CopyExecution.findOne({ subscriptionId: subscription._id }).lean();
+    assert.equal(job?.status, "queued");
+    await Trade.updateOne({ _id: sourceId }, { $set: closed
+      ? { status: "closed", protectionStatus: "confirmed" } : { protectionStatus: "failed" } });
+    await CopyExecution.updateOne({ _id: job!._id }, { $set: { availableAt: new Date(0) } });
+    await drainCopyQueue(dependencies);
+    assert.equal(executions, 0);
+    const failed = await CopyExecution.findById(job!._id).lean();
+    assert.equal(failed?.status, "failed");
+    assert.equal(failed?.sourceProtectionChecks, 1);
+    assert.match(failed?.reason ?? "", closed ? /position closed/ : /stop-loss protection is not confirmed/);
+  }
+});
+
 test("settlement debt permits subscriptions while remaining due for trade execution", async () => {
   const pro = await user("ProTrader", "active"), copier = await user("CopyTrader", "active");
   await User.collection.updateOne({ _id: copier._id }, { $unset: { settlementOwedUnits: 1 } });

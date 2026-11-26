@@ -300,6 +300,41 @@ test("protection failure is persisted and never returned as a successful opened 
   assert.deepEqual(trade?.protectionDiagnostics, failure.diagnostics);
   assert.deepEqual(result.body.protectionDiagnostics, failure.diagnostics);
 });
+test("monitoring preserves safe lookup diagnostics and reconfirms a protected pending entry after recovery", async t => {
+  const f = await fixture();
+  const result = await executeTrade(f.userId, f.body, true, f.dependencies);
+  assert.equal(result.status, 201);
+  const stored = await Trade.findById(result.body.trade._id).lean();
+  assert.ok(stored);
+  let unavailable = true;
+  let writes = 0;
+  t.mock.method(http, "get", async () => ({ data: { retCode: 0, time: Date.now() } }));
+  t.mock.method(http, "request", async (config: any) => {
+    if (config.method !== "GET") { writes++; assert.fail("Protection read-back must not write to the exchange"); }
+    const path = new URL(config.url).pathname;
+    if (unavailable) throw new Error("signed-url?apiKey=secret&signature=secret");
+    if (path === "/v5/position/list") return { data: { retCode: 0, result: { list: [] } } };
+    assert.equal(path, "/v5/order/realtime");
+    return { data: { retCode: 0, result: { list: [{ orderId: stored.exchangeOrderId,
+      orderStatus: "New", cumExecQty: "0", qty: stored.sizing.orderQuantity, price: stored.entryPrice,
+      stopLoss: stored.sl, takeProfit: stored.tp, tpslMode: "Full", slLimitPrice: "", slTriggerBy: "MarkPrice" }] } } };
+  });
+  assert.equal(await enforceStoredTradeProtection(String(stored._id)), false);
+  const review = await Trade.findById(stored._id).lean();
+  assert.equal(review?.status, "pending");
+  assert.equal(review?.protectionStatus, "review");
+  assert.deepEqual(review?.protectionDiagnostics, [{ stage: "entry_lookup", code: "EXCHANGE_UNAVAILABLE" }]);
+  assert.ok(review?.protectionCheckedAt);
+  assert.doesNotMatch(JSON.stringify(review?.protectionDiagnostics), /secret|signature|apiKey/);
+  unavailable = false;
+  assert.equal(await enforceStoredTradeProtection(String(stored._id)), true);
+  const recovered = await Trade.findById(stored._id).lean();
+  assert.equal(recovered?.status, "pending");
+  assert.equal(recovered?.protectionStatus, "confirmed");
+  assert.equal(recovered?.protectionDiagnostics, null);
+  assert.equal(writes, 0);
+});
+
 test("a protection failure discovered by initial monitoring overrides the earlier pending confirmation", async () => {
   const f = await fixture();
   f.dependencies.startMonitoring = async id => {

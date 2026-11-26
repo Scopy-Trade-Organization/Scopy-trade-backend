@@ -25,6 +25,9 @@ const executionSchema = new Schema({
   availableAt: { type: Date, default: Date.now },
   completedAt: { type: Date, default: null },
   failureNotifiedAt: { type: Date, default: null },
+  sourceProtectionChecks: { type: Number, default: 0 },
+  failureCode: { type: String, default: null },
+  sourceProtectionSnapshot: { type: Schema.Types.Mixed, default: null },
 }, { timestamps: true });
 executionSchema.index({ sourceTradeId: 1, exchangeConnectionId: 1 }, { unique: true });
 executionSchema.index({ status: 1, createdAt: 1 });
