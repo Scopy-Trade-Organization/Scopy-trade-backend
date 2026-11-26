@@ -219,9 +219,15 @@ async function bybitContext(
       ),
       leverageStep: amount(info.leverageFilter?.leverageStep, "Leverage step"),
       tiers: riskRows
-        .map((r) => ({
+        .map((r, index) => ({
           maximumNotional: amount(r.riskLimitValue, "Tier position limit"),
-          maintenanceDeduction: amount(r.mmDeduction, "Bybit maintenance deduction", true),
+          // Bybit can leave the lowest tier's deduction empty. Its deduction
+          // is zero; higher tiers still require an explicit, valid value.
+          maintenanceDeduction: amount(
+            index === 0 && r.isLowestRisk === 1 && (r.mmDeduction == null || r.mmDeduction === "")
+              ? "0" : r.mmDeduction,
+            "Bybit maintenance deduction", true,
+          ),
           maximumLeverage: amount(r.maxLeverage, "Tier leverage"),
           maintenanceRate: amount(
             r.maintenanceMargin,

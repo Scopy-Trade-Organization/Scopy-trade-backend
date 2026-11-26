@@ -69,6 +69,38 @@ for (const exchange of ["bybit", "okx", "bitget"] as const) test(`${exchange}: a
   assert.equal(f.calls.filter(call => call.method === "POST" && !call.path.includes("max-open-available")).length, 1);
 });
 
+test("Bybit empty lowest-tier deduction produces the same risk plan as explicit zero", async () => {
+  const f = fixture("bybit");
+  const plan = async () => {
+    const context = await getFuturesContext("bybit", credentials, "BTCUSDT", f.request);
+    return calculateTradeRisk({ exchange: "bybit", ...context, entry: "64755.1", sl: "64949.3", tp: "64000", direction: "sell" });
+  };
+  const expected = await plan();
+  for (const missing of ["", null, undefined]) {
+    f.responses["/v5/market/risk-limit"].result.list[0].mmDeduction = missing;
+    assert.deepEqual(await plan(), expected);
+  }
+  assert.ok(f.calls.every(call => call.method === "GET"));
+});
+
+test("Bybit malformed deductions and missing higher-tier deductions still block planning", async () => {
+  for (const invalid of ["invalid", "-1", "NaN", "Infinity", " "]) {
+    const f = fixture("bybit");
+    f.responses["/v5/market/risk-limit"].result.list[0].mmDeduction = invalid;
+    await assert.rejects(getFuturesContext("bybit", credentials, "BTCUSDT", f.request), /Bybit maintenance deduction.*unavailable or invalid/);
+    assert.ok(f.calls.every(call => call.method === "GET"));
+  }
+  for (const missing of ["", null, undefined]) {
+    const f = fixture("bybit");
+    const tiers = f.responses["/v5/market/risk-limit"].result.list;
+    const higher = { ...tiers[0], isLowestRisk: 0, riskLimitValue: "2000000", mmDeduction: missing };
+    // Sorting must identify the verified lowest tier, regardless of API order.
+    tiers.unshift(higher);
+    await assert.rejects(getFuturesContext("bybit", credentials, "BTCUSDT", f.request), /Bybit maintenance deduction.*unavailable or invalid/);
+    assert.ok(f.calls.every(call => call.method === "GET"));
+  }
+});
+
 test("Bybit isolated balance subtracts position margin, order margin and locked funds", async () => {
   const f = fixture("bybit");
   f.responses["/v5/account/info"].result.marginMode = "ISOLATED_MARGIN";
