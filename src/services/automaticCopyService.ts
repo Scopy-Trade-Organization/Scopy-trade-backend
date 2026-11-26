@@ -59,13 +59,12 @@ function safeFailure(result: { status: number; body: Record<string, any> }) {
 }
 
 let running = false;
-export async function drainCopyQueue(dependencies: { executeTrade?: typeof executeTrade; refreshConnectionBalance?: typeof refreshConnectionBalance; executionId?: string } = {}) {
+export async function drainCopyQueue(dependencies: { executeTrade?: typeof executeTrade; refreshConnectionBalance?: typeof refreshConnectionBalance } = {}) {
   if (running) return;
-  const scope = dependencies.executionId ? { _id: new mongoose.Types.ObjectId(dependencies.executionId) } : {};
   running = true;
   try {
     // Recover interrupted work conservatively: never blindly repeat an exchange order.
-    const interrupted = await CopyExecution.find({ ...scope, status: "processing", startedAt: { $lt: new Date(Date.now() - 10 * 60_000) } }).lean();
+    const interrupted = await CopyExecution.find({ status: "processing", startedAt: { $lt: new Date(Date.now() - 10 * 60_000) } }).lean();
     for (const job of interrupted) {
       const existing = await Trade.findOne({ sourceTradeId: job.sourceTradeId, exchangeConnectionId: job.exchangeConnectionId }).select("status protectionStatus").lean();
       const confirmed = existing?.protectionStatus === "confirmed" && !["failed", "cancelled"].includes(existing.status);
@@ -75,7 +74,7 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
     }
     const outcomes = await Promise.allSettled(Array.from({ length: 8 }, async () => {
       for (let i = 0; i < 25; i++) {
-        const job = await CopyExecution.findOneAndUpdate({ ...scope, status: "queued", availableAt: { $lte: new Date() } }, { $set: { status: "processing", startedAt: new Date() } }, { new: true, sort: { createdAt: 1 } }).lean();
+        const job = await CopyExecution.findOneAndUpdate({ status: "queued", availableAt: { $lte: new Date() } }, { $set: { status: "processing", startedAt: new Date() } }, { new: true, sort: { createdAt: 1 } }).lean();
         if (!job) break;
         let locked = false, retainLock = false;
         try {
@@ -133,7 +132,7 @@ export async function drainCopyQueue(dependencies: { executeTrade?: typeof execu
       if (outcome.status === "rejected") console.error("[automaticCopy] worker", outcome.reason);
     }
     // Notification persistence can be retried without ever retrying an order.
-    const failures = await CopyExecution.find({ ...scope, status: "failed", reason: { $ne: null }, failureNotifiedAt: null }).limit(500).lean();
+    const failures = await CopyExecution.find({ status: "failed", reason: { $ne: null }, failureNotifiedAt: null }).limit(500).lean();
     for (const job of failures) await notifyFailure(job, job.reason!);
   } finally { running = false; }
 }

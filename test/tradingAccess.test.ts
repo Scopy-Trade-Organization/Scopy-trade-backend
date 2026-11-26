@@ -126,39 +126,6 @@ test("subscription validates the account and concurrent requests cannot create d
   assert.equal(await CopySubscription.countDocuments({ copierId: copier._id, proTraderId: pro._id }), 1);
 });
 
-test("a targeted queue drain executes only the selected copy and leaves other jobs untouched", async () => {
-  const pro = await user("ProTrader", "active"), copier = await user("CopyTrader", "active");
-  const connectionId = new mongoose.Types.ObjectId(), sourceId = new mongoose.Types.ObjectId();
-  const subscription = await CopySubscription.create({ copierId: copier._id, proTraderId: pro._id,
-    exchangeConnectionId: connectionId, startedAt: new Date(Date.now() - 5000) });
-  await Trade.collection.insertOne({ _id: sourceId, userId: pro._id, signalId: new mongoose.Types.ObjectId(),
-    exchangeConnectionId: new mongoose.Types.ObjectId(), tradeOrigin: "pro", status: "filled",
-    protectionStatus: "confirmed", pair: "LINKUSDT", createdAt: new Date() });
-  const selected = await CopyExecution.create({ subscriptionId: subscription._id, sourceTradeId: sourceId,
-    copierId: copier._id, exchangeConnectionId: connectionId });
-  const unrelated = await CopyExecution.insertMany(["queued", "processing", "failed"].map(status => ({
-    subscriptionId: subscription._id, sourceTradeId: new mongoose.Types.ObjectId(), copierId: copier._id,
-    exchangeConnectionId: new mongoose.Types.ObjectId(), status, reason: "Unrelated failure",
-    startedAt: new Date(Date.now() - 20 * 60_000),
-  })));
-  let executions = 0;
-  await drainCopyQueue({ executionId: String(selected._id), executeTrade: async (copierId, body) => {
-    executions++;
-    assert.equal(String(copierId), String(copier._id));
-    assert.equal(body.sourceTradeId, String(sourceId));
-    return { status: 201, body: {} };
-  } });
-  assert.equal(executions, 1);
-  assert.equal((await CopyExecution.findById(selected._id).lean())?.status, "completed");
-  for (const job of unrelated) {
-    const current = await CopyExecution.findById(job._id).lean();
-    assert.equal(current?.status, job.status);
-    assert.equal(current?.failureNotifiedAt, null);
-  }
-  // Avoid leaving unrelated queued work for later tests in this shared database.
-  await CopyExecution.deleteMany({ _id: { $in: unrelated.map(job => job._id) } });
-});
-
 test("settlement debt permits subscriptions while remaining due for trade execution", async () => {
   const pro = await user("ProTrader", "active"), copier = await user("CopyTrader", "active");
   await User.collection.updateOne({ _id: copier._id }, { $unset: { settlementOwedUnits: 1 } });
