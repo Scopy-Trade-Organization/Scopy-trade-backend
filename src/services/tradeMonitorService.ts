@@ -566,7 +566,9 @@ export class TradeMonitorService extends EventEmitter {
       if (!current) return;
       if (!["pending", "filled"].includes(current.status)) {
         await this.stopMonitoring(monitored.tradeId);
-        this.emit("tradeUpdate", { tradeId: monitored.tradeId, status: current.status, timestamp: new Date() });
+        this.emit("tradeUpdate", { tradeId: monitored.tradeId, status: current.status,
+          realizedPnl: current.realizedPnl, tradeResult: current.tradeResult,
+          exitPrice: current.exitPrice, closedVia: current.closedVia, closedAt: current.closedAt, timestamp: new Date() });
         return;
       }
       if (!protectedTrade) return;

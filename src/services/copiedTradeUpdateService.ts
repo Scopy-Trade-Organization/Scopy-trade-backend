@@ -186,9 +186,12 @@ async function closeOneCopiedTrade(tradeId: string): Promise<void> {
     await Trade.updateOne({ _id: trade._id }, { $set: { ...(closed.closedQuantity ? { quantity: closed.closedQuantity } : {}), ...(closed.entryFillPrice ? { entryFillPrice: closed.entryFillPrice } : {}) } });
     await processTradeClose(String(trade._id), closed.exitPrice!, "manual");
   }
+  const updated = await Trade.findById(trade._id).lean();
   monitor.emit("tradeUpdate", {
     tradeId: String(trade._id),
     status: closed.status,
+    realizedPnl: updated?.realizedPnl, tradeResult: updated?.tradeResult,
+    exitPrice: updated?.exitPrice, closedVia: updated?.closedVia, closedAt: updated?.closedAt,
     sourceTradeClosedAt: null,
     timestamp: new Date(),
   });

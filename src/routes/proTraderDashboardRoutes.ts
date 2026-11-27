@@ -11,7 +11,7 @@ import {
   financeLimit,
 } from "../controllers/proFinanceController.js";
 import { Router } from "express";
-import { myCopiers, myRanks } from "../controllers/traderFlowController.js";
+import { myCopiers, myRanks, notifications, readNotification } from "../controllers/traderFlowController.js";
 import {
   userAuthenticate,
   requireRole,
@@ -32,6 +32,8 @@ proTraderDashboardRouter.use(userAuthenticate);
 proTraderDashboardRouter.use(requireRole(["ProTrader"]));
 proTraderDashboardRouter.get("/copiers", myCopiers);
 proTraderDashboardRouter.get("/ranks", myRanks);
+proTraderDashboardRouter.get("/notifications", notifications);
+proTraderDashboardRouter.patch("/notifications/:id/read", readNotification);
 
 proTraderDashboardRouter.post("/wallet", financeLimit, saveWalletAddress);
 proTraderDashboardRouter.get("/wallet", getWalletAddress);

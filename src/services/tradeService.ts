@@ -2,6 +2,7 @@ import { BITGET_CATEGORY, bitgetList, bitgetProtectionParams } from "./bitgetUta
 import {
   verifyOrRecoverProtection,
   readEntry,
+  readConfirmedExit,
   position,
   setBitgetPositionProtection,
 } from "./tradeProtectionService.js";
@@ -737,11 +738,18 @@ export async function closeTradeOrder(
   }
   const live = await position(exchange, api, symbol);
   if (!live) {
-    if (entry.filled)
+    if (entry.filled) {
+      const exit = await readConfirmedExit(exchange, api, symbol, entry, params.direction);
+      if (exit && !(await position(exchange, api, symbol))) return {
+        status: "closed", exitPrice: exit.exitPrice, entryFillPrice: entry.price,
+        closedQuantity: new D(exit.orderQuantity).mul(params.sizing?.exchangeInstrumentRules.contractSize ?? "1").toFixed(),
+        raw: {},
+      };
       throw new TradeRiskError(
         "ORDER_REVIEW_REQUIRED",
         "The position is already flat, but its actual exit price is unavailable. Monitoring must reconcile its exit before profit sharing is recorded.",
       );
+    }
     return { status: "cancelled", exitPrice: null, raw: {} };
   }
   const nativeQty = new D(

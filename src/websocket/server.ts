@@ -198,6 +198,11 @@ export class TradeWebSocketServer {
           filledQuantity: data.filledQuantity,
           tp: data.tp,
           sl: data.sl,
+          realizedPnl: data.realizedPnl,
+          tradeResult: data.tradeResult,
+          exitPrice: data.exitPrice,
+          closedVia: data.closedVia,
+          closedAt: data.closedAt,
           timestamp: data.timestamp,
         },
       });

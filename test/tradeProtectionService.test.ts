@@ -160,6 +160,24 @@ test("missed exits require exact cumulative filled quantity and use weighted act
   assert.equal(await readConfirmedExit("bybit", api, "BTCUSDT", entry, "buy"), null);
 });
 
+test("manual close reconciles an already flat filled position using actual weighted exits", async () => {
+  const api: ExchangeRequest = async (method, path) => {
+    assert.equal(method, "GET", "An already closed position must not submit another order");
+    if (path === "/v5/position/list") return { result: { list: [] } };
+    if (path === "/v5/order/history") return { result: { list: [
+      { createdTime: "1100", orderStatus: "Filled", side: "Sell", reduceOnly: true, cumExecQty: "0.4", avgPrice: "98" },
+      { createdTime: "1200", orderStatus: "Filled", side: "Sell", reduceOnly: true, cumExecQty: "0.6", avgPrice: "100" },
+    ] } };
+    return { result: { list: [{ orderId: "entry", createdTime: "1000", orderStatus: "Filled", qty: "1", cumExecQty: "1", avgPrice: "97" }] } };
+  };
+  const result = await closeTradeOrder("bybit", { credentials: order.credentials, pair: order.pair,
+    direction: "buy", quantity: "1", orderId: "entry", status: "filled" }, api);
+  assert.equal(result.status, "closed");
+  assert.equal(result.exitPrice, "99.2");
+  assert.equal(result.entryFillPrice, "97");
+  assert.equal(result.closedQuantity, "1");
+});
+
 test("Bybit pending full-position protection must not specify a stop limit execution price", async () => {
   const f = fixture("bybit"); f.protect();
   const api: ExchangeRequest = async (method, path, values) => {

@@ -141,6 +141,30 @@ test("trade close accrues settlement debt exactly once under concurrent requests
   assert.equal((await Trade.findById(id).lean())?.settlementInvoicePending, false);
 });
 
+test("manual closes classify actual profit, loss and breakeven for both trader types", async () => {
+  for (const tradeOrigin of ["pro", "copy"] as const) {
+    for (const direction of ["buy", "sell"] as const) {
+      for (const exit of ["99", "101", "103"]) {
+        const userId = new mongoose.Types.ObjectId(), id = new mongoose.Types.ObjectId();
+        await User.collection.insertOne({ _id: userId, email: `${userId}@example.com`, traderID: String(userId), settlementOwedUnits: 0 });
+        await Trade.collection.insertOne({ _id: id, userId, pair: "LINKUSDT", direction, quantity: "0.5",
+          entryPrice: "100", entryFillPrice: "101", status: "filled", tradeOrigin,
+          signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });
+        const pnl = (Number(exit) - 101) * 0.5 * (direction === "buy" ? 1 : -1);
+        const result = await processTradeClose(String(id), exit, "manual");
+        assert.equal(result.realizedPnl, pnl.toFixed(6));
+        assert.equal(result.tradeResult, pnl > 0 ? "profit" : pnl < 0 ? "loss" : "breakeven");
+        const stored = await Trade.findById(id).lean();
+        assert.equal(stored?.status, "closed");
+        assert.equal(stored?.closedVia, "manual");
+        assert.equal(stored?.exitPrice, exit);
+        assert.equal(stored?.realizedPnl, pnl.toFixed(6));
+        assert.equal(result.platformFee, tradeOrigin === "copy" && pnl > 0 ? (pnl * 0.2).toFixed(6) : "0.000000");
+      }
+    }
+  }
+});
+
 test("a missing balance rolls back the trade close instead of losing the debt", async () => {
   const userId = new mongoose.Types.ObjectId(), id = new mongoose.Types.ObjectId();
   await Trade.collection.insertOne({ _id: id, userId, pair: "BTCUSDT", direction: "buy", quantity: "1", entryPrice: "100", status: "filled", tradeOrigin: "copy", signalId: new mongoose.Types.ObjectId(), exchangeConnectionId: new mongoose.Types.ObjectId() });

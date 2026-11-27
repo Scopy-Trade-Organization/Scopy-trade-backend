@@ -401,18 +401,15 @@ export const closeProTrade = async (req: Request, res: Response) => {
         return res.status(409).json({ success: false, code: error.code, message: error.message });
       }
     }
-    const live = await getOrderStatus(exchange, credentials, trade.pair, trade.exchangeOrderId);
-    if (!['pending', 'filled'].includes(live.status)) {
-      return res.status(409).json({ success: false, message: `The exchange reports this order as ${live.status}; it can no longer be closed manually.` });
-    }
-    const closeStatus = live.status === "filled" ? "filled" : "pending";
+    // The close helper checks actual fills and exposure. A cancelled remainder
+    // can still have a filled position that must be closed and receive P&L.
     const result = await closeTradeOrder(exchange, {
       credentials,
       pair: trade.pair,
       direction: trade.direction as "buy" | "sell",
       quantity: trade.quantity,
       orderId: trade.exchangeOrderId,
-      status: closeStatus,
+      status: trade.status as "pending" | "filled",
       ...(trade.sizing ? { sizing: trade.sizing } : {}),
     });
 
@@ -435,7 +432,9 @@ export const closeProTrade = async (req: Request, res: Response) => {
     const updated = await Trade.findById(trade._id)
       .populate("exchangeConnectionId", "exchange label")
       .lean();
-    monitor.emit("tradeUpdate", { tradeId: String(trade._id), status: result.status, timestamp: new Date() });
+    monitor.emit("tradeUpdate", { tradeId: String(trade._id), status: result.status,
+      realizedPnl: updated?.realizedPnl, tradeResult: updated?.tradeResult,
+      exitPrice: updated?.exitPrice, closedVia: updated?.closedVia, closedAt: updated?.closedAt, timestamp: new Date() });
     await AuditLog.create({
       userId: req.user,
       action: "Pro Trade Closed Manually",
